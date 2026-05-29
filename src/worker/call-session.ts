@@ -4,9 +4,12 @@ import { dispatchTool, type ToolCall, type ToolResult } from '../engine/tools';
 import type { ClientEvent } from '../engine/types';
 import { AuraTts, ClientFedStt, WorkersAiLlm } from './adapters';
 import { verifyJwt } from './auth';
+import { estimateCallCost } from './cost';
+import { uuid } from './util';
 
 const DEFAULT_SYSTEM_PROMPT =
   'You are a friendly, concise voice agent on a phone call. Keep replies short and natural, one or two sentences. Do not use markdown or emoji.';
+const SUMMARY_MODEL = '@cf/meta/llama-3.1-8b-instruct';
 
 interface AgentConfig {
   id: string;
@@ -17,12 +20,32 @@ interface AgentConfig {
   tools: { name: string; webhookUrl?: string }[];
 }
 
-class WsClientPort implements ClientPort {
-  constructor(private ws: WebSocket) {}
+interface Turn {
+  role: string;
+  text: string;
+  ts: number;
+}
+
+class RecordingClientPort implements ClientPort {
+  constructor(
+    private ws: WebSocket,
+    private hooks: {
+      onTurn: (t: Turn) => void;
+      onLatency: (ms: number) => void;
+      onEnded: (reason: string) => void;
+    },
+  ) {}
   emit(event: ClientEvent): void {
     if (event.type === 'audio') {
       this.ws.send(event.chunk.data);
       return;
+    }
+    if (event.type === 'transcript') {
+      this.hooks.onTurn({ role: event.role, text: event.text, ts: Date.now() });
+    } else if (event.type === 'latency' && event.turn.endpointToFirstAudio != null) {
+      this.hooks.onLatency(event.turn.endpointToFirstAudio);
+    } else if (event.type === 'ended') {
+      this.hooks.onEnded(event.reason);
     }
     this.ws.send(JSON.stringify(event));
   }
@@ -32,7 +55,24 @@ function renderTemplate(template: string, vars: Record<string, string>): string 
   return template.replace(/\{\{\s*(\w+)\s*\}\}/g, (_, name: string) => vars[name] ?? '');
 }
 
+function median(xs: number[]): number | null {
+  if (xs.length === 0) return null;
+  const s = [...xs].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid]! : Math.round((s[mid - 1]! + s[mid]!) / 2);
+}
+
 export class CallSession {
+  private callId = uuid();
+  private tenantId: string | null = null;
+  private agentId: string | null = null;
+  private callerRef: string | null = null;
+  private startedAt = Date.now();
+  private turns: Turn[] = [];
+  private latencies: number[] = [];
+  private speakingChars = 0;
+  private finalized = false;
+
   constructor(
     private state: DurableObjectState,
     private env: Env,
@@ -47,26 +87,33 @@ export class CallSession {
     const params = url.searchParams;
     const agentId = params.get('agentId');
     const token = params.get('token');
+    this.callerRef = params.get('customer_name') ?? params.get('caller') ?? null;
 
     let systemPrompt = params.get('prompt') ?? DEFAULT_SYSTEM_PROMPT;
     let voice = params.get('voice') ?? 'asteria';
     let toolMap = new Map<string, string | undefined>();
 
-    if (agentId && token) {
-      const agent = await this.loadAgent(agentId, token);
+    if (token) {
+      const claims = await verifyJwt(token, this.secret());
+      if (claims) this.tenantId = claims.tid;
+    }
+
+    if (agentId && this.tenantId) {
+      const agent = await this.loadAgent(agentId);
       if (agent) {
+        this.agentId = agent.id;
         const vars: Record<string, string> = { agent_name: agent.name };
         for (const v of agent.variables) {
           if (v.source === 'call_init') vars[v.name] = params.get(v.name) ?? v.default ?? '';
           else if (v.source === 'static') vars[v.name] = v.default ?? '';
         }
-        if (agent.systemPromptTemplate.trim()) {
-          systemPrompt = renderTemplate(agent.systemPromptTemplate, vars);
-        }
+        if (agent.systemPromptTemplate.trim()) systemPrompt = renderTemplate(agent.systemPromptTemplate, vars);
         voice = params.get('voice') ?? agent.voice;
         toolMap = new Map(agent.tools.map((t) => [t.name, t.webhookUrl]));
       }
     }
+
+    if (this.tenantId) await this.createCallRecord();
 
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -74,11 +121,20 @@ export class CallSession {
     server.accept();
 
     const stt = new ClientFedStt();
+    const port = new RecordingClientPort(server, {
+      onTurn: (t) => {
+        this.turns.push(t);
+        if (t.role === 'assistant') this.speakingChars += t.text.length;
+      },
+      onLatency: (ms) => this.latencies.push(ms),
+      onEnded: (reason) => this.state.waitUntil(this.finalize(reason)),
+    });
+
     const engine = new ConversationEngine({
       stt,
       llm: new WorkersAiLlm(this.env.AI),
       tts: new AuraTts(this.env.AI, voice),
-      client: new WsClientPort(server),
+      client: port,
       clock: { now: () => Date.now() },
       systemPrompt,
       chunkerOptions: { minWords: 6, maxWords: 30 },
@@ -105,14 +161,66 @@ export class CallSession {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  private async loadAgent(agentId: string, token: string): Promise<AgentConfig | null> {
-    const secret = (this.env as unknown as { JWT_SECRET?: string }).JWT_SECRET ?? 'dev-insecure-secret-change-me';
-    const claims = await verifyJwt(token, secret);
-    if (!claims) return null;
+  private secret(): string {
+    return (this.env as unknown as { JWT_SECRET?: string }).JWT_SECRET ?? 'dev-insecure-secret-change-me';
+  }
+
+  private async createCallRecord(): Promise<void> {
+    try {
+      await this.env.DB.prepare(
+        'INSERT INTO calls (id, tenant_id, agent_id, caller_ref, started_at, status) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+        .bind(this.callId, this.tenantId, this.agentId, this.callerRef, this.startedAt, 'active')
+        .run();
+    } catch {
+      // best-effort; logging must never break a call
+    }
+  }
+
+  private async finalize(reason: string): Promise<void> {
+    if (this.finalized || !this.tenantId) return;
+    this.finalized = true;
+    const endedAt = Date.now();
+    const durationS = Math.round((endedAt - this.startedAt) / 1000);
+    const summary = await this.summarize();
+    const cost = estimateCallCost({ durationS, ttsChars: this.speakingChars });
+
+    try {
+      await this.env.DB.batch([
+        this.env.DB.prepare(
+          'UPDATE calls SET ended_at=?, duration_s=?, status=?, end_reason=?, cost_usd=?, summary=?, latency_p50_ms=? WHERE id=?',
+        ).bind(endedAt, durationS, 'ended', reason, cost, summary, median(this.latencies), this.callId),
+        this.env.DB.prepare(
+          'INSERT OR REPLACE INTO transcripts (call_id, tenant_id, turns) VALUES (?, ?, ?)',
+        ).bind(this.callId, this.tenantId, JSON.stringify(this.turns)),
+      ]);
+    } catch {
+      // best-effort
+    }
+  }
+
+  private async summarize(): Promise<string> {
+    const convo = this.turns.map((t) => `${t.role}: ${t.text}`).join('\n');
+    if (!convo.trim()) return '';
+    try {
+      const r = (await this.env.AI.run(SUMMARY_MODEL as never, {
+        messages: [
+          { role: 'system', content: 'Summarize this phone call transcript in 1-2 sentences. Be factual.' },
+          { role: 'user', content: convo.slice(0, 6000) },
+        ],
+        max_tokens: 120,
+      } as never)) as { response?: string };
+      return (r.response ?? '').trim();
+    } catch {
+      return '';
+    }
+  }
+
+  private async loadAgent(agentId: string): Promise<AgentConfig | null> {
     const row = await this.env.DB.prepare(
       'SELECT id, name, voice, system_prompt_template, variables_schema, tools FROM agents WHERE id = ? AND tenant_id = ?',
     )
-      .bind(agentId, claims.tid)
+      .bind(agentId, this.tenantId)
       .first<{
         id: string;
         name: string;
@@ -144,8 +252,7 @@ export class CallSession {
             body: JSON.stringify(call.arguments),
             signal: AbortSignal.timeout(8000),
           });
-          const text = await r.text();
-          return { type: 'continue', content: text.slice(0, 2000) };
+          return { type: 'continue', content: (await r.text()).slice(0, 2000) };
         } catch {
           return { type: 'continue', content: `Error calling tool "${call.name}".` };
         }

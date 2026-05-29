@@ -46,8 +46,25 @@ ws.on('message', (data, isBinary) => {
 });
 ws.on('error', (e) => console.error('WS ERROR', e.message));
 
-setTimeout(() => {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+setTimeout(async () => {
   console.log('audioBytes', audioBytes);
+  ws.send(JSON.stringify({ type: 'hangup' }));
+  await sleep(4000); // let finalize() run (summary + persist)
   ws.close();
+
+  const calls = await (
+    await fetch(`${BASE}/api/calls`, { headers: { authorization: `Bearer ${token}` } })
+  ).json();
+  console.log('CALLS', JSON.stringify(calls, null, 2));
+  if (calls.calls?.[0]) {
+    const detail = await (
+      await fetch(`${BASE}/api/calls/${calls.calls[0].id}`, {
+        headers: { authorization: `Bearer ${token}` },
+      })
+    ).json();
+    console.log('DETAIL', JSON.stringify(detail, null, 2));
+  }
   process.exit(0);
-}, 9000);
+}, 7000);
