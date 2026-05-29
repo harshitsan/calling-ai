@@ -1,4 +1,4 @@
-import { Mic, PhoneOff, Send } from 'lucide-react';
+import { Phone, PhoneOff, Send } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -16,11 +16,14 @@ interface Line {
   text: string;
 }
 
+const VAD_RMS_THRESHOLD = 0.13;
+const VAD_FRAMES = 5;
+
 export function TestCall() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [agentId, setAgentId] = useState('');
   const [customer, setCustomer] = useState('Alex');
-  const [connected, setConnected] = useState(false);
+  const [status, setStatus] = useState<'idle' | 'connecting' | 'live'>('idle');
   const [lines, setLines] = useState<Line[]>([]);
   const [latency, setLatency] = useState<number | null>(null);
   const [text, setText] = useState('');
@@ -28,19 +31,42 @@ export function TestCall() {
   const wsRef = useRef<WebSocket | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
   const nextStartRef = useRef(0);
+  const sourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const speakingRef = useRef(false);
+  const speakingTimer = useRef<number | null>(null);
+  const liveRef = useRef(false);
+  const recRef = useRef<any>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const vadRaf = useRef<number | null>(null);
 
   useEffect(() => {
     api<{ agents: Agent[] }>('/api/agents').then((r) => {
       setAgents(r.agents);
       if (r.agents[0]) setAgentId(r.agents[0].id);
     });
-    return () => wsRef.current?.close();
+    return () => stop();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function ensureCtx() {
     if (!ctxRef.current) ctxRef.current = new AudioContext();
     if (ctxRef.current.state === 'suspended') await ctxRef.current.resume();
     return ctxRef.current;
+  }
+
+  function setSpeaking(on: boolean) {
+    if (on) {
+      if (speakingTimer.current) {
+        clearTimeout(speakingTimer.current);
+        speakingTimer.current = null;
+      }
+      speakingRef.current = true;
+    } else {
+      // small cooldown so brief gaps between clips don't re-open the mic
+      speakingTimer.current = window.setTimeout(() => {
+        speakingRef.current = false;
+      }, 300);
+    }
   }
 
   async function playAudio(buf: ArrayBuffer) {
@@ -57,18 +83,119 @@ export function TestCall() {
     const start = Math.max(ctx.currentTime + 0.02, nextStartRef.current);
     src.start(start);
     nextStartRef.current = start + decoded.duration;
+    sourcesRef.current.push(src);
+    setSpeaking(true);
+    src.onended = () => {
+      sourcesRef.current = sourcesRef.current.filter((s) => s !== src);
+      if (sourcesRef.current.length === 0) setSpeaking(false);
+    };
   }
 
-  function connect() {
+  function stopAudio() {
+    for (const s of sourcesRef.current) {
+      try {
+        s.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    sourcesRef.current = [];
+    nextStartRef.current = ctxRef.current ? ctxRef.current.currentTime : 0;
+    speakingRef.current = false;
+  }
+
+  function bargeIn() {
+    stopAudio();
+    if (wsRef.current?.readyState === 1) wsRef.current.send(JSON.stringify({ type: 'interrupt' }));
+  }
+
+  async function startVad() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      micStreamRef.current = stream;
+      const ctx = await ensureCtx();
+      const srcNode = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      srcNode.connect(analyser);
+      const data = new Uint8Array(analyser.fftSize);
+      let consec = 0;
+      const loop = () => {
+        analyser.getByteTimeDomainData(data);
+        let sum = 0;
+        for (const v of data) {
+          const x = (v - 128) / 128;
+          sum += x * x;
+        }
+        const rms = Math.sqrt(sum / data.length);
+        if (speakingRef.current && rms > VAD_RMS_THRESHOLD) {
+          if (++consec >= VAD_FRAMES) {
+            consec = 0;
+            bargeIn(); // user is talking over the agent -> stop it
+          }
+        } else {
+          consec = 0;
+        }
+        vadRaf.current = requestAnimationFrame(loop);
+      };
+      vadRaf.current = requestAnimationFrame(loop);
+    } catch {
+      // mic denied: barge-in disabled, text/STT still works
+    }
+  }
+
+  function startRecognition() {
+    const SR = window as unknown as { SpeechRecognition?: any; webkitSpeechRecognition?: any };
+    const Rec = SR.SpeechRecognition || SR.webkitSpeechRecognition;
+    if (!Rec) return;
+    const rec = new Rec();
+    rec.lang = 'en-US';
+    rec.continuous = true;
+    rec.interimResults = false;
+    rec.onresult = (e: any) => {
+      const r = e.results[e.results.length - 1];
+      if (!r.isFinal) return;
+      // half-duplex: ignore anything heard while the agent is speaking (echo)
+      if (speakingRef.current) return;
+      send(r[0].transcript);
+    };
+    rec.onend = () => {
+      if (liveRef.current) {
+        try {
+          rec.start();
+        } catch {
+          /* already started */
+        }
+      }
+    };
+    try {
+      rec.start();
+    } catch {
+      /* ignore */
+    }
+    recRef.current = rec;
+  }
+
+  async function start() {
     if (!agentId) return;
-    ensureCtx();
+    setStatus('connecting');
+    setLines([]);
+    setLatency(null);
+    await ensureCtx();
+    liveRef.current = true;
     const token = getToken();
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const url = `${proto}://${location.host}/call?agentId=${agentId}&token=${encodeURIComponent(token ?? '')}&customer_name=${encodeURIComponent(customer)}`;
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
-    ws.onopen = () => setConnected(true);
-    ws.onclose = () => setConnected(false);
+    ws.onopen = () => {
+      setStatus('live');
+      startVad();
+      startRecognition();
+    };
+    ws.onclose = () => liveRef.current && stop();
     ws.onmessage = (e) => {
       if (typeof e.data !== 'string') {
         playAudio(e.data as ArrayBuffer);
@@ -76,33 +203,38 @@ export function TestCall() {
       }
       const ev = JSON.parse(e.data);
       if (ev.type === 'transcript') setLines((l) => [...l, { role: ev.role, text: ev.text }]);
+      else if (ev.type === 'flush') stopAudio();
       else if (ev.type === 'latency' && ev.turn.endpointToFirstAudio != null) setLatency(ev.turn.endpointToFirstAudio);
     };
     wsRef.current = ws;
-    setLines([]);
   }
 
-  function hangup() {
-    wsRef.current?.send(JSON.stringify({ type: 'hangup' }));
+  function stop() {
+    liveRef.current = false;
+    if (vadRaf.current) cancelAnimationFrame(vadRaf.current);
+    try {
+      recRef.current?.stop();
+    } catch {
+      /* ignore */
+    }
+    recRef.current = null;
+    micStreamRef.current?.getTracks().forEach((t) => t.stop());
+    micStreamRef.current = null;
+    stopAudio();
+    if (wsRef.current?.readyState === 1) wsRef.current.send(JSON.stringify({ type: 'hangup' }));
     wsRef.current?.close();
-    setConnected(false);
+    wsRef.current = null;
+    setStatus('idle');
   }
 
   function send(t: string) {
     if (!t.trim() || wsRef.current?.readyState !== 1) return;
+    stopAudio(); // typing/speaking interrupts the agent too
     wsRef.current.send(JSON.stringify({ type: 'userText', text: t }));
     setText('');
   }
 
-  function startMic() {
-    const SR = (window as unknown as { SpeechRecognition?: any; webkitSpeechRecognition?: any });
-    const Rec = SR.SpeechRecognition || SR.webkitSpeechRecognition;
-    if (!Rec) return alert('SpeechRecognition not supported in this browser.');
-    const rec = new Rec();
-    rec.lang = 'en-US';
-    rec.onresult = (e: any) => send(e.results[0][0].transcript);
-    rec.start();
-  }
+  const live = status === 'live' || status === 'connecting';
 
   return (
     <div className="space-y-6">
@@ -115,7 +247,7 @@ export function TestCall() {
         <CardContent className="flex flex-wrap gap-4 items-end">
           <div className="space-y-1">
             <Label>Agent</Label>
-            <Select value={agentId} onChange={(e) => setAgentId(e.target.value)} className="w-56" disabled={connected}>
+            <Select value={agentId} onChange={(e) => setAgentId(e.target.value)} className="w-56" disabled={live}>
               {agents.map((a) => (
                 <option key={a.id} value={a.id}>
                   {a.name}
@@ -125,16 +257,22 @@ export function TestCall() {
           </div>
           <div className="space-y-1">
             <Label>Caller name</Label>
-            <Input value={customer} onChange={(e) => setCustomer(e.target.value)} className="w-40" disabled={connected} />
+            <Input value={customer} onChange={(e) => setCustomer(e.target.value)} className="w-40" disabled={live} />
           </div>
-          {connected ? (
-            <Button variant="destructive" onClick={hangup}>
-              <PhoneOff className="h-4 w-4" /> Hang up
+          {status === 'idle' ? (
+            <Button onClick={start} disabled={!agentId}>
+              <Phone className="h-4 w-4" /> Start call
             </Button>
           ) : (
-            <Button onClick={connect} disabled={!agentId}>
-              Start call
+            <Button variant="destructive" onClick={stop}>
+              <PhoneOff className="h-4 w-4" />
+              {status === 'connecting' ? 'Connecting…' : 'Stop'}
             </Button>
+          )}
+          {status === 'live' && (
+            <span className="flex items-center gap-2 text-sm text-emerald-600">
+              <span className="h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse" /> Live — just talk
+            </span>
           )}
           {latency != null && <span className="text-sm text-muted-foreground">first audio: {latency}ms</span>}
         </CardContent>
@@ -145,7 +283,11 @@ export function TestCall() {
           <CardTitle>Conversation</CardTitle>
         </CardHeader>
         <CardContent className="space-y-2 min-h-[200px]">
-          {lines.length === 0 && <p className="text-sm text-muted-foreground">Start a call, then talk or type.</p>}
+          {lines.length === 0 && (
+            <p className="text-sm text-muted-foreground">
+              Start the call, then just speak — the agent listens continuously and you can talk over it to interrupt.
+            </p>
+          )}
           {lines.map((l, i) => (
             <div key={i} className="text-sm">
               <span className={l.role === 'user' ? 'text-blue-600 font-medium' : 'text-emerald-700 font-medium'}>
@@ -159,17 +301,14 @@ export function TestCall() {
 
       <div className="flex gap-2">
         <Input
-          placeholder="Type a message…"
+          placeholder="Or type a message…"
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && send(text)}
-          disabled={!connected}
+          disabled={status !== 'live'}
         />
-        <Button onClick={() => send(text)} disabled={!connected}>
+        <Button onClick={() => send(text)} disabled={status !== 'live'}>
           <Send className="h-4 w-4" />
-        </Button>
-        <Button variant="secondary" onClick={startMic} disabled={!connected}>
-          <Mic className="h-4 w-4" /> Talk
         </Button>
       </div>
     </div>
