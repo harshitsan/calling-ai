@@ -25,7 +25,8 @@ export default {
     }
 
     if (url.pathname.startsWith('/api/auth/') || url.pathname === '/api/me' ||
-        url.pathname.startsWith('/api/agents') || url.pathname.startsWith('/api/calls')) {
+        url.pathname.startsWith('/api/agents') || url.pathname.startsWith('/api/calls') ||
+        url.pathname === '/api/usage') {
       const res = await handleApi(request, env);
       const headers = new Headers(res.headers);
       for (const [k, v] of Object.entries(CORS)) headers.set(k, v);

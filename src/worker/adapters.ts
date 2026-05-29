@@ -19,21 +19,27 @@ export class ClientFedStt implements SttPort {
 
 /** Streaming LLM over Workers AI (open Llama model — low TTFT default). */
 export class WorkersAiLlm implements LlmPort {
+  private model: string;
+  private gatewayId?: string;
   constructor(
     private ai: Ai,
-    private model = '@cf/meta/llama-3.1-8b-instruct',
-  ) {}
+    opts: { model?: string; gatewayId?: string } = {},
+  ) {
+    this.model = opts.model ?? '@cf/meta/llama-3.1-8b-instruct';
+    this.gatewayId = opts.gatewayId;
+  }
 
   async *generate(messages: Message[], opts?: { signal?: AbortSignal }): AsyncIterable<LlmDelta> {
     const aiMessages = messages.map((m) => ({
       role: m.role === 'tool' ? 'user' : m.role,
       content: m.content,
     }));
-    const stream = (await this.ai.run(this.model as never, {
-      messages: aiMessages,
-      stream: true,
-      max_tokens: 512,
-    } as never)) as unknown as ReadableStream<Uint8Array>;
+    const runOpts = this.gatewayId ? { gateway: { id: this.gatewayId } } : undefined;
+    const stream = (await this.ai.run(
+      this.model as never,
+      { messages: aiMessages, stream: true, max_tokens: 512 } as never,
+      runOpts as never,
+    )) as unknown as ReadableStream<Uint8Array>;
 
     const reader = stream.getReader();
     const decoder = new TextDecoder();

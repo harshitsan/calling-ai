@@ -189,6 +189,19 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     }
   }
 
+  // ---- usage / cost metering ----
+  if (path === '/api/usage' && method === 'GET') {
+    const row = await env.DB.prepare(
+      `SELECT COUNT(*) AS calls, COALESCE(SUM(cost_usd), 0) AS cost_usd,
+              COALESCE(SUM(duration_s), 0) AS duration_s,
+              COALESCE(AVG(latency_p50_ms), 0) AS avg_latency_ms
+       FROM calls WHERE tenant_id = ? AND status = 'ended'`,
+    )
+      .bind(auth.tenantId)
+      .first();
+    return json({ usage: row });
+  }
+
   // ---- call logs ----
   if (path === '/api/calls' && method === 'GET') {
     const { results } = await env.DB.prepare(

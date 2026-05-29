@@ -18,6 +18,7 @@ interface AgentConfig {
   systemPromptTemplate: string;
   variables: { name: string; source: string; default?: string }[];
   tools: { name: string; webhookUrl?: string }[];
+  llmTierPolicy: { defaultModel?: string; escalateModel?: string; escalateOn?: string };
 }
 
 interface Turn {
@@ -92,6 +93,7 @@ export class CallSession {
     let systemPrompt = params.get('prompt') ?? DEFAULT_SYSTEM_PROMPT;
     let voice = params.get('voice') ?? 'asteria';
     let toolMap = new Map<string, string | undefined>();
+    let model = '@cf/meta/llama-3.1-8b-instruct';
 
     if (token) {
       const claims = await verifyJwt(token, this.secret());
@@ -110,6 +112,7 @@ export class CallSession {
         if (agent.systemPromptTemplate.trim()) systemPrompt = renderTemplate(agent.systemPromptTemplate, vars);
         voice = params.get('voice') ?? agent.voice;
         toolMap = new Map(agent.tools.map((t) => [t.name, t.webhookUrl]));
+        if (agent.llmTierPolicy.defaultModel) model = agent.llmTierPolicy.defaultModel;
       }
     }
 
@@ -138,9 +141,10 @@ export class CallSession {
       onEnded: (reason) => this.state.waitUntil(this.finalize(reason)),
     });
 
+    const gatewayId = (this.env as unknown as { AI_GATEWAY_ID?: string }).AI_GATEWAY_ID || undefined;
     const engine = new ConversationEngine({
       stt,
-      llm: new WorkersAiLlm(this.env.AI),
+      llm: new WorkersAiLlm(this.env.AI, { model, gatewayId }),
       tts: new AuraTts(this.env.AI, voice),
       client: port,
       clock: { now: () => Date.now() },
@@ -227,7 +231,7 @@ export class CallSession {
 
   private async loadAgent(agentId: string): Promise<AgentConfig | null> {
     const row = await this.env.DB.prepare(
-      'SELECT id, name, voice, system_prompt_template, variables_schema, tools FROM agents WHERE id = ? AND tenant_id = ?',
+      'SELECT id, name, voice, system_prompt_template, variables_schema, tools, llm_tier_policy FROM agents WHERE id = ? AND tenant_id = ?',
     )
       .bind(agentId, this.tenantId)
       .first<{
@@ -237,6 +241,7 @@ export class CallSession {
         system_prompt_template: string;
         variables_schema: string;
         tools: string;
+        llm_tier_policy: string;
       }>();
     if (!row) return null;
     return {
@@ -246,6 +251,7 @@ export class CallSession {
       systemPromptTemplate: row.system_prompt_template,
       variables: JSON.parse(row.variables_schema),
       tools: JSON.parse(row.tools),
+      llmTierPolicy: JSON.parse(row.llm_tier_policy),
     };
   }
 
