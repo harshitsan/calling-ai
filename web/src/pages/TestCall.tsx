@@ -39,6 +39,9 @@ export function TestCall() {
   const recRef = useRef<any>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const vadRaf = useRef<number | null>(null);
+  const interimRef = useRef('');
+  const finalizeTimer = useRef<number | null>(null);
+  const lastSent = useRef({ text: '', t: 0 });
 
   useEffect(() => {
     api<{ agents: Agent[] }>('/api/agents').then((r) => {
@@ -167,14 +170,18 @@ export function TestCall() {
         let interimText = '';
         for (let i = e.resultIndex; i < e.results.length; i++) {
           const res = e.results[i];
-          if (res.isFinal) {
-            setInterim('');
-            send(res[0].transcript);
-          } else {
-            interimText += res[0].transcript;
-          }
+          if (res.isFinal) send(res[0].transcript);
+          else interimText += res[0].transcript;
         }
-        if (interimText) setInterim(interimText);
+        if (interimText) {
+          interimRef.current = interimText;
+          setInterim(interimText);
+          // Fallback: Chrome sometimes never fires a final. Finalize on a pause.
+          if (finalizeTimer.current) clearTimeout(finalizeTimer.current);
+          finalizeTimer.current = window.setTimeout(() => {
+            if (interimRef.current && !isSpeaking()) send(interimRef.current);
+          }, 1100);
+        }
       };
       rec.onerror = () => {
         /* onend handles the respawn */
@@ -245,9 +252,19 @@ export function TestCall() {
   }
 
   function send(t: string) {
-    if (!t.trim() || wsRef.current?.readyState !== 1) return;
+    const text = t.trim();
+    if (!text || wsRef.current?.readyState !== 1) return;
+    // dedupe: a late real-final shouldn't resend what the pause-finalizer already sent
+    if (lastSent.current.text === text && Date.now() - lastSent.current.t < 2500) return;
+    lastSent.current = { text, t: Date.now() };
+    if (finalizeTimer.current) {
+      clearTimeout(finalizeTimer.current);
+      finalizeTimer.current = null;
+    }
+    interimRef.current = '';
+    setInterim('');
     stopAudio(); // talking/typing interrupts the agent
-    wsRef.current.send(JSON.stringify({ type: 'userText', text: t }));
+    wsRef.current.send(JSON.stringify({ type: 'userText', text }));
     setText('');
   }
 

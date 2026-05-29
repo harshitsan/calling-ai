@@ -1,4 +1,4 @@
-import { Bot, LogOut, Phone, PhoneCall } from 'lucide-react';
+import { Bot, LogOut, Phone, PhoneCall, ScrollText } from 'lucide-react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { Button } from './ui/button';
 import { clearToken } from '@/lib/api';
@@ -8,6 +8,7 @@ const nav = [
   { to: '/agents', label: 'Agents', icon: Bot },
   { to: '/calls', label: 'Call Logs', icon: Phone },
   { to: '/test', label: 'Test Call', icon: PhoneCall },
+  { to: '/logs', label: 'Live Logs', icon: ScrollText },
 ];
 
 export function Layout() {

@@ -8,6 +8,7 @@ import type { LlmPort, SttPort } from '../engine/ports';
 const LEGACY_WORKERS_AI_MODEL = '@cf/meta/llama-3.1-8b-instruct';
 import { verifyJwt } from './auth';
 import { estimateCallCost } from './cost';
+import { publishLog, type LogEvent } from './log-hub';
 import { uuid } from './util';
 
 const DEFAULT_SYSTEM_PROMPT =
@@ -150,9 +151,17 @@ export class CallSession {
     const port = new RecordingClientPort(server, {
       onTurn: (t) => {
         this.turns.push(t);
-        if (t.role === 'assistant') this.speakingChars += t.text.length;
+        if (t.role === 'assistant') {
+          this.speakingChars += t.text.length;
+          this.log('llm', 'reply', { text: t.text });
+        } else if (t.role === 'user') {
+          this.log('stt', 'heard', { text: t.text });
+        }
       },
-      onLatency: (ms) => this.latencies.push(ms),
+      onLatency: (ms) => {
+        this.latencies.push(ms);
+        this.log('tts', 'first audio', { ms });
+      },
       onEnded: (reason) => this.state.waitUntil(this.finalize(reason)),
     });
 
@@ -176,6 +185,13 @@ export class CallSession {
       onToolCall: (call) => this.executeTool(call, toolMap),
     });
     engine.start();
+    this.log('call', 'call started', {
+      agentId: this.agentId,
+      caller: this.callerRef,
+      voice,
+      model: useOpenAI ? model : `workers-ai:${model}`,
+      stt: useFlux ? 'flux' : 'browser',
+    });
 
     const clientStt = useFlux ? null : (stt as ClientFedStt);
     server.addEventListener('message', (event: MessageEvent) => {
@@ -205,6 +221,12 @@ export class CallSession {
     return (this.env as unknown as { JWT_SECRET?: string }).JWT_SECRET ?? 'dev-insecure-secret-change-me';
   }
 
+  private log(service: string, msg: string, data?: Record<string, unknown>, level?: LogEvent['level']): void {
+    this.state.waitUntil(
+      publishLog(this.env, this.tenantId, { service, msg, data, level, callId: this.callId }),
+    );
+  }
+
   private async createCallRecord(): Promise<void> {
     try {
       await this.env.DB.prepare(
@@ -222,6 +244,7 @@ export class CallSession {
     this.finalized = true;
     const endedAt = Date.now();
     const durationS = Math.round((endedAt - this.startedAt) / 1000);
+    this.log('call', 'call ended', { reason, durationS });
     const summary = await this.summarize();
     const cost = estimateCallCost({ durationS, ttsChars: this.speakingChars });
     await this.extractMemory();
@@ -295,6 +318,7 @@ export class CallSession {
         : `caller=${encodeURIComponent(opts.caller ?? '')}`;
       const r = await this.memoryStub().fetch(`https://memory/recall?${qs}`);
       const j = (await r.json()) as { facts?: string[] };
+      this.log('memory', 'recall', { query: opts.q ?? opts.caller, hits: j.facts?.length ?? 0 });
       return j.facts ?? [];
     } catch {
       return [];
@@ -326,12 +350,14 @@ export class CallSession {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ caller: this.callerRef, facts }),
       });
+      this.log('memory', 'extracted facts', { count: facts.length });
     } catch {
       // best-effort
     }
   }
 
   private async executeTool(call: ToolCall, toolMap: Map<string, string | undefined>): Promise<ToolResult> {
+    this.log('tool', `call ${call.name}`, { args: call.arguments });
     if (call.name === 'end_call') return dispatchTool(call);
     if (call.name === 'recall_memory') {
       const q = typeof call.arguments.query === 'string' ? call.arguments.query : '';

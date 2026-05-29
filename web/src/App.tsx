@@ -6,6 +6,7 @@ import { Agents } from './pages/Agents';
 import { CallDetail } from './pages/CallDetail';
 import { Calls } from './pages/Calls';
 import { Login } from './pages/Login';
+import { Logs } from './pages/Logs';
 import { TestCall } from './pages/TestCall';
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
@@ -31,6 +32,7 @@ export function App() {
           <Route path="/calls" element={<Calls />} />
           <Route path="/calls/:id" element={<CallDetail />} />
           <Route path="/test" element={<TestCall />} />
+          <Route path="/logs" element={<Logs />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

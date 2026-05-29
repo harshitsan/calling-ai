@@ -1,8 +1,10 @@
 import { handleApi } from './api';
+import { verifyJwt } from './auth';
 import { CallSession } from './call-session';
+import { LogHub } from './log-hub';
 import { MemoryStore } from './memory-store';
 
-export { CallSession, MemoryStore };
+export { CallSession, LogHub, MemoryStore };
 
 const LLM_MODEL = '@cf/meta/llama-3.1-8b-instruct';
 
@@ -36,6 +38,14 @@ export default {
     if (url.pathname === '/call') {
       const id = env.CALL_SESSION.newUniqueId();
       const stub = env.CALL_SESSION.get(id);
+      return stub.fetch(request);
+    }
+
+    if (url.pathname === '/logs') {
+      const secret = (env as unknown as { JWT_SECRET?: string }).JWT_SECRET ?? 'dev-insecure-secret-change-me';
+      const claims = await verifyJwt(url.searchParams.get('token') ?? '', secret);
+      if (!claims) return new Response('unauthorized', { status: 401 });
+      const stub = env.LOGS.get(env.LOGS.idFromName(claims.tid));
       return stub.fetch(request);
     }
 
