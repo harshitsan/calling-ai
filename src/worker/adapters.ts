@@ -1,7 +1,68 @@
 import type { LlmPort, SttPort, TtsPort } from '../engine/ports';
 import type { AudioChunk, LlmDelta, Message, SttEvent } from '../engine/types';
 
-/** STT fed by client-recognized text (demo-grade stand-in for Deepgram Flux WS). */
+/**
+ * Server-side Deepgram Flux STT over Workers AI WebSocket.
+ * Client streams raw linear16 16kHz PCM frames; Flux emits Update/EndOfTurn events.
+ * EXPERIMENTAL: protocol per docs; needs live-audio verification.
+ */
+export class FluxStt implements SttPort {
+  private handler: ((e: SttEvent) => void) | null = null;
+  private flux: WebSocket | null = null;
+  private queue: Uint8Array[] = [];
+  private ready: Promise<void>;
+
+  constructor(ai: Ai, sampleRate = '16000') {
+    this.ready = this.connect(ai, sampleRate);
+  }
+
+  private async connect(ai: Ai, sampleRate: string): Promise<void> {
+    try {
+      const resp = (await ai.run(
+        '@cf/deepgram/flux' as never,
+        { encoding: 'linear16', sample_rate: sampleRate } as never,
+        { websocket: true } as never,
+      )) as unknown as { webSocket?: WebSocket };
+      const ws = resp.webSocket;
+      if (!ws) return;
+      ws.accept();
+      ws.addEventListener('message', (e: MessageEvent) => {
+        if (typeof e.data !== 'string') return;
+        let msg: { event?: string; transcript?: string };
+        try {
+          msg = JSON.parse(e.data);
+        } catch {
+          return;
+        }
+        const text = msg.transcript ?? '';
+        if (msg.event === 'EndOfTurn') this.handler?.({ type: 'endOfTurn', text });
+        else if (msg.event === 'Update' && text) this.handler?.({ type: 'partial', text });
+      });
+      this.flux = ws;
+      for (const f of this.queue) ws.send(f);
+      this.queue = [];
+    } catch {
+      // leave flux null; audio frames will be dropped
+    }
+  }
+
+  sendAudio(frame: Uint8Array): void {
+    if (this.flux) this.flux.send(frame);
+    else this.queue.push(frame);
+  }
+  onEvent(handler: (e: SttEvent) => void): void {
+    this.handler = handler;
+  }
+  close(): void {
+    try {
+      this.flux?.close();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** STT fed by client-recognized text (browser SpeechRecognition stand-in). */
 export class ClientFedStt implements SttPort {
   private handler: ((e: SttEvent) => void) | null = null;
   sendAudio(_frame: Uint8Array): void {}

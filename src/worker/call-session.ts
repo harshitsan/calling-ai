@@ -2,7 +2,8 @@ import { ConversationEngine } from '../engine/conversation-engine';
 import type { ClientPort } from '../engine/ports';
 import { dispatchTool, type ToolCall, type ToolResult } from '../engine/tools';
 import type { ClientEvent } from '../engine/types';
-import { AuraTts, ClientFedStt, WorkersAiLlm } from './adapters';
+import { AuraTts, ClientFedStt, FluxStt, WorkersAiLlm } from './adapters';
+import type { SttPort } from '../engine/ports';
 import { verifyJwt } from './auth';
 import { estimateCallCost } from './cost';
 import { uuid } from './util';
@@ -131,7 +132,8 @@ export class CallSession {
     const server = pair[1];
     server.accept();
 
-    const stt = new ClientFedStt();
+    const useFlux = params.get('stt') === 'flux';
+    const stt: SttPort = useFlux ? new FluxStt(this.env.AI) : new ClientFedStt();
     const port = new RecordingClientPort(server, {
       onTurn: (t) => {
         this.turns.push(t);
@@ -154,7 +156,12 @@ export class CallSession {
     });
     engine.start();
 
+    const clientStt = useFlux ? null : (stt as ClientFedStt);
     server.addEventListener('message', (event: MessageEvent) => {
+      if (event.data instanceof ArrayBuffer) {
+        stt.sendAudio(new Uint8Array(event.data)); // raw PCM -> Flux (no-op for text mode)
+        return;
+      }
       if (typeof event.data !== 'string') return;
       let msg: { type?: string; text?: string };
       try {
@@ -162,8 +169,8 @@ export class CallSession {
       } catch {
         return;
       }
-      if (msg.type === 'userText' && typeof msg.text === 'string') stt.feedEndOfTurn(msg.text);
-      else if (msg.type === 'partial' && typeof msg.text === 'string') stt.feedPartial(msg.text);
+      if (msg.type === 'userText' && typeof msg.text === 'string') clientStt?.feedEndOfTurn(msg.text);
+      else if (msg.type === 'partial' && typeof msg.text === 'string') clientStt?.feedPartial(msg.text);
       else if (msg.type === 'interrupt') engine.interrupt();
       else if (msg.type === 'hangup') engine.end('client_hangup');
     });
