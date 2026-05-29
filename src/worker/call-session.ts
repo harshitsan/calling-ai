@@ -33,6 +33,8 @@ interface AgentConfig {
   variables: { name: string; source: string; default?: string }[];
   tools: { name: string; description?: string; parameters?: Record<string, unknown>; webhookUrl?: string }[];
   llmTierPolicy: { defaultModel?: string; escalateModel?: string; escalateOn?: string };
+  inboundLookup?: { url: string; method?: 'GET' | 'POST'; headers?: Record<string, string>; timeoutMs?: number };
+  endWebhook?: { url: string; headers?: Record<string, string> };
 }
 
 interface Turn {
@@ -87,6 +89,7 @@ export class CallSession {
   private latencies: number[] = [];
   private speakingChars = 0;
   private finalized = false;
+  private endWebhook: AgentConfig['endWebhook'];
 
   constructor(
     private state: DurableObjectState,
@@ -119,10 +122,14 @@ export class CallSession {
       const agent = await this.loadAgent(agentId);
       if (agent) {
         this.agentId = agent.id;
-        const vars: Record<string, string> = { agent_name: agent.name };
+        this.endWebhook = agent.endWebhook;
+        // Inbound API lookup: fetch caller data before resolving variables.
+        const lookupData = agent.inboundLookup ? await this.runInboundLookup(agent.inboundLookup) : {};
+        const vars: Record<string, string> = { agent_name: agent.name, ...lookupData };
         for (const v of agent.variables) {
           if (v.source === 'call_init') vars[v.name] = params.get(v.name) ?? v.default ?? '';
           else if (v.source === 'static') vars[v.name] = v.default ?? '';
+          else if (v.source === 'webhook') vars[v.name] = lookupData[v.name] ?? v.default ?? '';
         }
         if (agent.systemPromptTemplate.trim()) systemPrompt = renderTemplate(agent.systemPromptTemplate, vars);
         voice = params.get('voice') ?? agent.voice;
@@ -274,6 +281,11 @@ export class CallSession {
     const summary = await this.summarize();
     const cost = estimateCallCost({ durationS, ttsChars: this.speakingChars });
     await this.extractMemory();
+    if (this.endWebhook) {
+      this.state.waitUntil(
+        this.deliverEndWebhook({ reason, durationS, endedAt, summary, costUsd: cost }),
+      );
+    }
 
     try {
       await this.env.DB.batch([
@@ -309,7 +321,7 @@ export class CallSession {
 
   private async loadAgent(agentId: string): Promise<AgentConfig | null> {
     const row = await this.env.DB.prepare(
-      'SELECT id, name, voice, system_prompt_template, variables_schema, tools, llm_tier_policy FROM agents WHERE id = ? AND tenant_id = ?',
+      'SELECT id, name, voice, system_prompt_template, variables_schema, tools, llm_tier_policy, inbound_lookup, end_webhook FROM agents WHERE id = ? AND tenant_id = ?',
     )
       .bind(agentId, this.tenantId)
       .first<{
@@ -320,6 +332,8 @@ export class CallSession {
         variables_schema: string;
         tools: string;
         llm_tier_policy: string;
+        inbound_lookup: string | null;
+        end_webhook: string | null;
       }>();
     if (!row) return null;
     return {
@@ -330,7 +344,87 @@ export class CallSession {
       variables: JSON.parse(row.variables_schema),
       tools: JSON.parse(row.tools),
       llmTierPolicy: JSON.parse(row.llm_tier_policy),
+      inboundLookup: row.inbound_lookup ? JSON.parse(row.inbound_lookup) : undefined,
+      endWebhook: row.end_webhook ? JSON.parse(row.end_webhook) : undefined,
     };
+  }
+
+  private async runInboundLookup(
+    cfg: NonNullable<AgentConfig['inboundLookup']>,
+  ): Promise<Record<string, string>> {
+    const payload = {
+      caller: this.callerRef,
+      agentId: this.agentId,
+      callId: this.callId,
+    };
+    const method = cfg.method ?? 'POST';
+    const timeout = cfg.timeoutMs ?? 5000;
+    let url = cfg.url;
+    if (method === 'GET') {
+      const qs = new URLSearchParams({
+        caller: this.callerRef ?? '',
+        agentId: this.agentId ?? '',
+        callId: this.callId,
+      });
+      url = `${cfg.url}${cfg.url.includes('?') ? '&' : '?'}${qs.toString()}`;
+    }
+    try {
+      const r = await fetch(url, {
+        method,
+        headers: { 'content-type': 'application/json', ...(cfg.headers ?? {}) },
+        body: method === 'POST' ? JSON.stringify(payload) : undefined,
+        signal: AbortSignal.timeout(timeout),
+      });
+      if (!r.ok) {
+        this.log('webhook', `inbound lookup ${r.status}`, { url: cfg.url }, 'warn');
+        return {};
+      }
+      const data = (await r.json().catch(() => null)) as Record<string, unknown> | null;
+      if (!data || typeof data !== 'object') return {};
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(data)) if (v != null) out[k] = String(v);
+      this.log('webhook', 'inbound lookup ok', { keys: Object.keys(out) });
+      return out;
+    } catch (e) {
+      this.log('webhook', 'inbound lookup failed', { url: cfg.url, error: String(e) }, 'error');
+      return {};
+    }
+  }
+
+  private async deliverEndWebhook(args: {
+    reason: string;
+    durationS: number;
+    endedAt: number;
+    summary: string;
+    costUsd: number;
+  }): Promise<void> {
+    const cfg = this.endWebhook;
+    if (!cfg) return;
+    const payload = {
+      callId: this.callId,
+      tenantId: this.tenantId,
+      agentId: this.agentId,
+      caller: this.callerRef,
+      startedAt: this.startedAt,
+      endedAt: args.endedAt,
+      durationS: args.durationS,
+      endReason: args.reason,
+      summary: args.summary,
+      costUsd: args.costUsd,
+      transcript: this.turns,
+    };
+    try {
+      const r = await fetch(cfg.url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(cfg.headers ?? {}) },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!r.ok) this.log('webhook', `end webhook ${r.status}`, { url: cfg.url }, 'warn');
+      else this.log('webhook', 'end webhook delivered', { status: r.status });
+    } catch (e) {
+      this.log('webhook', 'end webhook failed', { url: cfg.url, error: String(e) }, 'error');
+    }
   }
 
   private memoryStub() {

@@ -20,11 +20,12 @@ const SERVICE_COLOR: Record<string, string> = {
   tts: 'bg-amber-100 text-amber-700',
   memory: 'bg-pink-100 text-pink-700',
   tool: 'bg-cyan-100 text-cyan-700',
+  webhook: 'bg-indigo-100 text-indigo-700',
   auth: 'bg-slate-100 text-slate-700',
   system: 'bg-slate-100 text-slate-700',
 };
 
-const SERVICES = ['call', 'stt', 'llm', 'tts', 'memory', 'tool'];
+const SERVICES = ['call', 'stt', 'llm', 'tts', 'memory', 'tool', 'webhook'];
 
 export function Logs() {
   const [events, setEvents] = useState<LogEvent[]>([]);

@@ -37,6 +37,16 @@ const schema = z.object({
     escalateOn: z.enum(['never', 'manual', 'low_confidence']),
   }),
   endpointingMs: z.coerce.number().int().min(200).max(4000),
+  inboundLookup: z.object({
+    url: z.string().refine((v) => v === '' || /^https?:\/\//.test(v), 'must be a URL'),
+    method: z.enum(['GET', 'POST']),
+    headersJson: z.string(),
+    timeoutMs: z.coerce.number().int().min(500).max(15000),
+  }),
+  endWebhook: z.object({
+    url: z.string().refine((v) => v === '' || /^https?:\/\//.test(v), 'must be a URL'),
+    headersJson: z.string(),
+  }),
 });
 type FormValues = z.infer<typeof schema>;
 
@@ -49,7 +59,22 @@ const DEFAULTS: FormValues = {
   tools: [],
   llmTierPolicy: { defaultModel: 'gpt-4o-mini', escalateModel: '', escalateOn: 'never' },
   endpointingMs: 900,
+  inboundLookup: { url: '', method: 'POST', headersJson: '', timeoutMs: 5000 },
+  endWebhook: { url: '', headersJson: '' },
 };
+
+function parseHeaders(s: string): Record<string, string> {
+  if (!s.trim()) return {};
+  try {
+    const j = JSON.parse(s);
+    if (!j || typeof j !== 'object') return {};
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(j as Record<string, unknown>)) out[k] = String(v);
+    return out;
+  } catch {
+    return {};
+  }
+}
 
 export function AgentForm() {
   const { id } = useParams();
@@ -63,14 +88,44 @@ export function AgentForm() {
 
   useEffect(() => {
     if (!id) return;
-    api<{ agent: FormValues }>(`/api/agents/${id}`).then((r) => reset({ ...DEFAULTS, ...r.agent }));
+    api<{ agent: any }>(`/api/agents/${id}`).then((r) =>
+      reset({
+        ...DEFAULTS,
+        ...r.agent,
+        inboundLookup: r.agent.inboundLookup
+          ? {
+              url: r.agent.inboundLookup.url ?? '',
+              method: r.agent.inboundLookup.method ?? 'POST',
+              headersJson: JSON.stringify(r.agent.inboundLookup.headers ?? {}, null, 2),
+              timeoutMs: r.agent.inboundLookup.timeoutMs ?? 5000,
+            }
+          : DEFAULTS.inboundLookup,
+        endWebhook: r.agent.endWebhook
+          ? {
+              url: r.agent.endWebhook.url ?? '',
+              headersJson: JSON.stringify(r.agent.endWebhook.headers ?? {}, null, 2),
+            }
+          : DEFAULTS.endWebhook,
+      }),
+    );
   }, [id, reset]);
 
   async function onSubmit(values: FormValues) {
     setError('');
-    const payload = {
+    const payload: any = {
       ...values,
       tools: values.tools.map((t) => ({ ...t, webhookUrl: t.webhookUrl || undefined })),
+      inboundLookup: values.inboundLookup.url
+        ? {
+            url: values.inboundLookup.url,
+            method: values.inboundLookup.method,
+            headers: parseHeaders(values.inboundLookup.headersJson),
+            timeoutMs: values.inboundLookup.timeoutMs,
+          }
+        : null,
+      endWebhook: values.endWebhook.url
+        ? { url: values.endWebhook.url, headers: parseHeaders(values.endWebhook.headersJson) }
+        : null,
     };
     try {
       await api(editing ? `/api/agents/${id}` : '/api/agents', {
@@ -218,6 +273,57 @@ export function AgentForm() {
               <option value="manual">manual</option>
               <option value="low_confidence">low_confidence</option>
             </Select>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Integrations</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          <div className="space-y-2">
+            <Label>Inbound API call (at call start)</Label>
+            <p className="text-xs text-muted-foreground">
+              We call this URL when a call starts and merge the JSON response into your prompt variables —
+              great for looking the caller up in your CRM. Any variable with source <code>webhook</code> gets
+              its value from this response (by key name). Leave blank to skip.
+            </p>
+            <div className="flex gap-2">
+              <Select {...register('inboundLookup.method')} className="w-24">
+                <option value="POST">POST</option>
+                <option value="GET">GET</option>
+              </Select>
+              <Input placeholder="https://api.you.com/lookup" {...register('inboundLookup.url')} />
+            </div>
+            <Label className="text-xs">Headers (JSON, optional)</Label>
+            <Textarea
+              rows={3}
+              placeholder='{"Authorization": "Bearer ..."}'
+              className="font-mono text-xs"
+              {...register('inboundLookup.headersJson')}
+            />
+            <p className="text-xs text-muted-foreground">
+              Payload: <code>{`{caller, agentId, callId}`}</code> (POST as JSON body, GET as query params).
+              Timeout (ms): <input {...register('inboundLookup.timeoutMs')} className="ml-1 w-20 border rounded px-1 text-xs" />
+            </p>
+          </div>
+
+          <div className="space-y-2 border-t pt-4">
+            <Label>End-of-call webhook</Label>
+            <p className="text-xs text-muted-foreground">
+              When the call ends we POST{' '}
+              <code>{`{callId, agentId, caller, startedAt, endedAt, durationS, endReason, summary, transcript, costUsd}`}</code>{' '}
+              to this URL. Leave blank to skip.
+            </p>
+            <Input placeholder="https://api.you.com/calls/ended" {...register('endWebhook.url')} />
+            <Label className="text-xs">Headers (JSON, optional)</Label>
+            <Textarea
+              rows={3}
+              placeholder='{"Authorization": "Bearer ..."}'
+              className="font-mono text-xs"
+              {...register('endWebhook.headersJson')}
+            />
           </div>
         </CardContent>
       </Card>

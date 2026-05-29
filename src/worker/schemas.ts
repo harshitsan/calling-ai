@@ -30,6 +30,18 @@ export const ToolSchema = z.object({
   webhookUrl: z.string().url().optional(),
 });
 
+export const InboundLookupSchema = z.object({
+  url: z.string().url(),
+  method: z.enum(['GET', 'POST']).default('POST'),
+  headers: z.record(z.string(), z.string()).default({}),
+  timeoutMs: z.coerce.number().int().min(500).max(15000).default(5000),
+});
+
+export const EndWebhookSchema = z.object({
+  url: z.string().url(),
+  headers: z.record(z.string(), z.string()).default({}),
+});
+
 export const LlmTierPolicySchema = z.object({
   defaultModel: z.string().default('gpt-4o-mini'),
   escalateModel: z.string().optional(),
@@ -46,6 +58,8 @@ export const AgentSchema = z.object({
   tools: z.array(ToolSchema).default([]),
   llmTierPolicy: LlmTierPolicySchema.default({}),
   endpointingMs: z.coerce.number().int().min(200).max(4000).default(900),
+  inboundLookup: InboundLookupSchema.optional().nullable(),
+  endWebhook: EndWebhookSchema.optional().nullable(),
 });
 
 export type AgentInput = z.infer<typeof AgentSchema>;
