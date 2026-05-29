@@ -5,6 +5,13 @@
   "compatibility_date": "2025-05-01",
   "observability": { "enabled": true },
   "ai": { "binding": "AI" },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "calling-ai-db",
+      "database_id": "e461e69e-16d5-470d-b3df-54fee411b4ed"
+    }
+  ],
   "durable_objects": {
     "bindings": [{ "name": "CALL_SESSION", "class_name": "CallSession" }]
   },

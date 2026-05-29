@@ -1,15 +1,34 @@
+import { handleApi } from './api';
 import { CallSession } from './call-session';
 
 export { CallSession };
 
 const LLM_MODEL = '@cf/meta/llama-3.1-8b-instruct';
 
+const CORS = {
+  'access-control-allow-origin': '*',
+  'access-control-allow-methods': 'GET,POST,PUT,DELETE,OPTIONS',
+  'access-control-allow-headers': 'content-type,authorization,x-api-key',
+};
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS });
+    }
+
     if (url.pathname === '/healthz') {
       return new Response('ok', { headers: { 'content-type': 'text/plain' } });
+    }
+
+    if (url.pathname.startsWith('/api/auth/') || url.pathname === '/api/me' ||
+        url.pathname.startsWith('/api/agents') || url.pathname.startsWith('/api/calls')) {
+      const res = await handleApi(request, env);
+      const headers = new Headers(res.headers);
+      for (const [k, v] of Object.entries(CORS)) headers.set(k, v);
+      return new Response(res.body, { status: res.status, headers });
     }
 
     if (url.pathname === '/call') {
