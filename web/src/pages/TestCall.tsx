@@ -16,8 +16,9 @@ interface Line {
   text: string;
 }
 
-const VAD_RMS_THRESHOLD = 0.13;
-const VAD_FRAMES = 5;
+const VAD_FLOOR = 0.045; // ignore anything quieter than this (ambient)
+const VAD_RATIO = 2.2; // user speech must exceed the adaptive baseline by this factor
+const VAD_FRAMES = 3; // consecutive frames to confirm a barge-in
 
 export function TestCall() {
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -107,6 +108,12 @@ export function TestCall() {
   function bargeIn() {
     stopAudio();
     if (wsRef.current?.readyState === 1) wsRef.current.send(JSON.stringify({ type: 'interrupt' }));
+    // discard whatever the recognizer half-heard (likely agent echo), start fresh for the user
+    try {
+      recRef.current?.abort();
+    } catch {
+      /* ignore */
+    }
   }
 
   async function startVad() {
@@ -120,8 +127,16 @@ export function TestCall() {
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
       srcNode.connect(analyser);
+      // Force the graph to pull audio: route analyser -> muted gain -> destination.
+      // Without a path to destination, Chrome leaves the analyser idle (all silence).
+      const sink = ctx.createGain();
+      sink.gain.value = 0;
+      analyser.connect(sink);
+      sink.connect(ctx.destination);
+
       const data = new Uint8Array(analyser.fftSize);
       let consec = 0;
+      let baseline = 0.01; // adaptive noise/echo floor
       const loop = () => {
         analyser.getByteTimeDomainData(data);
         let sum = 0;
@@ -130,13 +145,20 @@ export function TestCall() {
           sum += x * x;
         }
         const rms = Math.sqrt(sum / data.length);
-        if (speakingRef.current && rms > VAD_RMS_THRESHOLD) {
-          if (++consec >= VAD_FRAMES) {
+        if (speakingRef.current) {
+          // barge-in when energy jumps well above the residual-echo baseline
+          if (rms > VAD_FLOOR && rms > baseline * VAD_RATIO) {
+            if (++consec >= VAD_FRAMES) {
+              consec = 0;
+              bargeIn();
+            }
+          } else {
             consec = 0;
-            bargeIn(); // user is talking over the agent -> stop it
+            baseline = baseline * 0.95 + rms * 0.05; // adapt to residual echo level
           }
         } else {
           consec = 0;
+          baseline = baseline * 0.9 + rms * 0.1; // track ambient while idle
         }
         vadRaf.current = requestAnimationFrame(loop);
       };
