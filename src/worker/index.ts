@@ -61,11 +61,12 @@ export default {
       return new Response(audio, { headers: { 'content-type': 'audio/mpeg' } });
     }
 
-    if (url.pathname === '/') {
+    if (url.pathname === '/demo') {
       return new Response(DEMO_PAGE, { headers: { 'content-type': 'text/html; charset=utf-8' } });
     }
 
-    return new Response('not found', { status: 404 });
+    // Everything else: serve the React dashboard (SPA fallback handled by assets config).
+    return env.ASSETS.fetch(request);
   },
 };
 
