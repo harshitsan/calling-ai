@@ -19,6 +19,7 @@ interface Line {
 const VAD_FLOOR = 0.045; // ignore anything quieter than this (ambient)
 const VAD_RATIO = 2.2; // user speech must exceed the adaptive baseline by this factor
 const VAD_FRAMES = 3; // consecutive frames to confirm a barge-in
+const SPEAK_GRACE = 0.15; // seconds of grace after scheduled audio ends
 
 export function TestCall() {
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -33,8 +34,6 @@ export function TestCall() {
   const ctxRef = useRef<AudioContext | null>(null);
   const nextStartRef = useRef(0);
   const sourcesRef = useRef<AudioBufferSourceNode[]>([]);
-  const speakingRef = useRef(false);
-  const speakingTimer = useRef<number | null>(null);
   const liveRef = useRef(false);
   const recRef = useRef<any>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -55,19 +54,10 @@ export function TestCall() {
     return ctxRef.current;
   }
 
-  function setSpeaking(on: boolean) {
-    if (on) {
-      if (speakingTimer.current) {
-        clearTimeout(speakingTimer.current);
-        speakingTimer.current = null;
-      }
-      speakingRef.current = true;
-    } else {
-      // small cooldown so brief gaps between clips don't re-open the mic
-      speakingTimer.current = window.setTimeout(() => {
-        speakingRef.current = false;
-      }, 300);
-    }
+  // Self-healing "agent is speaking" check derived from the audio clock — no flag to get stuck.
+  function isSpeaking() {
+    const c = ctxRef.current;
+    return !!c && c.currentTime < nextStartRef.current - 0.001 + SPEAK_GRACE && nextStartRef.current > 0;
   }
 
   async function playAudio(buf: ArrayBuffer) {
@@ -85,10 +75,8 @@ export function TestCall() {
     src.start(start);
     nextStartRef.current = start + decoded.duration;
     sourcesRef.current.push(src);
-    setSpeaking(true);
     src.onended = () => {
       sourcesRef.current = sourcesRef.current.filter((s) => s !== src);
-      if (sourcesRef.current.length === 0) setSpeaking(false);
     };
   }
 
@@ -101,19 +89,12 @@ export function TestCall() {
       }
     }
     sourcesRef.current = [];
-    nextStartRef.current = ctxRef.current ? ctxRef.current.currentTime : 0;
-    speakingRef.current = false;
+    nextStartRef.current = ctxRef.current ? ctxRef.current.currentTime : 0; // -> isSpeaking() false
   }
 
   function bargeIn() {
     stopAudio();
     if (wsRef.current?.readyState === 1) wsRef.current.send(JSON.stringify({ type: 'interrupt' }));
-    // discard whatever the recognizer half-heard (likely agent echo), start fresh for the user
-    try {
-      recRef.current?.abort();
-    } catch {
-      /* ignore */
-    }
   }
 
   async function startVad() {
@@ -127,8 +108,7 @@ export function TestCall() {
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
       srcNode.connect(analyser);
-      // Force the graph to pull audio: route analyser -> muted gain -> destination.
-      // Without a path to destination, Chrome leaves the analyser idle (all silence).
+      // Force the graph to pull audio: analyser -> muted gain -> destination.
       const sink = ctx.createGain();
       sink.gain.value = 0;
       analyser.connect(sink);
@@ -136,8 +116,9 @@ export function TestCall() {
 
       const data = new Uint8Array(analyser.fftSize);
       let consec = 0;
-      let baseline = 0.01; // adaptive noise/echo floor
+      let baseline = 0.01;
       const loop = () => {
+        if (!liveRef.current) return;
         analyser.getByteTimeDomainData(data);
         let sum = 0;
         for (const v of data) {
@@ -145,8 +126,7 @@ export function TestCall() {
           sum += x * x;
         }
         const rms = Math.sqrt(sum / data.length);
-        if (speakingRef.current) {
-          // barge-in when energy jumps well above the residual-echo baseline
+        if (isSpeaking()) {
           if (rms > VAD_FLOOR && rms > baseline * VAD_RATIO) {
             if (++consec >= VAD_FRAMES) {
               consec = 0;
@@ -154,50 +134,53 @@ export function TestCall() {
             }
           } else {
             consec = 0;
-            baseline = baseline * 0.95 + rms * 0.05; // adapt to residual echo level
+            baseline = baseline * 0.95 + rms * 0.05;
           }
         } else {
           consec = 0;
-          baseline = baseline * 0.9 + rms * 0.1; // track ambient while idle
+          baseline = baseline * 0.9 + rms * 0.1;
         }
         vadRaf.current = requestAnimationFrame(loop);
       };
       vadRaf.current = requestAnimationFrame(loop);
     } catch {
-      // mic denied: barge-in disabled, text/STT still works
+      // mic denied: barge-in disabled, text still works
     }
   }
 
+  // Robust continuous recognition: spawn a FRESH instance on every end (Chrome
+  // dies on timeouts/errors; reusing an instance gets stuck).
   function startRecognition() {
     const SR = window as unknown as { SpeechRecognition?: any; webkitSpeechRecognition?: any };
     const Rec = SR.SpeechRecognition || SR.webkitSpeechRecognition;
     if (!Rec) return;
-    const rec = new Rec();
-    rec.lang = 'en-US';
-    rec.continuous = true;
-    rec.interimResults = false;
-    rec.onresult = (e: any) => {
-      const r = e.results[e.results.length - 1];
-      if (!r.isFinal) return;
-      // half-duplex: ignore anything heard while the agent is speaking (echo)
-      if (speakingRef.current) return;
-      send(r[0].transcript);
-    };
-    rec.onend = () => {
-      if (liveRef.current) {
-        try {
-          rec.start();
-        } catch {
-          /* already started */
-        }
+
+    const spawn = () => {
+      if (!liveRef.current) return;
+      const rec = new Rec();
+      rec.lang = 'en-US';
+      rec.continuous = true;
+      rec.interimResults = false;
+      rec.onresult = (e: any) => {
+        const r = e.results[e.results.length - 1];
+        if (!r.isFinal) return;
+        if (isSpeaking()) return; // half-duplex: ignore echo while agent talks
+        send(r[0].transcript);
+      };
+      rec.onerror = () => {
+        /* onend handles the respawn */
+      };
+      rec.onend = () => {
+        if (liveRef.current) setTimeout(spawn, 300);
+      };
+      recRef.current = rec;
+      try {
+        rec.start();
+      } catch {
+        if (liveRef.current) setTimeout(spawn, 500);
       }
     };
-    try {
-      rec.start();
-    } catch {
-      /* ignore */
-    }
-    recRef.current = rec;
+    spawn();
   }
 
   async function start() {
@@ -217,7 +200,9 @@ export function TestCall() {
       startVad();
       startRecognition();
     };
-    ws.onclose = () => liveRef.current && stop();
+    ws.onclose = () => {
+      if (liveRef.current) stop();
+    };
     ws.onmessage = (e) => {
       if (typeof e.data !== 'string') {
         playAudio(e.data as ArrayBuffer);
@@ -251,7 +236,7 @@ export function TestCall() {
 
   function send(t: string) {
     if (!t.trim() || wsRef.current?.readyState !== 1) return;
-    stopAudio(); // typing/speaking interrupts the agent too
+    stopAudio(); // talking/typing interrupts the agent
     wsRef.current.send(JSON.stringify({ type: 'userText', text: t }));
     setText('');
   }
