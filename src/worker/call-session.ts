@@ -113,6 +113,14 @@ export class CallSession {
       }
     }
 
+    // vectorless KG recall at call start (top-K facts about this caller)
+    if (this.tenantId && this.callerRef) {
+      const facts = await this.recallMemory({ caller: this.callerRef });
+      if (facts.length) {
+        systemPrompt += `\n\nKnown facts about the caller:\n${facts.map((f) => `- ${f}`).join('\n')}`;
+      }
+    }
+
     if (this.tenantId) await this.createCallRecord();
 
     const pair = new WebSocketPair();
@@ -184,6 +192,7 @@ export class CallSession {
     const durationS = Math.round((endedAt - this.startedAt) / 1000);
     const summary = await this.summarize();
     const cost = estimateCallCost({ durationS, ttsChars: this.speakingChars });
+    await this.extractMemory();
 
     try {
       await this.env.DB.batch([
@@ -240,8 +249,61 @@ export class CallSession {
     };
   }
 
+  private memoryStub() {
+    return this.env.MEMORY.get(this.env.MEMORY.idFromName(this.tenantId!));
+  }
+
+  private async recallMemory(opts: { caller?: string; q?: string }): Promise<string[]> {
+    if (!this.tenantId) return [];
+    try {
+      const qs = opts.q
+        ? `q=${encodeURIComponent(opts.q)}`
+        : `caller=${encodeURIComponent(opts.caller ?? '')}`;
+      const r = await this.memoryStub().fetch(`https://memory/recall?${qs}`);
+      const j = (await r.json()) as { facts?: string[] };
+      return j.facts ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  private async extractMemory(): Promise<void> {
+    if (!this.tenantId) return;
+    const convo = this.turns.map((t) => `${t.role}: ${t.text}`).join('\n');
+    if (!convo.trim()) return;
+    try {
+      const r = (await this.env.AI.run(SUMMARY_MODEL as never, {
+        messages: [
+          {
+            role: 'system',
+            content:
+              'Extract durable facts about the caller from this transcript as a JSON array of objects {"subject","predicate","object"}. Only stable facts (identity, preferences, commitments). Respond with ONLY the JSON array, or [] if none.',
+          },
+          { role: 'user', content: convo.slice(0, 6000) },
+        ],
+        max_tokens: 300,
+      } as never)) as { response?: string };
+      const match = (r.response ?? '').match(/\[[\s\S]*\]/);
+      if (!match) return;
+      const facts = JSON.parse(match[0]) as { subject?: string; predicate?: string; object?: string }[];
+      if (!Array.isArray(facts) || facts.length === 0) return;
+      await this.memoryStub().fetch('https://memory/upsert', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ caller: this.callerRef, facts }),
+      });
+    } catch {
+      // best-effort
+    }
+  }
+
   private async executeTool(call: ToolCall, toolMap: Map<string, string | undefined>): Promise<ToolResult> {
     if (call.name === 'end_call') return dispatchTool(call);
+    if (call.name === 'recall_memory') {
+      const q = typeof call.arguments.query === 'string' ? call.arguments.query : '';
+      const facts = await this.recallMemory({ q });
+      return { type: 'continue', content: facts.length ? facts.join('; ') : 'no relevant memory found' };
+    }
     if (toolMap.has(call.name)) {
       const webhookUrl = toolMap.get(call.name);
       if (webhookUrl) {

@@ -1,7 +1,8 @@
 import { handleApi } from './api';
 import { CallSession } from './call-session';
+import { MemoryStore } from './memory-store';
 
-export { CallSession };
+export { CallSession, MemoryStore };
 
 const LLM_MODEL = '@cf/meta/llama-3.1-8b-instruct';
 
