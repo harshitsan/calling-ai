@@ -140,6 +140,70 @@ export class WorkersAiLlm implements LlmPort {
   }
 }
 
+/** Streaming LLM over the OpenAI Chat Completions API (better quality than Llama). */
+export class OpenAiLlm implements LlmPort {
+  constructor(
+    private apiKey: string,
+    private model = 'gpt-4o-mini',
+    private baseUrl = 'https://api.openai.com/v1',
+  ) {}
+
+  async *generate(messages: Message[], opts?: { signal?: AbortSignal }): AsyncIterable<LlmDelta> {
+    const res = await fetch(`${this.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${this.apiKey}` },
+      body: JSON.stringify({
+        model: this.model,
+        messages: messages.map((m) => ({ role: m.role === 'tool' ? 'user' : m.role, content: m.content })),
+        stream: true,
+        max_tokens: 300,
+        temperature: 0.6,
+      }),
+      signal: opts?.signal,
+    });
+    if (!res.ok || !res.body) {
+      yield { type: 'done' };
+      return;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    try {
+      while (true) {
+        if (opts?.signal?.aborted) return;
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() ?? '';
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t.startsWith('data:')) continue;
+          const data = t.slice(5).trim();
+          if (data === '[DONE]') {
+            yield { type: 'done' };
+            return;
+          }
+          try {
+            const j = JSON.parse(data) as { choices?: { delta?: { content?: string } }[] };
+            const tok = j.choices?.[0]?.delta?.content;
+            if (tok) yield { type: 'text', text: tok };
+          } catch {
+            // partial SSE line; ignore
+          }
+        }
+      }
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {
+        // already closed
+      }
+    }
+    yield { type: 'done' };
+  }
+}
+
 /** TTS over Workers AI Deepgram Aura. Buffers the full clip per sentence for simple playback. */
 export class AuraTts implements TtsPort {
   constructor(

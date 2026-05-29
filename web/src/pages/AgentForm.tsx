@@ -46,7 +46,7 @@ const DEFAULTS: FormValues = {
   systemPromptTemplate: 'You are {{agent_name}}, a helpful voice agent. Keep replies short and natural.',
   variables: [],
   tools: [],
-  llmTierPolicy: { defaultModel: '@cf/meta/llama-3.1-8b-instruct', escalateModel: '', escalateOn: 'never' },
+  llmTierPolicy: { defaultModel: 'gpt-4o-mini', escalateModel: '', escalateOn: 'never' },
 };
 
 export function AgentForm() {

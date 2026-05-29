@@ -31,7 +31,7 @@ export const ToolSchema = z.object({
 });
 
 export const LlmTierPolicySchema = z.object({
-  defaultModel: z.string().default('@cf/meta/llama-3.1-8b-instruct'),
+  defaultModel: z.string().default('gpt-4o-mini'),
   escalateModel: z.string().optional(),
   escalateOn: z.enum(['never', 'manual', 'low_confidence']).default('never'),
 });

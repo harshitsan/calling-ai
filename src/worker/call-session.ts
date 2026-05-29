@@ -2,8 +2,10 @@ import { ConversationEngine } from '../engine/conversation-engine';
 import type { ClientPort } from '../engine/ports';
 import { dispatchTool, type ToolCall, type ToolResult } from '../engine/tools';
 import type { ClientEvent } from '../engine/types';
-import { AuraTts, ClientFedStt, FluxStt, WorkersAiLlm } from './adapters';
-import type { SttPort } from '../engine/ports';
+import { AuraTts, ClientFedStt, FluxStt, OpenAiLlm, WorkersAiLlm } from './adapters';
+import type { LlmPort, SttPort } from '../engine/ports';
+
+const LEGACY_WORKERS_AI_MODEL = '@cf/meta/llama-3.1-8b-instruct';
 import { verifyJwt } from './auth';
 import { estimateCallCost } from './cost';
 import { uuid } from './util';
@@ -155,9 +157,17 @@ export class CallSession {
     });
 
     const gatewayId = (this.env as unknown as { AI_GATEWAY_ID?: string }).AI_GATEWAY_ID || undefined;
+    const openaiKey = (this.env as unknown as { OPENAI_API_KEY?: string }).OPENAI_API_KEY;
+    // Prefer OpenAI when configured; auto-upgrade legacy/blank model to gpt-4o-mini.
+    if (openaiKey && (model === LEGACY_WORKERS_AI_MODEL || model === '')) model = 'gpt-4o-mini';
+    const useOpenAI = Boolean(openaiKey) && !model.startsWith('@cf/');
+    const llm: LlmPort = useOpenAI
+      ? new OpenAiLlm(openaiKey!, model)
+      : new WorkersAiLlm(this.env.AI, { model, gatewayId });
+
     const engine = new ConversationEngine({
       stt,
-      llm: new WorkersAiLlm(this.env.AI, { model, gatewayId }),
+      llm,
       tts: new AuraTts(this.env.AI, voice),
       client: port,
       clock: { now: () => Date.now() },
