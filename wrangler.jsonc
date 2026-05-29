@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "calling-ai",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2025-05-01",
+  "observability": { "enabled": true },
+  "ai": { "binding": "AI" },
+  "durable_objects": {
+    "bindings": [{ "name": "CALL_SESSION", "class_name": "CallSession" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["CallSession"] }
+  ]
+}
