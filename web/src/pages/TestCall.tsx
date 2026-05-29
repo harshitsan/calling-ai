@@ -29,6 +29,7 @@ export function TestCall() {
   const [lines, setLines] = useState<Line[]>([]);
   const [latency, setLatency] = useState<number | null>(null);
   const [text, setText] = useState('');
+  const [interim, setInterim] = useState('');
 
   const wsRef = useRef<WebSocket | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
@@ -160,12 +161,20 @@ export function TestCall() {
       const rec = new Rec();
       rec.lang = 'en-US';
       rec.continuous = true;
-      rec.interimResults = false;
+      rec.interimResults = true;
       rec.onresult = (e: any) => {
-        const r = e.results[e.results.length - 1];
-        if (!r.isFinal) return;
         if (isSpeaking()) return; // half-duplex: ignore echo while agent talks
-        send(r[0].transcript);
+        let interimText = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const res = e.results[i];
+          if (res.isFinal) {
+            setInterim('');
+            send(res[0].transcript);
+          } else {
+            interimText += res[0].transcript;
+          }
+        }
+        if (interimText) setInterim(interimText);
       };
       rec.onerror = () => {
         /* onend handles the respawn */
@@ -227,6 +236,7 @@ export function TestCall() {
     recRef.current = null;
     micStreamRef.current?.getTracks().forEach((t) => t.stop());
     micStreamRef.current = null;
+    setInterim('');
     stopAudio();
     if (wsRef.current?.readyState === 1) wsRef.current.send(JSON.stringify({ type: 'hangup' }));
     wsRef.current?.close();
@@ -303,6 +313,11 @@ export function TestCall() {
               {l.text}
             </div>
           ))}
+          {interim && (
+            <div className="text-sm opacity-50 italic">
+              <span className="text-blue-600 font-medium">You:</span> {interim}…
+            </div>
+          )}
         </CardContent>
       </Card>
 
