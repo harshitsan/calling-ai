@@ -42,12 +42,19 @@ export function CallDetail() {
   };
 
   return (
-    <div className="space-y-6">
-      <Link to="/calls" className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:underline">
-        <ArrowLeft className="h-4 w-4" /> Back to calls
+    <div className="space-y-8 fade-up">
+      <Link to="/calls" className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.22em] text-muted-foreground hover:text-foreground/95 transition-colors">
+        <ArrowLeft className="h-3.5 w-3.5" /> Back to calls
       </Link>
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div>
+        <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground/80 mb-2">Call</div>
+        <h1 className="font-display text-5xl tracking-tight leading-[0.95]">
+          <span className="italic text-aurora">{call.caller_ref ?? 'Unknown caller'}</span>
+        </h1>
+      </div>
+
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 stagger">
         <Stat label="Duration" value={call.duration_s != null ? `${call.duration_s}s` : '—'} />
         <Stat label="Latency p50" value={call.latency_p50_ms != null ? `${call.latency_p50_ms}ms` : '—'} />
         <Stat label="Cost" value={call.cost_usd != null ? `$${call.cost_usd.toFixed(4)}` : '—'} />
@@ -58,21 +65,29 @@ export function CallDetail() {
         <CardHeader>
           <CardTitle>Summary</CardTitle>
         </CardHeader>
-        <CardContent className="text-sm text-muted-foreground">{call.summary || 'No summary.'}</CardContent>
+        <CardContent className="font-display italic text-[17px] leading-relaxed text-foreground/85">
+          {call.summary || 'No summary.'}
+        </CardContent>
       </Card>
 
       <Card>
         <CardHeader>
           <CardTitle>Transcript</CardTitle>
         </CardHeader>
-        <CardContent className="space-y-2">
-          {turns.length === 0 && <p className="text-sm text-muted-foreground">No transcript.</p>}
+        <CardContent className="space-y-3">
+          {turns.length === 0 && <p className="text-sm text-muted-foreground italic font-display">No transcript.</p>}
           {turns.map((t, i) => (
-            <div key={i} className="text-sm">
-              <span className={t.role === 'user' ? 'text-blue-600 font-medium' : 'text-emerald-700 font-medium'}>
-                {t.role === 'user' ? 'Caller' : 'Agent'}:
-              </span>{' '}
-              {t.text}
+            <div key={i} className="flex gap-3 text-[14px] leading-relaxed">
+              <span
+                className={
+                  t.role === 'user'
+                    ? 'shrink-0 mt-0.5 text-[10px] uppercase tracking-[0.18em] text-aurora-2 font-medium w-16'
+                    : 'shrink-0 mt-0.5 text-[10px] uppercase tracking-[0.18em] text-aurora-1 font-medium w-16'
+                }
+              >
+                {t.role === 'user' ? 'Caller' : 'Agent'}
+              </span>
+              <span className="text-foreground/90">{t.text}</span>
             </div>
           ))}
         </CardContent>
@@ -83,11 +98,9 @@ export function CallDetail() {
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <Card>
-      <CardContent className="p-4">
-        <div className="text-xs text-muted-foreground">{label}</div>
-        <div className="text-lg font-semibold">{value}</div>
-      </CardContent>
+    <Card className="p-5">
+      <div className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground/75">{label}</div>
+      <div className="mt-2 font-display text-2xl tracking-tight text-foreground/95">{value}</div>
     </Card>
   );
 }

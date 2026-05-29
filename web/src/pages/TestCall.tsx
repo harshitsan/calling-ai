@@ -288,8 +288,16 @@ export function TestCall() {
   const live = status === 'live' || status === 'connecting';
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-semibold">Test Call</h1>
+    <div className="space-y-8 fade-up">
+      <header>
+        <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground/80 mb-3">Live · Test Call</div>
+        <h1 className="font-display text-6xl tracking-tight leading-[0.95]">
+          Step <span className="italic text-aurora">into</span> the call
+        </h1>
+        <p className="mt-4 text-[13px] text-muted-foreground max-w-md leading-relaxed">
+          Pick a voice, name the caller, and speak. The agent will listen, interrupt, and hang up on its own.
+        </p>
+      </header>
 
       <Card>
         <CardHeader>
@@ -321,11 +329,17 @@ export function TestCall() {
             </Button>
           )}
           {status === 'live' && (
-            <span className="flex items-center gap-2 text-sm text-emerald-600">
-              <span className="h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse" /> Live — just talk
+            <span className="flex items-center gap-2.5 text-[12px] tracking-tight text-emerald-300/95">
+              <span className="breath inline-block h-2 w-2 rounded-full bg-emerald-400/90" />
+              <span className="italic font-display text-[15px]">Live</span>
+              <span className="text-muted-foreground">— just talk</span>
             </span>
           )}
-          {latency != null && <span className="text-sm text-muted-foreground">first audio: {latency}ms</span>}
+          {latency != null && (
+            <span className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground/80">
+              first audio · <span className="text-foreground/85">{latency}ms</span>
+            </span>
+          )}
         </CardContent>
       </Card>
 
@@ -341,21 +355,32 @@ export function TestCall() {
           )}
           {lines.map((l, i) =>
             l.role === 'system' ? (
-              <div key={i} className="text-center text-xs text-muted-foreground py-1">
-                {l.text}
+              <div key={i} className="text-center py-2">
+                <span className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground/70 italic font-display normal-case">
+                  {l.text}
+                </span>
               </div>
             ) : (
-              <div key={i} className="text-sm">
-                <span className={l.role === 'user' ? 'text-blue-600 font-medium' : 'text-emerald-700 font-medium'}>
-                  {l.role === 'user' ? 'You' : 'Agent'}:
-                </span>{' '}
-                {l.text}
+              <div key={i} className="flex gap-3 text-[14px] leading-relaxed">
+                <span
+                  className={
+                    l.role === 'user'
+                      ? 'shrink-0 mt-0.5 text-[10px] uppercase tracking-[0.18em] text-aurora-2 font-medium w-14'
+                      : 'shrink-0 mt-0.5 text-[10px] uppercase tracking-[0.18em] text-aurora-1 font-medium w-14'
+                  }
+                >
+                  {l.role === 'user' ? 'You' : 'Agent'}
+                </span>
+                <span className="text-foreground/90">{l.text}</span>
               </div>
             ),
           )}
           {interim && (
-            <div className="text-sm opacity-50 italic">
-              <span className="text-blue-600 font-medium">You:</span> {interim}…
+            <div className="flex gap-3 text-[14px] leading-relaxed opacity-55 italic font-display">
+              <span className="shrink-0 mt-0.5 text-[10px] uppercase tracking-[0.18em] text-aurora-2 font-medium w-14 not-italic font-sans">
+                You
+              </span>
+              <span>{interim}…</span>
             </div>
           )}
         </CardContent>

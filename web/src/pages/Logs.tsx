@@ -72,9 +72,14 @@ export function Logs() {
   }
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Realtime Logs</h1>
+    <div className="space-y-6 fade-up">
+      <header>
+        <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground/80 mb-3">Telemetry · Live</div>
+        <h1 className="font-display text-6xl tracking-tight leading-[0.95]">
+          The <span className="italic text-aurora">pulse</span>
+        </h1>
+      </header>
+      <div className="flex items-center justify-end -mt-4">
         <div className="flex items-center gap-3 text-sm">
           {errorCount > 0 && (
             <Badge className="bg-red-100 text-red-700">{errorCount} error{errorCount > 1 ? 's' : ''}</Badge>
@@ -118,7 +123,7 @@ export function Logs() {
 
       <Card>
         <CardContent className="p-0">
-          <div className="h-[60vh] overflow-y-auto font-mono text-xs p-3 space-y-1">
+          <div className="h-[60vh] overflow-y-auto font-mono text-[12px] p-5 space-y-1.5">
             {shown.length === 0 && (
               <p className="text-muted-foreground">
                 Waiting for events… start a Test Call in another tab and watch them stream here.

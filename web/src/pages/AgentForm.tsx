@@ -139,13 +139,20 @@ export function AgentForm() {
   }
 
   return (
-    <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">{editing ? 'Edit agent' : 'New agent'}</h1>
-        <Button type="submit" disabled={formState.isSubmitting}>
-          {formState.isSubmitting ? 'Saving…' : 'Save'}
+    <form onSubmit={handleSubmit(onSubmit)} className="space-y-8 fade-up">
+      <header className="flex items-end justify-between gap-6">
+        <div>
+          <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground/80 mb-3">
+            {editing ? 'Editing' : 'Composing'}
+          </div>
+          <h1 className="font-display text-6xl tracking-tight leading-[0.95]">
+            {editing ? 'Tune the' : 'A new'} <span className="italic text-aurora">voice</span>
+          </h1>
+        </div>
+        <Button type="submit" size="lg" disabled={formState.isSubmitting}>
+          {formState.isSubmitting ? 'Saving…' : 'Save agent'}
         </Button>
-      </div>
+      </header>
 
       <Card>
         <CardHeader>

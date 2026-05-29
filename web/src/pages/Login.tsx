@@ -4,7 +4,6 @@ import { useForm } from 'react-hook-form';
 import { useNavigate } from 'react-router-dom';
 import { z } from 'zod';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { api, setToken } from '@/lib/api';
@@ -43,43 +42,55 @@ export function Login() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-4">
-      <Card className="w-full max-w-sm">
-        <CardHeader>
-          <CardTitle>calling-ai</CardTitle>
-          <CardDescription>{mode === 'login' ? 'Sign in to your workspace' : 'Create a workspace'}</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+    <div className="min-h-screen flex items-center justify-center p-6">
+      <div className="w-full max-w-[440px] fade-up">
+        <div className="text-center mb-10">
+          <div className="font-display text-6xl leading-none tracking-tight text-foreground/95">
+            calling<span className="text-aurora">.</span>
+            <span className="italic text-aurora">ai</span>
+          </div>
+          <p className="mt-5 text-[13px] text-muted-foreground italic font-display">
+            {mode === 'login' ? 'Welcome back.' : 'Begin something quiet and exceptional.'}
+          </p>
+        </div>
+
+        <div className="glass rounded-2xl p-8 stagger">
+          <form onSubmit={handleSubmit(onSubmit)} className="space-y-5">
             {mode === 'register' && (
-              <div className="space-y-1">
-                <Label>Workspace name</Label>
-                <Input placeholder="Acme Inc" {...register('tenantName')} />
+              <div className="space-y-2">
+                <Label>Workspace</Label>
+                <Input placeholder="Aurora Studio" {...register('tenantName')} />
               </div>
             )}
-            <div className="space-y-1">
+            <div className="space-y-2">
               <Label>Email</Label>
-              <Input type="email" placeholder="you@company.com" {...register('email')} />
-              {errors.email && <p className="text-xs text-destructive">{errors.email.message}</p>}
+              <Input type="email" placeholder="you@elsewhere.com" {...register('email')} />
+              {errors.email && <p className="text-xs text-destructive/90">{errors.email.message}</p>}
             </div>
-            <div className="space-y-1">
+            <div className="space-y-2">
               <Label>Password</Label>
               <Input type="password" placeholder="••••••••" {...register('password')} />
-              {errors.password && <p className="text-xs text-destructive">{errors.password.message}</p>}
+              {errors.password && <p className="text-xs text-destructive/90">{errors.password.message}</p>}
             </div>
-            {error && <p className="text-sm text-destructive">{error}</p>}
-            <Button type="submit" className="w-full" disabled={isSubmitting}>
-              {isSubmitting ? 'Please wait…' : mode === 'login' ? 'Sign in' : 'Create workspace'}
+            {error && <p className="text-sm text-destructive/90">{error}</p>}
+            <Button type="submit" size="lg" className="w-full" disabled={isSubmitting}>
+              {isSubmitting ? 'A moment…' : mode === 'login' ? 'Enter' : 'Create workspace'}
             </Button>
           </form>
+          <div className="hairline my-6" />
           <button
-            className="mt-4 text-sm text-muted-foreground hover:underline"
+            type="button"
+            className="w-full text-center text-[12px] text-muted-foreground hover:text-foreground/90 transition-colors"
             onClick={() => setMode(mode === 'login' ? 'register' : 'login')}
           >
-            {mode === 'login' ? "Don't have an account? Register" : 'Already have an account? Sign in'}
+            {mode === 'login' ? 'No account yet? Create a workspace →' : 'Already with us? Sign in →'}
           </button>
-        </CardContent>
-      </Card>
+        </div>
+
+        <p className="text-center mt-8 text-[10px] uppercase tracking-[0.24em] text-muted-foreground/60">
+          a quieter way to call
+        </p>
+      </div>
     </div>
   );
 }
