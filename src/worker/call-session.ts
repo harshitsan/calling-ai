@@ -46,6 +46,7 @@ export class CallSession {
       client: new WsClientPort(server),
       clock: { now: () => Date.now() },
       systemPrompt,
+      chunkerOptions: { minWords: 6, maxWords: 30 },
     });
     engine.start();
 

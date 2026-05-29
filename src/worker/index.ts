@@ -30,7 +30,7 @@ export default {
 
     if (url.pathname === '/api/tts') {
       const text = url.searchParams.get('text') ?? 'Hello from Cloudflare.';
-      const speaker = url.searchParams.get('voice') ?? 'angus';
+      const speaker = url.searchParams.get('voice') ?? 'asteria';
       const res = (await env.AI.run('@cf/deepgram/aura-1' as never, {
         text,
         speaker,
@@ -57,21 +57,44 @@ const DEMO_PAGE = `<!doctype html>
 <style>
   body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; color: #111; }
   h1 { font-size: 1.25rem; }
-  #log { border: 1px solid #ddd; border-radius: 8px; padding: .75rem; height: 320px; overflow-y: auto; background: #fafafa; }
+  #log { border: 1px solid #ddd; border-radius: 8px; padding: .75rem; height: 300px; overflow-y: auto; background: #fafafa; }
   .msg { margin: .35rem 0; }
   .user { color: #1a56db; }
   .assistant { color: #047857; }
   .meta { color: #6b7280; font-size: .8rem; }
-  .row { display: flex; gap: .5rem; margin-top: .75rem; }
+  .row { display: flex; gap: .5rem; margin-top: .75rem; align-items: center; }
   input[type=text] { flex: 1; padding: .5rem; border: 1px solid #ccc; border-radius: 6px; }
+  select { padding: .5rem; border: 1px solid #ccc; border-radius: 6px; }
   button { padding: .5rem .9rem; border: 0; border-radius: 6px; background: #111; color: #fff; cursor: pointer; }
   button.secondary { background: #6b7280; }
+  label { font-size: .85rem; color: #374151; }
   #status { font-size: .85rem; color: #6b7280; }
 </style>
 </head>
 <body>
   <h1>calling-ai &mdash; voice agent demo</h1>
-  <p id="status">connecting&hellip;</p>
+  <div class="row">
+    <label for="voice">Voice</label>
+    <select id="voice">
+      <optgroup label="Female">
+        <option value="asteria">Asteria</option>
+        <option value="luna">Luna</option>
+        <option value="stella">Stella</option>
+        <option value="athena">Athena</option>
+        <option value="hera">Hera</option>
+      </optgroup>
+      <optgroup label="Male">
+        <option value="orion">Orion</option>
+        <option value="arcas">Arcas</option>
+        <option value="perseus">Perseus</option>
+        <option value="angus">Angus</option>
+        <option value="orpheus">Orpheus</option>
+        <option value="helios">Helios</option>
+        <option value="zeus">Zeus</option>
+      </optgroup>
+    </select>
+    <span id="status">connecting&hellip;</span>
+  </div>
   <div id="log"></div>
   <div class="row">
     <input id="text" type="text" placeholder="Type a message and press Send" autocomplete="off" />
@@ -86,8 +109,8 @@ const DEMO_PAGE = `<!doctype html>
 <script>
 const logEl = document.getElementById('log');
 const statusEl = document.getElementById('status');
-const audioQueue = [];
-let playing = false;
+const voiceEl = document.getElementById('voice');
+const textEl = document.getElementById('text');
 
 function add(text, cls) {
   const d = document.createElement('div');
@@ -97,41 +120,67 @@ function add(text, cls) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-async function playNext() {
-  if (playing || audioQueue.length === 0) return;
-  playing = true;
-  const buf = audioQueue.shift();
-  const blob = new Blob([buf], { type: 'audio/mpeg' });
-  const audio = new Audio(URL.createObjectURL(blob));
-  audio.onended = () => { playing = false; playNext(); };
-  audio.onerror = () => { playing = false; playNext(); };
-  try { await audio.play(); } catch { playing = false; playNext(); }
+// ---- gapless Web Audio playback ----
+let audioCtx = null;
+let nextStart = 0;
+let sources = [];
+async function ensureCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+}
+async function enqueueAudio(arrayBuffer) {
+  await ensureCtx();
+  let buf;
+  try { buf = await audioCtx.decodeAudioData(arrayBuffer.slice(0)); } catch (e) { return; }
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+  const start = Math.max(audioCtx.currentTime + 0.02, nextStart);
+  src.start(start);
+  nextStart = start + buf.duration;
+  sources.push(src);
+  src.onended = () => { sources = sources.filter((s) => s !== src); };
+}
+function stopAudio() {
+  for (const s of sources) { try { s.stop(); } catch (e) {} }
+  sources = [];
+  nextStart = audioCtx ? audioCtx.currentTime : 0;
 }
 
-const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-const ws = new WebSocket(proto + '://' + location.host + '/call');
-ws.binaryType = 'arraybuffer';
-ws.onopen = () => { statusEl.textContent = 'connected'; };
-ws.onclose = () => { statusEl.textContent = 'disconnected'; };
-ws.onmessage = (e) => {
-  if (typeof e.data !== 'string') { audioQueue.push(e.data); playNext(); return; }
-  const ev = JSON.parse(e.data);
-  if (ev.type === 'transcript') add((ev.role === 'user' ? 'You: ' : 'Agent: ') + ev.text, ev.role);
-  else if (ev.type === 'state') statusEl.textContent = ev.state;
-  else if (ev.type === 'latency' && ev.turn.endpointToFirstAudio != null) add('↳ first audio ' + ev.turn.endpointToFirstAudio + 'ms', 'meta');
-  else if (ev.type === 'ended') { add('— call ended (' + ev.reason + ') —', 'meta'); statusEl.textContent = 'ended'; }
-};
+// ---- websocket call ----
+let ws = null;
+function connect(voice) {
+  if (ws) { try { ws.close(); } catch (e) {} }
+  stopAudio();
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(proto + '://' + location.host + '/call?voice=' + encodeURIComponent(voice));
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { statusEl.textContent = 'connected (' + voice + ')'; };
+  ws.onclose = () => { statusEl.textContent = 'disconnected'; };
+  ws.onmessage = (e) => {
+    if (typeof e.data !== 'string') { enqueueAudio(e.data); return; }
+    const ev = JSON.parse(e.data);
+    if (ev.type === 'transcript') add((ev.role === 'user' ? 'You: ' : 'Agent: ') + ev.text, ev.role);
+    else if (ev.type === 'state') statusEl.textContent = ev.state;
+    else if (ev.type === 'flush') stopAudio();
+    else if (ev.type === 'latency' && ev.turn.endpointToFirstAudio != null) add('↳ first audio ' + ev.turn.endpointToFirstAudio + 'ms', 'meta');
+    else if (ev.type === 'ended') { add('— call ended (' + ev.reason + ') —', 'meta'); statusEl.textContent = 'ended'; }
+  };
+}
 
 function sendText(text) {
-  if (!text.trim() || ws.readyState !== 1) return;
+  if (!text.trim() || !ws || ws.readyState !== 1) return;
+  ensureCtx();
   ws.send(JSON.stringify({ type: 'userText', text }));
 }
 
-const textEl = document.getElementById('text');
+connect(voiceEl.value);
+voiceEl.onchange = () => connect(voiceEl.value);
+
 document.getElementById('send').onclick = () => { sendText(textEl.value); textEl.value = ''; };
 textEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') { sendText(textEl.value); textEl.value = ''; } });
-document.getElementById('interrupt').onclick = () => ws.send(JSON.stringify({ type: 'interrupt' }));
-document.getElementById('hangup').onclick = () => ws.send(JSON.stringify({ type: 'hangup' }));
+document.getElementById('interrupt').onclick = () => { stopAudio(); if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'interrupt' })); };
+document.getElementById('hangup').onclick = () => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'hangup' })); };
 
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const micBtn = document.getElementById('mic');
@@ -139,9 +188,12 @@ if (SR) {
   const rec = new SR();
   rec.continuous = false; rec.interimResults = false; rec.lang = 'en-US';
   let on = false;
-  rec.onresult = (e) => { const t = e.results[0][0].transcript; sendText(t); };
+  rec.onresult = (e) => { sendText(e.results[0][0].transcript); };
   rec.onend = () => { on = false; micBtn.textContent = '🎤 Talk'; };
-  micBtn.onclick = () => { if (on) { rec.stop(); } else { on = true; micBtn.textContent = '◉ Listening…'; rec.start(); } };
+  micBtn.onclick = async () => {
+    await ensureCtx();
+    if (on) { rec.stop(); } else { on = true; micBtn.textContent = '◉ Listening…'; rec.start(); }
+  };
 } else {
   micBtn.disabled = true; micBtn.textContent = 'mic n/a';
 }
