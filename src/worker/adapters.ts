@@ -1,6 +1,9 @@
 import type { LlmPort, SttPort, TtsPort } from '../engine/ports';
 import type { AudioChunk, LlmDelta, Message, SttEvent } from '../engine/types';
 
+/** Reports a failure/warning out of an adapter so it can be logged. */
+export type ErrorReporter = (msg: string, data?: Record<string, unknown>, level?: 'warn' | 'error') => void;
+
 /**
  * Server-side Deepgram Flux STT over Workers AI WebSocket.
  * Client streams raw linear16 16kHz PCM frames; Flux emits Update/EndOfTurn events.
@@ -12,7 +15,11 @@ export class FluxStt implements SttPort {
   private queue: Uint8Array[] = [];
   private ready: Promise<void>;
 
-  constructor(ai: Ai, sampleRate = '16000') {
+  constructor(
+    ai: Ai,
+    sampleRate = '16000',
+    private onError?: ErrorReporter,
+  ) {
     this.ready = this.connect(ai, sampleRate);
   }
 
@@ -24,7 +31,10 @@ export class FluxStt implements SttPort {
         { websocket: true } as never,
       )) as unknown as { webSocket?: WebSocket };
       const ws = resp.webSocket;
-      if (!ws) return;
+      if (!ws) {
+        this.onError?.('Flux STT did not return a WebSocket');
+        return;
+      }
       ws.accept();
       ws.addEventListener('message', (e: MessageEvent) => {
         if (typeof e.data !== 'string') return;
@@ -41,8 +51,8 @@ export class FluxStt implements SttPort {
       this.flux = ws;
       for (const f of this.queue) ws.send(f);
       this.queue = [];
-    } catch {
-      // leave flux null; audio frames will be dropped
+    } catch (e) {
+      this.onError?.('Flux STT connection failed', { error: String(e) });
     }
   }
 
@@ -82,12 +92,14 @@ export class ClientFedStt implements SttPort {
 export class WorkersAiLlm implements LlmPort {
   private model: string;
   private gatewayId?: string;
+  private onError?: ErrorReporter;
   constructor(
     private ai: Ai,
-    opts: { model?: string; gatewayId?: string } = {},
+    opts: { model?: string; gatewayId?: string; onError?: ErrorReporter } = {},
   ) {
     this.model = opts.model ?? '@cf/meta/llama-3.1-8b-instruct';
     this.gatewayId = opts.gatewayId;
+    this.onError = opts.onError;
   }
 
   async *generate(messages: Message[], opts?: { signal?: AbortSignal }): AsyncIterable<LlmDelta> {
@@ -96,11 +108,23 @@ export class WorkersAiLlm implements LlmPort {
       content: m.content,
     }));
     const runOpts = this.gatewayId ? { gateway: { id: this.gatewayId } } : undefined;
-    const stream = (await this.ai.run(
-      this.model as never,
-      { messages: aiMessages, stream: true, max_tokens: 512 } as never,
-      runOpts as never,
-    )) as unknown as ReadableStream<Uint8Array>;
+    let stream: ReadableStream<Uint8Array>;
+    try {
+      stream = (await this.ai.run(
+        this.model as never,
+        { messages: aiMessages, stream: true, max_tokens: 512 } as never,
+        runOpts as never,
+      )) as unknown as ReadableStream<Uint8Array>;
+    } catch (e) {
+      this.onError?.('Workers AI LLM call failed', { model: this.model, error: String(e) });
+      yield { type: 'done' };
+      return;
+    }
+    if (!stream) {
+      this.onError?.('Workers AI LLM returned no stream', { model: this.model });
+      yield { type: 'done' };
+      return;
+    }
 
     const reader = stream.getReader();
     const decoder = new TextDecoder();
@@ -153,36 +177,48 @@ interface OpenAiDelta {
 /** Streaming LLM over the OpenAI Chat Completions API, with function calling. */
 export class OpenAiLlm implements LlmPort {
   private tools?: OpenAiTool[];
+  private onError?: ErrorReporter;
   constructor(
     private apiKey: string,
     private model = 'gpt-4o-mini',
-    opts: { tools?: OpenAiTool[]; baseUrl?: string } = {},
+    opts: { tools?: OpenAiTool[]; baseUrl?: string; onError?: ErrorReporter } = {},
     private baseUrl = opts.baseUrl ?? 'https://api.openai.com/v1',
   ) {
     this.tools = opts.tools && opts.tools.length ? opts.tools : undefined;
+    this.onError = opts.onError;
   }
 
   async *generate(messages: Message[], opts?: { signal?: AbortSignal }): AsyncIterable<LlmDelta> {
-    const res = await fetch(`${this.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${this.apiKey}` },
-      body: JSON.stringify({
-        model: this.model,
-        messages: messages.map((m) => ({ role: m.role === 'tool' ? 'user' : m.role, content: m.content })),
-        stream: true,
-        max_tokens: 300,
-        temperature: 0.6,
-        ...(this.tools ? { tools: this.tools, tool_choice: 'auto' } : {}),
-      }),
-      signal: opts?.signal,
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${this.apiKey}` },
+        body: JSON.stringify({
+          model: this.model,
+          messages: messages.map((m) => ({ role: m.role === 'tool' ? 'user' : m.role, content: m.content })),
+          stream: true,
+          max_tokens: 300,
+          temperature: 0.6,
+          ...(this.tools ? { tools: this.tools, tool_choice: 'auto' } : {}),
+        }),
+        signal: opts?.signal,
+      });
+    } catch (e) {
+      if (!opts?.signal?.aborted) this.onError?.('OpenAI request threw', { model: this.model, error: String(e) });
+      yield { type: 'done' };
+      return;
+    }
     if (!res.ok || !res.body) {
+      const body = await res.text().catch(() => '');
+      this.onError?.('OpenAI request failed', { status: res.status, body: body.slice(0, 300) });
       yield { type: 'done' };
       return;
     }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
+    let produced = false;
     const toolAcc = new Map<number, { id: string; name: string; args: string }>();
 
     const flushTools = (): LlmDelta[] => {
@@ -213,15 +249,23 @@ export class OpenAiLlm implements LlmPort {
           if (!t.startsWith('data:')) continue;
           const data = t.slice(5).trim();
           if (data === '[DONE]') {
-            for (const d of flushTools()) yield d;
+            const tools = flushTools();
+            for (const d of tools) yield d;
+            if (!produced && tools.length === 0) {
+              this.onError?.('OpenAI returned an empty response', { model: this.model }, 'warn');
+            }
             yield { type: 'done' };
             return;
           }
           try {
             const j = JSON.parse(data) as { choices?: { delta?: OpenAiDelta }[] };
             const delta = j.choices?.[0]?.delta;
-            if (delta?.content) yield { type: 'text', text: delta.content };
+            if (delta?.content) {
+              produced = true;
+              yield { type: 'text', text: delta.content };
+            }
             if (delta?.tool_calls) {
+              produced = true;
               for (const tc of delta.tool_calls) {
                 const idx = tc.index ?? 0;
                 const cur = toolAcc.get(idx) ?? { id: '', name: '', args: '' };
@@ -243,7 +287,11 @@ export class OpenAiLlm implements LlmPort {
         // already closed
       }
     }
-    for (const d of flushTools()) yield d;
+    const tools = flushTools();
+    for (const d of tools) yield d;
+    if (!produced && tools.length === 0 && !opts?.signal?.aborted) {
+      this.onError?.('OpenAI stream ended with no output', { model: this.model }, 'warn');
+    }
     yield { type: 'done' };
   }
 }
@@ -253,19 +301,27 @@ export class AuraTts implements TtsPort {
   constructor(
     private ai: Ai,
     private speaker = 'angus',
+    private onError?: ErrorReporter,
   ) {}
 
   async *synthesize(text: string, opts?: { signal?: AbortSignal }): AsyncIterable<AudioChunk> {
     if (opts?.signal?.aborted) return;
-    const res = (await this.ai.run('@cf/deepgram/aura-1' as never, {
-      text,
-      speaker: this.speaker,
-      encoding: 'mp3',
-    } as never)) as unknown;
+    let res: unknown;
+    try {
+      res = await this.ai.run('@cf/deepgram/aura-1' as never, {
+        text,
+        speaker: this.speaker,
+        encoding: 'mp3',
+      } as never);
+    } catch (e) {
+      this.onError?.('Aura TTS call failed', { speaker: this.speaker, error: String(e) });
+      return;
+    }
 
     const bytes = await toBytes(res);
     if (opts?.signal?.aborted) return;
     if (bytes.length > 0) yield { data: bytes };
+    else this.onError?.('Aura TTS returned no audio', { speaker: this.speaker, chars: text.length }, 'warn');
   }
 }
 

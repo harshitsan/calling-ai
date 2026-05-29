@@ -150,7 +150,9 @@ export class CallSession {
     server.accept();
 
     const useFlux = params.get('stt') === 'flux';
-    const stt: SttPort = useFlux ? new FluxStt(this.env.AI) : new ClientFedStt();
+    const reporter = (service: string) =>
+      (m: string, d?: Record<string, unknown>, l?: 'warn' | 'error') => this.log(service, m, d, l ?? 'error');
+    const stt: SttPort = useFlux ? new FluxStt(this.env.AI, '16000', reporter('stt')) : new ClientFedStt();
     const port = new RecordingClientPort(server, {
       onTurn: (t) => {
         this.turns.push(t);
@@ -195,13 +197,13 @@ export class CallSession {
       })),
     ];
     const llm: LlmPort = useOpenAI
-      ? new OpenAiLlm(openaiKey!, model, { tools: openaiTools })
-      : new WorkersAiLlm(this.env.AI, { model, gatewayId });
+      ? new OpenAiLlm(openaiKey!, model, { tools: openaiTools, onError: reporter('llm') })
+      : new WorkersAiLlm(this.env.AI, { model, gatewayId, onError: reporter('llm') });
 
     const engine = new ConversationEngine({
       stt,
       llm,
-      tts: new AuraTts(this.env.AI, voice),
+      tts: new AuraTts(this.env.AI, voice, reporter('tts')),
       client: port,
       clock: { now: () => Date.now() },
       systemPrompt,
@@ -258,8 +260,8 @@ export class CallSession {
       )
         .bind(this.callId, this.tenantId, this.agentId, this.callerRef, this.startedAt, 'active')
         .run();
-    } catch {
-      // best-effort; logging must never break a call
+    } catch (e) {
+      this.log('system', 'failed to create call record', { error: String(e) }, 'error');
     }
   }
 
@@ -282,8 +284,8 @@ export class CallSession {
           'INSERT OR REPLACE INTO transcripts (call_id, tenant_id, turns) VALUES (?, ?, ?)',
         ).bind(this.callId, this.tenantId, JSON.stringify(this.turns)),
       ]);
-    } catch {
-      // best-effort
+    } catch (e) {
+      this.log('system', 'failed to persist call/transcript', { error: String(e) }, 'error');
     }
   }
 
@@ -299,7 +301,8 @@ export class CallSession {
         max_tokens: 120,
       } as never)) as { response?: string };
       return (r.response ?? '').trim();
-    } catch {
+    } catch (e) {
+      this.log('llm', 'summary generation failed', { error: String(e) }, 'warn');
       return '';
     }
   }
@@ -344,7 +347,8 @@ export class CallSession {
       const j = (await r.json()) as { facts?: string[] };
       this.log('memory', 'recall', { query: opts.q ?? opts.caller, hits: j.facts?.length ?? 0 });
       return j.facts ?? [];
-    } catch {
+    } catch (e) {
+      this.log('memory', 'recall failed', { error: String(e) }, 'warn');
       return [];
     }
   }
@@ -375,8 +379,8 @@ export class CallSession {
         body: JSON.stringify({ caller: this.callerRef, facts }),
       });
       this.log('memory', 'extracted facts', { count: facts.length });
-    } catch {
-      // best-effort
+    } catch (e) {
+      this.log('memory', 'fact extraction failed', { error: String(e) }, 'warn');
     }
   }
 
@@ -398,8 +402,10 @@ export class CallSession {
             body: JSON.stringify(call.arguments),
             signal: AbortSignal.timeout(8000),
           });
+          if (!r.ok) this.log('tool', `webhook ${call.name} returned ${r.status}`, { url: webhookUrl }, 'warn');
           return { type: 'continue', content: (await r.text()).slice(0, 2000) };
-        } catch {
+        } catch (e) {
+          this.log('tool', `webhook ${call.name} failed`, { url: webhookUrl, error: String(e) }, 'error');
           return { type: 'continue', content: `Error calling tool "${call.name}".` };
         }
       }
