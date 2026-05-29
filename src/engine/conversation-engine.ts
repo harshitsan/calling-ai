@@ -1,6 +1,6 @@
 import { TextChunker, type ChunkerOptions } from './chunking';
 import { TurnLatency } from './latency';
-import { dispatchTool } from './tools';
+import { dispatchTool, type ToolCall, type ToolResult } from './tools';
 import type { ClientPort, LlmPort, SttPort, TtsPort } from './ports';
 import type { Clock, EngineState, Message, SttEvent } from './types';
 
@@ -12,6 +12,8 @@ export interface EngineDeps {
   clock: Clock;
   systemPrompt: string;
   chunkerOptions?: ChunkerOptions;
+  /** Custom tool executor (e.g. tenant webhooks). Defaults to built-in dispatch. */
+  onToolCall?: (call: ToolCall) => ToolResult | Promise<ToolResult>;
 }
 
 export class ConversationEngine {
@@ -115,7 +117,9 @@ export class ConversationEngine {
           if (this.state !== 'speaking') this.setState('speaking');
           for (const chunk of chunker.push(delta.text)) await speak(chunk);
         } else if (delta.type === 'toolCall') {
-          const result = dispatchTool({ id: delta.id, name: delta.name, arguments: delta.arguments });
+          const exec = this.deps.onToolCall ?? dispatchTool;
+          const result = await exec({ id: delta.id, name: delta.name, arguments: delta.arguments });
+          if (myTurn !== this.turnId) return;
           if (result.type === 'endCall') {
             if (result.farewell) {
               this.setState('speaking');

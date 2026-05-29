@@ -59,6 +59,33 @@ describe('ConversationEngine', () => {
     expect(client.events.some((e) => e.type === 'ended' && e.reason === 'done')).toBe(true);
   });
 
+  test('custom onToolCall executor handles tenant tools (continue path)', async () => {
+    const llm = new FakeLlm([
+      { type: 'toolCall', id: 'w1', name: 'lookup_order', arguments: { id: '42' } },
+      { type: 'text', text: 'Your order is on the way. ' },
+      { type: 'done' },
+    ]);
+    const stt = new FakeStt();
+    const tts = new FakeTts();
+    const client = new FakeClient();
+    const seen: string[] = [];
+    const engine = new ConversationEngine({
+      stt, llm, tts, client, clock: new ManualClock(0),
+      systemPrompt: 'agent',
+      onToolCall: async (call) => {
+        seen.push(call.name);
+        return { type: 'continue', content: 'order 42: shipped' };
+      },
+    });
+    engine.start();
+    stt.emit({ type: 'endOfTurn', text: 'where is my order' });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(seen).toEqual(['lookup_order']);
+    expect(client.events.some((e) => e.type === 'transcript' && e.role === 'tool')).toBe(true);
+    expect(tts.calls).toEqual(['Your order is on the way.']);
+  });
+
   test('barge-in cancels the turn, flushes, and returns to listening', async () => {
     const llm = new FakeLlm([
       { type: 'text', text: 'One. ' },
