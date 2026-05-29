@@ -133,8 +133,9 @@ export class ConversationEngine {
       if (myTurn !== this.turnId) return;
       const tail = chunker.flush();
       if (tail) await speak(tail);
+      if (myTurn !== this.turnId) return;
       this.finishAssistantTurn(assistantText);
-      if (this.state !== 'ended') this.setState('listening');
+      this.setState('listening');
     } catch (err) {
       if (signal.aborted) return;
       throw err;

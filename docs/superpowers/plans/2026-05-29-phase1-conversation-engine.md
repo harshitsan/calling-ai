@@ -70,7 +70,7 @@
     "target": "ES2022",
     "module": "ES2022",
     "moduleResolution": "bundler",
-    "lib": ["ES2022"],
+    "lib": ["ES2022", "WebWorker"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "esModuleInterop": true,
@@ -853,8 +853,9 @@ export class ConversationEngine {
       if (myTurn !== this.turnId) return;
       const tail = chunker.flush();
       if (tail) await speak(tail);
+      if (myTurn !== this.turnId) return;
       this.finishAssistantTurn(assistantText);
-      if (this.state !== 'ended') this.setState('listening');
+      this.setState('listening');
     } catch (err) {
       if (signal.aborted) return;
       throw err;
