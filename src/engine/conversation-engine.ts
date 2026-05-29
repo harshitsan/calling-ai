@@ -126,7 +126,7 @@ export class ConversationEngine {
               await speak(result.farewell);
             }
             this.finishAssistantTurn(assistantText);
-            this.end(result.reason);
+            this.end(`tool:${result.reason || 'completed'}`);
             return;
           }
           this.deps.client.emit({ type: 'transcript', role: 'tool', text: result.content });

@@ -41,6 +41,7 @@ interface AgentRow {
   variables_schema: string;
   tools: string;
   llm_tier_policy: string;
+  endpointing_ms: number;
   created_at: number;
   updated_at: number;
 }
@@ -56,6 +57,7 @@ function agentToJson(r: AgentRow) {
     variables: JSON.parse(r.variables_schema),
     tools: JSON.parse(r.tools),
     llmTierPolicy: JSON.parse(r.llm_tier_policy),
+    endpointingMs: r.endpointing_ms,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -140,13 +142,13 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     const id = uuid();
     const ts = now();
     await env.DB.prepare(
-      `INSERT INTO agents (id, tenant_id, name, avatar, voice, role, system_prompt_template, variables_schema, tools, llm_tier_policy, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, tenant_id, name, avatar, voice, role, system_prompt_template, variables_schema, tools, llm_tier_policy, endpointing_ms, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         id, auth.tenantId, a.name, a.avatar ?? null, a.voice, a.role ?? null,
         a.systemPromptTemplate, JSON.stringify(a.variables), JSON.stringify(a.tools),
-        JSON.stringify(a.llmTierPolicy), ts, ts,
+        JSON.stringify(a.llmTierPolicy), a.endpointingMs, ts, ts,
       )
       .run();
     const row = await env.DB.prepare('SELECT * FROM agents WHERE id = ?').bind(id).first<AgentRow>();
@@ -168,13 +170,13 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
       if (!parsed.success) return err(400, parsed.error.issues[0]?.message ?? 'invalid agent');
       const a = parsed.data;
       await env.DB.prepare(
-        `UPDATE agents SET name=?, avatar=?, voice=?, role=?, system_prompt_template=?, variables_schema=?, tools=?, llm_tier_policy=?, updated_at=?
+        `UPDATE agents SET name=?, avatar=?, voice=?, role=?, system_prompt_template=?, variables_schema=?, tools=?, llm_tier_policy=?, endpointing_ms=?, updated_at=?
          WHERE id=? AND tenant_id=?`,
       )
         .bind(
           a.name, a.avatar ?? null, a.voice, a.role ?? null, a.systemPromptTemplate,
           JSON.stringify(a.variables), JSON.stringify(a.tools), JSON.stringify(a.llmTierPolicy),
-          now(), agentId, auth.tenantId,
+          a.endpointingMs, now(), agentId, auth.tenantId,
         )
         .run();
       const updated = await env.DB.prepare('SELECT * FROM agents WHERE id = ?').bind(agentId).first<AgentRow>();

@@ -45,6 +45,7 @@ export const AgentSchema = z.object({
   variables: z.array(VariableSchema).default([]),
   tools: z.array(ToolSchema).default([]),
   llmTierPolicy: LlmTierPolicySchema.default({}),
+  endpointingMs: z.coerce.number().int().min(200).max(4000).default(900),
 });
 
 export type AgentInput = z.infer<typeof AgentSchema>;

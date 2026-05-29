@@ -33,6 +33,14 @@ export function CallDetail() {
 
   if (!call) return <p className="text-muted-foreground">Loading…</p>;
 
+  const endLabel = (r: string | null) => {
+    if (!r) return '—';
+    if (r.startsWith('tool:')) return `agent (end_call)`;
+    if (r === 'client_hangup') return 'manual hangup';
+    if (r === 'socket_closed') return 'disconnected';
+    return r;
+  };
+
   return (
     <div className="space-y-6">
       <Link to="/calls" className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:underline">
@@ -43,7 +51,7 @@ export function CallDetail() {
         <Stat label="Duration" value={call.duration_s != null ? `${call.duration_s}s` : '—'} />
         <Stat label="Latency p50" value={call.latency_p50_ms != null ? `${call.latency_p50_ms}ms` : '—'} />
         <Stat label="Cost" value={call.cost_usd != null ? `$${call.cost_usd.toFixed(4)}` : '—'} />
-        <Stat label="Ended" value={call.end_reason ?? '—'} />
+        <Stat label="Ended" value={endLabel(call.end_reason)} />
       </div>
 
       <Card>

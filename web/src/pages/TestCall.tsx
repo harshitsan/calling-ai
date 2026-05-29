@@ -10,16 +10,24 @@ import { api, getToken } from '@/lib/api';
 interface Agent {
   id: string;
   name: string;
+  endpointingMs?: number;
 }
 interface Line {
   role: string;
   text: string;
 }
 
-const VAD_FLOOR = 0.045; // ignore anything quieter than this (ambient)
-const VAD_RATIO = 2.2; // user speech must exceed the adaptive baseline by this factor
-const VAD_FRAMES = 3; // consecutive frames to confirm a barge-in
-const SPEAK_GRACE = 0.15; // seconds of grace after scheduled audio ends
+const VAD_FLOOR = 0.045;
+const VAD_RATIO = 2.2;
+const VAD_FRAMES = 3;
+const SPEAK_GRACE = 0.15;
+
+function endedLabel(reason: string): string {
+  if (reason.startsWith('tool:')) return `— Call ended by the agent (${reason.slice(5)}) —`;
+  if (reason === 'client_hangup') return '— Call ended — you hung up —';
+  if (reason === 'socket_closed') return '— Call ended — disconnected —';
+  return `— Call ended (${reason}) —`;
+}
 
 export function TestCall() {
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -40,7 +48,10 @@ export function TestCall() {
   const micStreamRef = useRef<MediaStream | null>(null);
   const vadRaf = useRef<number | null>(null);
   const interimRef = useRef('');
-  const finalizeTimer = useRef<number | null>(null);
+  const baseIndexRef = useRef(0);
+  const resultsLenRef = useRef(0);
+  const endpointTimer = useRef<number | null>(null);
+  const endpointMsRef = useRef(900);
   const lastSent = useRef({ text: '', t: 0 });
 
   useEffect(() => {
@@ -52,13 +63,17 @@ export function TestCall() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    const a = agents.find((x) => x.id === agentId);
+    if (a?.endpointingMs) endpointMsRef.current = a.endpointingMs;
+  }, [agentId, agents]);
+
   async function ensureCtx() {
     if (!ctxRef.current) ctxRef.current = new AudioContext();
     if (ctxRef.current.state === 'suspended') await ctxRef.current.resume();
     return ctxRef.current;
   }
 
-  // Self-healing "agent is speaking" check derived from the audio clock — no flag to get stuck.
   function isSpeaking() {
     const c = ctxRef.current;
     return !!c && c.currentTime < nextStartRef.current - 0.001 + SPEAK_GRACE && nextStartRef.current > 0;
@@ -93,7 +108,7 @@ export function TestCall() {
       }
     }
     sourcesRef.current = [];
-    nextStartRef.current = ctxRef.current ? ctxRef.current.currentTime : 0; // -> isSpeaking() false
+    nextStartRef.current = ctxRef.current ? ctxRef.current.currentTime : 0;
   }
 
   function bargeIn() {
@@ -112,7 +127,6 @@ export function TestCall() {
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
       srcNode.connect(analyser);
-      // Force the graph to pull audio: analyser -> muted gain -> destination.
       const sink = ctx.createGain();
       sink.gain.value = 0;
       analyser.connect(sink);
@@ -152,8 +166,6 @@ export function TestCall() {
     }
   }
 
-  // Robust continuous recognition: spawn a FRESH instance on every end (Chrome
-  // dies on timeouts/errors; reusing an instance gets stuck).
   function startRecognition() {
     const SR = window as unknown as { SpeechRecognition?: any; webkitSpeechRecognition?: any };
     const Rec = SR.SpeechRecognition || SR.webkitSpeechRecognition;
@@ -165,27 +177,26 @@ export function TestCall() {
       rec.lang = 'en-US';
       rec.continuous = true;
       rec.interimResults = true;
+      baseIndexRef.current = 0;
       rec.onresult = (e: any) => {
-        if (isSpeaking()) return; // half-duplex: ignore echo while agent talks
-        let interimText = '';
-        for (let i = e.resultIndex; i < e.results.length; i++) {
-          const res = e.results[i];
-          if (res.isFinal) send(res[0].transcript);
-          else interimText += res[0].transcript;
+        resultsLenRef.current = e.results.length;
+        if (isSpeaking()) {
+          // skip everything heard while the agent talks (echo)
+          baseIndexRef.current = e.results.length;
+          return;
         }
-        if (interimText) {
-          interimRef.current = interimText;
-          setInterim(interimText);
-          // Fallback: Chrome sometimes never fires a final. Finalize on a pause.
-          if (finalizeTimer.current) clearTimeout(finalizeTimer.current);
-          finalizeTimer.current = window.setTimeout(() => {
-            if (interimRef.current && !isSpeaking()) send(interimRef.current);
-          }, 1100);
-        }
+        let full = '';
+        for (let i = baseIndexRef.current; i < e.results.length; i++) full += e.results[i][0].transcript + ' ';
+        full = full.trim();
+        interimRef.current = full;
+        setInterim(full);
+        // Only commit after the configured end-of-turn pause (silence).
+        if (endpointTimer.current) clearTimeout(endpointTimer.current);
+        endpointTimer.current = window.setTimeout(() => {
+          if (interimRef.current && !isSpeaking()) send(interimRef.current);
+        }, endpointMsRef.current);
       };
-      rec.onerror = () => {
-        /* onend handles the respawn */
-      };
+      rec.onerror = () => {};
       rec.onend = () => {
         if (liveRef.current) setTimeout(spawn, 300);
       };
@@ -228,6 +239,10 @@ export function TestCall() {
       if (ev.type === 'transcript') setLines((l) => [...l, { role: ev.role, text: ev.text }]);
       else if (ev.type === 'flush') stopAudio();
       else if (ev.type === 'latency' && ev.turn.endpointToFirstAudio != null) setLatency(ev.turn.endpointToFirstAudio);
+      else if (ev.type === 'ended') {
+        setLines((l) => [...l, { role: 'system', text: endedLabel(ev.reason) }]);
+        stop();
+      }
     };
     wsRef.current = ws;
   }
@@ -235,6 +250,7 @@ export function TestCall() {
   function stop() {
     liveRef.current = false;
     if (vadRaf.current) cancelAnimationFrame(vadRaf.current);
+    if (endpointTimer.current) clearTimeout(endpointTimer.current);
     try {
       recRef.current?.stop();
     } catch {
@@ -244,6 +260,7 @@ export function TestCall() {
     micStreamRef.current?.getTracks().forEach((t) => t.stop());
     micStreamRef.current = null;
     setInterim('');
+    interimRef.current = '';
     stopAudio();
     if (wsRef.current?.readyState === 1) wsRef.current.send(JSON.stringify({ type: 'hangup' }));
     wsRef.current?.close();
@@ -252,19 +269,19 @@ export function TestCall() {
   }
 
   function send(t: string) {
-    const text = t.trim();
-    if (!text || wsRef.current?.readyState !== 1) return;
-    // dedupe: a late real-final shouldn't resend what the pause-finalizer already sent
-    if (lastSent.current.text === text && Date.now() - lastSent.current.t < 2500) return;
-    lastSent.current = { text, t: Date.now() };
-    if (finalizeTimer.current) {
-      clearTimeout(finalizeTimer.current);
-      finalizeTimer.current = null;
+    const body = t.trim();
+    if (!body || wsRef.current?.readyState !== 1) return;
+    if (lastSent.current.text === body && Date.now() - lastSent.current.t < 2500) return;
+    lastSent.current = { text: body, t: Date.now() };
+    if (endpointTimer.current) {
+      clearTimeout(endpointTimer.current);
+      endpointTimer.current = null;
     }
+    baseIndexRef.current = resultsLenRef.current; // consume what we just sent
     interimRef.current = '';
     setInterim('');
-    stopAudio(); // talking/typing interrupts the agent
-    wsRef.current.send(JSON.stringify({ type: 'userText', text }));
+    stopAudio();
+    wsRef.current.send(JSON.stringify({ type: 'userText', text: body }));
     setText('');
   }
 
@@ -322,14 +339,20 @@ export function TestCall() {
               Start the call, then just speak — the agent listens continuously and you can talk over it to interrupt.
             </p>
           )}
-          {lines.map((l, i) => (
-            <div key={i} className="text-sm">
-              <span className={l.role === 'user' ? 'text-blue-600 font-medium' : 'text-emerald-700 font-medium'}>
-                {l.role === 'user' ? 'You' : 'Agent'}:
-              </span>{' '}
-              {l.text}
-            </div>
-          ))}
+          {lines.map((l, i) =>
+            l.role === 'system' ? (
+              <div key={i} className="text-center text-xs text-muted-foreground py-1">
+                {l.text}
+              </div>
+            ) : (
+              <div key={i} className="text-sm">
+                <span className={l.role === 'user' ? 'text-blue-600 font-medium' : 'text-emerald-700 font-medium'}>
+                  {l.role === 'user' ? 'You' : 'Agent'}:
+                </span>{' '}
+                {l.text}
+              </div>
+            ),
+          )}
           {interim && (
             <div className="text-sm opacity-50 italic">
               <span className="text-blue-600 font-medium">You:</span> {interim}…

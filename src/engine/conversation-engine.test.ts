@@ -56,7 +56,7 @@ describe('ConversationEngine', () => {
     expect(tts.calls).toEqual(['Goodbye!']);
     expect(engine.getState()).toBe('ended');
     expect(stt.closed).toBe(true);
-    expect(client.events.some((e) => e.type === 'ended' && e.reason === 'done')).toBe(true);
+    expect(client.events.some((e) => e.type === 'ended' && e.reason === 'tool:done')).toBe(true);
   });
 
   test('custom onToolCall executor handles tenant tools (continue path)', async () => {

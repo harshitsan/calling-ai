@@ -140,13 +140,27 @@ export class WorkersAiLlm implements LlmPort {
   }
 }
 
-/** Streaming LLM over the OpenAI Chat Completions API (better quality than Llama). */
+export interface OpenAiTool {
+  type: 'function';
+  function: { name: string; description?: string; parameters?: Record<string, unknown> };
+}
+
+interface OpenAiDelta {
+  content?: string;
+  tool_calls?: { index?: number; id?: string; function?: { name?: string; arguments?: string } }[];
+}
+
+/** Streaming LLM over the OpenAI Chat Completions API, with function calling. */
 export class OpenAiLlm implements LlmPort {
+  private tools?: OpenAiTool[];
   constructor(
     private apiKey: string,
     private model = 'gpt-4o-mini',
-    private baseUrl = 'https://api.openai.com/v1',
-  ) {}
+    opts: { tools?: OpenAiTool[]; baseUrl?: string } = {},
+    private baseUrl = opts.baseUrl ?? 'https://api.openai.com/v1',
+  ) {
+    this.tools = opts.tools && opts.tools.length ? opts.tools : undefined;
+  }
 
   async *generate(messages: Message[], opts?: { signal?: AbortSignal }): AsyncIterable<LlmDelta> {
     const res = await fetch(`${this.baseUrl}/chat/completions`, {
@@ -158,6 +172,7 @@ export class OpenAiLlm implements LlmPort {
         stream: true,
         max_tokens: 300,
         temperature: 0.6,
+        ...(this.tools ? { tools: this.tools, tool_choice: 'auto' } : {}),
       }),
       signal: opts?.signal,
     });
@@ -168,6 +183,23 @@ export class OpenAiLlm implements LlmPort {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
+    const toolAcc = new Map<number, { id: string; name: string; args: string }>();
+
+    const flushTools = (): LlmDelta[] => {
+      const out: LlmDelta[] = [];
+      for (const [, t] of toolAcc) {
+        if (!t.name) continue;
+        let args: Record<string, unknown> = {};
+        try {
+          args = t.args ? JSON.parse(t.args) : {};
+        } catch {
+          args = {};
+        }
+        out.push({ type: 'toolCall', id: t.id || t.name, name: t.name, arguments: args });
+      }
+      return out;
+    };
+
     try {
       while (true) {
         if (opts?.signal?.aborted) return;
@@ -181,13 +213,24 @@ export class OpenAiLlm implements LlmPort {
           if (!t.startsWith('data:')) continue;
           const data = t.slice(5).trim();
           if (data === '[DONE]') {
+            for (const d of flushTools()) yield d;
             yield { type: 'done' };
             return;
           }
           try {
-            const j = JSON.parse(data) as { choices?: { delta?: { content?: string } }[] };
-            const tok = j.choices?.[0]?.delta?.content;
-            if (tok) yield { type: 'text', text: tok };
+            const j = JSON.parse(data) as { choices?: { delta?: OpenAiDelta }[] };
+            const delta = j.choices?.[0]?.delta;
+            if (delta?.content) yield { type: 'text', text: delta.content };
+            if (delta?.tool_calls) {
+              for (const tc of delta.tool_calls) {
+                const idx = tc.index ?? 0;
+                const cur = toolAcc.get(idx) ?? { id: '', name: '', args: '' };
+                if (tc.id) cur.id = tc.id;
+                if (tc.function?.name) cur.name = tc.function.name;
+                if (tc.function?.arguments) cur.args += tc.function.arguments;
+                toolAcc.set(idx, cur);
+              }
+            }
           } catch {
             // partial SSE line; ignore
           }
@@ -200,6 +243,7 @@ export class OpenAiLlm implements LlmPort {
         // already closed
       }
     }
+    for (const d of flushTools()) yield d;
     yield { type: 'done' };
   }
 }

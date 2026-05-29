@@ -2,7 +2,8 @@ import { ConversationEngine } from '../engine/conversation-engine';
 import type { ClientPort } from '../engine/ports';
 import { dispatchTool, type ToolCall, type ToolResult } from '../engine/tools';
 import type { ClientEvent } from '../engine/types';
-import { AuraTts, ClientFedStt, FluxStt, OpenAiLlm, WorkersAiLlm } from './adapters';
+import { AuraTts, ClientFedStt, FluxStt, OpenAiLlm, type OpenAiTool, WorkersAiLlm } from './adapters';
+import { END_CALL_TOOL } from '../engine/tools';
 import type { LlmPort, SttPort } from '../engine/ports';
 
 const LEGACY_WORKERS_AI_MODEL = '@cf/meta/llama-3.1-8b-instruct';
@@ -30,7 +31,7 @@ interface AgentConfig {
   voice: string;
   systemPromptTemplate: string;
   variables: { name: string; source: string; default?: string }[];
-  tools: { name: string; webhookUrl?: string }[];
+  tools: { name: string; description?: string; parameters?: Record<string, unknown>; webhookUrl?: string }[];
   llmTierPolicy: { defaultModel?: string; escalateModel?: string; escalateOn?: string };
 }
 
@@ -106,6 +107,7 @@ export class CallSession {
     let systemPrompt = params.get('prompt') ?? DEFAULT_SYSTEM_PROMPT;
     let voice = params.get('voice') ?? 'asteria';
     let toolMap = new Map<string, string | undefined>();
+    let agentTools: AgentConfig['tools'] = [];
     let model = '@cf/meta/llama-3.1-8b-instruct';
 
     if (token) {
@@ -124,6 +126,7 @@ export class CallSession {
         }
         if (agent.systemPromptTemplate.trim()) systemPrompt = renderTemplate(agent.systemPromptTemplate, vars);
         voice = params.get('voice') ?? agent.voice;
+        agentTools = agent.tools;
         toolMap = new Map(agent.tools.map((t) => [t.name, t.webhookUrl]));
         if (agent.llmTierPolicy.defaultModel) model = agent.llmTierPolicy.defaultModel;
       }
@@ -170,8 +173,29 @@ export class CallSession {
     // Prefer OpenAI when configured; auto-upgrade legacy/blank model to gpt-4o-mini.
     if (openaiKey && (model === LEGACY_WORKERS_AI_MODEL || model === '')) model = 'gpt-4o-mini';
     const useOpenAI = Boolean(openaiKey) && !model.startsWith('@cf/');
+    const openaiTools: OpenAiTool[] = [
+      { type: 'function', function: { name: END_CALL_TOOL.name, description: END_CALL_TOOL.description, parameters: END_CALL_TOOL.parameters } },
+      ...(this.tenantId
+        ? [{
+            type: 'function' as const,
+            function: {
+              name: 'recall_memory',
+              description: 'Look up facts you already know about this caller.',
+              parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+            },
+          }]
+        : []),
+      ...agentTools.map((t) => ({
+        type: 'function' as const,
+        function: {
+          name: t.name,
+          description: t.description ?? '',
+          parameters: t.parameters ?? { type: 'object', properties: {} },
+        },
+      })),
+    ];
     const llm: LlmPort = useOpenAI
-      ? new OpenAiLlm(openaiKey!, model)
+      ? new OpenAiLlm(openaiKey!, model, { tools: openaiTools })
       : new WorkersAiLlm(this.env.AI, { model, gatewayId });
 
     const engine = new ConversationEngine({

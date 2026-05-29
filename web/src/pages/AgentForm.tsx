@@ -36,6 +36,7 @@ const schema = z.object({
     escalateModel: z.string().optional(),
     escalateOn: z.enum(['never', 'manual', 'low_confidence']),
   }),
+  endpointingMs: z.coerce.number().int().min(200).max(4000),
 });
 type FormValues = z.infer<typeof schema>;
 
@@ -47,6 +48,7 @@ const DEFAULTS: FormValues = {
   variables: [],
   tools: [],
   llmTierPolicy: { defaultModel: 'gpt-4o-mini', escalateModel: '', escalateOn: 'never' },
+  endpointingMs: 900,
 };
 
 export function AgentForm() {
@@ -179,6 +181,20 @@ export function AgentForm() {
               </Button>
             </div>
           ))}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Turn-taking</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          <Label>End-of-turn pause (ms)</Label>
+          <Input type="number" min={200} max={4000} step={50} {...register('endpointingMs')} className="w-40" />
+          <p className="text-xs text-muted-foreground">
+            How long the caller must pause before the agent treats the sentence as finished and replies. Lower =
+            snappier but may cut people off; higher = more patient.
+          </p>
         </CardContent>
       </Card>
 
