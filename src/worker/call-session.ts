@@ -268,7 +268,16 @@ export class CallSession {
       if (msg.type === 'userText' && typeof msg.text === 'string') clientStt?.feedEndOfTurn(msg.text);
       else if (msg.type === 'partial' && typeof msg.text === 'string') clientStt?.feedPartial(msg.text);
       else if (msg.type === 'interrupt') engine.interrupt();
-      else if (msg.type === 'hangup') engine.end('client_hangup');
+      else if (msg.type === 'hangup') {
+        const reason = typeof (msg as { reason?: string }).reason === 'string' ? (msg as { reason: string }).reason : 'unknown';
+        if (reason !== 'manual') this.log('call', `client closed (${reason})`, {}, 'warn');
+        engine.end('client_hangup');
+      } else if (msg.type === 'client_log') {
+        const m = msg as { msg?: string; data?: Record<string, unknown>; level?: 'info' | 'warn' | 'error' };
+        if (typeof m.msg === 'string') {
+          this.log('client', m.msg, m.data, m.level ?? 'info');
+        }
+      }
     });
 
     server.addEventListener('close', () => engine.end('socket_closed'));

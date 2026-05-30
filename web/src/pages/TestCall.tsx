@@ -166,6 +166,7 @@ export function TestCall() {
       if (d.lastRecResultAt === 0) return; // never heard anything yet
       const idleMs = Date.now() - d.lastRecResultAt;
       if (idleMs > 12000 && d.micRms > 0.025) {
+        clientLog('recognition stuck — watchdog restart', { idleMs, micRms: d.micRms }, 'warn');
         setDiag((s) => ({ ...s, lastError: 'recognition stuck — auto-restarted' }));
         try {
           recRef.current?.abort();
@@ -177,7 +178,23 @@ export function TestCall() {
     return () => clearInterval(id);
   }, [status]);
 
+  // Stream diagnostic events to the server so they show in Live Logs
+  // alongside the stt/tts/llm trail — invaluable for debugging stalls.
+  function clientLog(
+    msg: string,
+    data?: Record<string, unknown>,
+    level: 'info' | 'warn' | 'error' = 'info',
+  ) {
+    if (wsRef.current?.readyState !== 1) return;
+    try {
+      wsRef.current.send(JSON.stringify({ type: 'client_log', msg, data, level }));
+    } catch {
+      /* ignore */
+    }
+  }
+
   function restartRecognition() {
+    clientLog('recognition restart (manual)', undefined, 'warn');
     try {
       recRef.current?.abort();
     } catch {
@@ -351,6 +368,7 @@ export function TestCall() {
       rec.interimResults = true;
       baseIndexRef.current = 0;
       setDiag((d) => ({ ...d, recRunning: true, lastError: '' }));
+      clientLog('recognition spawn', { restarts: diagRef.current.recRestarts });
       rec.onresult = (e: any) => {
         setDiag((d) => ({ ...d, lastRecResultAt: Date.now() }));
         resultsLenRef.current = e.results.length;
@@ -376,17 +394,21 @@ export function TestCall() {
         }, endpointMsRef.current);
       };
       rec.onerror = (ev: any) => {
-        setDiag((d) => ({ ...d, lastError: `recognition: ${ev?.error ?? 'unknown'}` }));
+        const err = ev?.error ?? 'unknown';
+        clientLog('recognition error', { error: err }, err === 'no-speech' ? 'info' : 'warn');
+        setDiag((d) => ({ ...d, lastError: `recognition: ${err}` }));
       };
       rec.onend = () => {
+        clientLog('recognition ended');
         setDiag((d) => ({ ...d, recRunning: false, recRestarts: d.recRestarts + 1 }));
-        if (liveRef.current) setTimeout(spawn, 300);
+        if (liveRef.current) setTimeout(spawn, 100);
       };
       recRef.current = rec;
       try {
         rec.start();
-      } catch {
-        if (liveRef.current) setTimeout(spawn, 500);
+      } catch (e) {
+        clientLog('recognition start threw', { error: String(e) }, 'error');
+        if (liveRef.current) setTimeout(spawn, 300);
       }
     };
     spawn();
@@ -421,6 +443,7 @@ export function TestCall() {
       setStatus('live');
       callStartRef.current = Date.now();
       setDiag((d) => ({ ...d, wsState: 'open' }));
+      clientLog('ws open', { agentId, voice: agents.find((a) => a.id === agentId)?.name });
       startVad();
       startRecognition();
     };
