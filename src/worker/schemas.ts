@@ -58,6 +58,7 @@ export const AgentSchema = z.object({
   tools: z.array(ToolSchema).default([]),
   llmTierPolicy: LlmTierPolicySchema.default({}),
   endpointingMs: z.coerce.number().int().min(200).max(4000).default(900),
+  language: z.string().default('en-US'),
   inboundLookup: InboundLookupSchema.optional().nullable(),
   endWebhook: EndWebhookSchema.optional().nullable(),
 });

@@ -10,7 +10,8 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
 import { Textarea } from '@/components/ui/textarea';
-import { api, AURA_VOICES } from '@/lib/api';
+import { api } from '@/lib/api';
+import { languageLabel, VOICES, voiceById } from '@/lib/voices';
 import { cn } from '@/lib/utils';
 
 const schema = z.object({
@@ -38,6 +39,7 @@ const schema = z.object({
     escalateOn: z.enum(['never', 'manual', 'low_confidence']),
   }),
   endpointingMs: z.coerce.number().int().min(200).max(4000),
+  language: z.string(),
   inboundLookup: z.object({
     url: z.string().refine((v) => v === '' || /^https?:\/\//.test(v), 'must be a URL'),
     method: z.enum(['GET', 'POST']),
@@ -60,6 +62,7 @@ const DEFAULTS: FormValues = {
   tools: [],
   llmTierPolicy: { defaultModel: 'gpt-4o-mini', escalateModel: '', escalateOn: 'never' },
   endpointingMs: 900,
+  language: 'en-US',
   inboundLookup: { url: '', method: 'POST', headersJson: '', timeoutMs: 5000 },
   endWebhook: { url: '', headersJson: '' },
 };
@@ -98,6 +101,7 @@ export function AgentForm() {
   const tools = useFieldArray({ control, name: 'tools' });
   const currentVoice = useWatch({ control, name: 'voice' });
   const currentName = useWatch({ control, name: 'name' });
+  const currentVoiceMeta = voiceById(currentVoice);
   const [previewing, setPreviewing] = useState(false);
   const previewAudio = useRef<HTMLAudioElement | null>(null);
 
@@ -238,11 +242,20 @@ export function AgentForm() {
                 <Label>Voice</Label>
                 <div className="flex gap-2">
                   <Select {...register('voice')} className="flex-1">
-                    {AURA_VOICES.map((v) => (
-                      <option key={v} value={v}>
-                        {v}
-                      </option>
-                    ))}
+                    <optgroup label="◌ Female">
+                      {VOICES.filter((v) => v.gender === 'female').map((v) => (
+                        <option key={v.id} value={v.id}>
+                          {v.label} {v.description ? `· ${v.description}` : ''}
+                        </option>
+                      ))}
+                    </optgroup>
+                    <optgroup label="◌ Male">
+                      {VOICES.filter((v) => v.gender === 'male').map((v) => (
+                        <option key={v.id} value={v.id}>
+                          {v.label} {v.description ? `· ${v.description}` : ''}
+                        </option>
+                      ))}
+                    </optgroup>
                   </Select>
                   <Button
                     type="button"
@@ -256,10 +269,28 @@ export function AgentForm() {
                     {previewing ? 'Playing…' : 'Preview'}
                   </Button>
                 </div>
-                <p className="text-[11px] text-muted-foreground/80">
-                  A short clip in the chosen voice — handy for finding the right tone.
-                </p>
+                {currentVoiceMeta && currentVoiceMeta.languages.length === 1 && (
+                  <p className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground/70">
+                    {languageLabel(currentVoiceMeta.languages[0]!)} only
+                  </p>
+                )}
               </div>
+
+              {currentVoiceMeta && currentVoiceMeta.languages.length > 1 && (
+                <div className="space-y-2 ring-aurora rounded-md p-3">
+                  <Label>Language</Label>
+                  <Select {...register('language')} className="border-0 bg-white/[0.04]">
+                    {currentVoiceMeta.languages.map((code) => (
+                      <option key={code} value={code}>
+                        {languageLabel(code)}
+                      </option>
+                    ))}
+                  </Select>
+                  <p className="text-[11px] text-muted-foreground/80">
+                    {currentVoiceMeta.label} is multilingual — pick the language to speak in.
+                  </p>
+                </div>
+              )}
             </CardContent>
           </Card>
         )}
