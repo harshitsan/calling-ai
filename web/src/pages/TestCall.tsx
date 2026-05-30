@@ -405,11 +405,13 @@ export function TestCall() {
       }
       if (ev.type === 'meta') callIdRef.current = ev.callId;
       else if (ev.type === 'state') setDiag((d) => ({ ...d, engineState: ev.state }));
-      else if (ev.type === 'transcript')
+      else if (ev.type === 'transcript' && ev.role !== 'user') {
+        // user lines are committed optimistically in send(); skip the server echo.
         setLines((l) => [
           ...l,
           { role: ev.role, text: ev.text, ts: Date.now() - (callStartRef.current || Date.now()) },
         ]);
+      }
       else if (ev.type === 'flush') stopAudio();
       else if (ev.type === 'latency' && ev.turn.endpointToFirstAudio != null) setLatency(ev.turn.endpointToFirstAudio);
       else if (ev.type === 'ended') {
@@ -472,7 +474,13 @@ export function TestCall() {
   function send(t: string) {
     const body = t.trim();
     if (!body || wsRef.current?.readyState !== 1) return;
-    if (lastSent.current.text === body && Date.now() - lastSent.current.t < 2500) return;
+    if (lastSent.current.text === body && Date.now() - lastSent.current.t < 2500) {
+      // dupe send (Chrome's late real-final following our pause-finalizer);
+      // clear interim so the UI doesn't get stuck displaying it.
+      interimRef.current = '';
+      setInterim('');
+      return;
+    }
     lastSent.current = { text: body, t: Date.now() };
     if (endpointTimer.current) {
       clearTimeout(endpointTimer.current);
@@ -482,6 +490,12 @@ export function TestCall() {
     interimRef.current = '';
     setInterim('');
     stopAudio();
+    // Optimistic local commit — we know what the user said; don't wait for the
+    // server's transcript echo (it can stall and leave the line never showing).
+    setLines((l) => [
+      ...l,
+      { role: 'user', text: body, ts: Date.now() - (callStartRef.current || Date.now()) },
+    ]);
     wsRef.current.send(JSON.stringify({ type: 'userText', text: body }));
     setText('');
   }
