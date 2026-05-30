@@ -89,6 +89,7 @@ export class CallSession {
   private latencies: number[] = [];
   private speakingChars = 0;
   private finalized = false;
+  private voiceId: string | null = null;
   private endWebhook: AgentConfig['endWebhook'];
 
   constructor(
@@ -149,6 +150,7 @@ export class CallSession {
 
     systemPrompt += `\n${GUARDRAILS}`;
 
+    this.voiceId = voice;
     if (this.tenantId) await this.createCallRecord();
 
     const pair = new WebSocketPair();
@@ -280,7 +282,11 @@ export class CallSession {
     const durationS = Math.round((endedAt - this.startedAt) / 1000);
     this.log('call', 'call ended', { reason, durationS });
     const summary = await this.summarize();
-    const cost = estimateCallCost({ durationS, ttsChars: this.speakingChars });
+    const cost = estimateCallCost({
+      durationS,
+      ttsChars: this.speakingChars,
+      voiceId: this.voiceId ?? undefined,
+    });
     await this.extractMemory();
     if (this.endWebhook) {
       this.state.waitUntil(

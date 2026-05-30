@@ -20,21 +20,21 @@ export const MODELS: ModelMeta[] = [
     label: 'Aura-2 · English',
     vendor: 'Deepgram',
     description: 'HD English · 40 voices',
-    pricing: '$0.03 / 1k chars',
+    pricing: '≈ $0.022 / spoken min',
   },
   {
     id: '@cf/deepgram/aura-2-es',
     label: 'Aura-2 · Spanish',
     vendor: 'Deepgram',
     description: 'HD Spanish · 10 voices',
-    pricing: '$0.03 / 1k chars',
+    pricing: '≈ $0.022 / spoken min',
   },
   {
     id: '@cf/deepgram/aura-1',
     label: 'Aura-1 · Legacy',
     vendor: 'Deepgram',
     description: 'Original lineup · 12 voices · English',
-    pricing: '$0.015 / 1k chars',
+    pricing: '≈ $0.011 / spoken min',
   },
   // Gemini Flash TTS (30 multilingual voices) is wired but disabled by default —
   // it's an AI-Gateway-proxied model that needs a configured gateway + Google
