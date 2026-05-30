@@ -355,13 +355,18 @@ export function TestCall() {
         setDiag((d) => ({ ...d, lastRecResultAt: Date.now() }));
         resultsLenRef.current = e.results.length;
         if (isSpeaking()) {
-          // skip everything heard while the agent talks (echo)
-          baseIndexRef.current = e.results.length;
+          // Drop while agent talks, but only consume FINAL results — Chrome
+          // may still be appending to the current in-progress result when the
+          // user starts speaking, so we mustn't skip past it.
+          for (let i = baseIndexRef.current; i < e.results.length; i++) {
+            if (e.results[i].isFinal) baseIndexRef.current = i + 1;
+          }
           return;
         }
         let full = '';
         for (let i = baseIndexRef.current; i < e.results.length; i++) full += e.results[i][0].transcript + ' ';
         full = full.trim();
+        if (!full) return;
         interimRef.current = full;
         setInterim(full);
         // Only commit after the configured end-of-turn pause (silence).
