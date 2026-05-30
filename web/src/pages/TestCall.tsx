@@ -31,16 +31,28 @@ function DiagRow({
   value,
   sub,
   valueClass,
+  dot,
 }: {
   label: string;
   value: string;
   sub?: string;
   valueClass?: string;
+  dot?: boolean;
 }) {
+  const dotColor = valueClass?.includes('emerald')
+    ? 'bg-emerald-400/90'
+    : valueClass?.includes('amber')
+      ? 'bg-amber-400/90'
+      : valueClass?.includes('red')
+        ? 'bg-red-400/90'
+        : 'bg-muted-foreground/60';
   return (
     <div>
       <div className="text-[10px] uppercase tracking-[0.22em] text-muted-foreground/65">{label}</div>
-      <div className={`font-mono text-[13px] tabular-nums ${valueClass ?? 'text-foreground/90'}`}>{value}</div>
+      <div className={`flex items-center gap-2 font-mono text-[13px] tabular-nums ${valueClass ?? 'text-foreground/90'}`}>
+        {dot && <span className={`h-2 w-2 rounded-full ${dotColor} ${value === 'open' ? 'animate-pulse' : ''}`} />}
+        {value}
+      </div>
       {sub && <div className="text-[10px] font-mono text-muted-foreground/55 tabular-nums">{sub}</div>}
     </div>
   );
@@ -82,6 +94,7 @@ export function TestCall() {
   const [interim, setInterim] = useState('');
   const [diag, setDiag] = useState({
     engineState: 'idle',
+    wsState: 'closed' as 'connecting' | 'open' | 'closing' | 'closed',
     micRms: 0,
     audioQueue: 0,
     recRunning: false,
@@ -120,7 +133,7 @@ export function TestCall() {
       setAgents(r.agents);
       if (r.agents[0]) setAgentId(r.agents[0].id);
     });
-    return () => stop();
+    return () => stop('unmount');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -128,6 +141,18 @@ export function TestCall() {
   useEffect(() => {
     if (status !== 'live') return;
     const id = setInterval(() => force((v) => v + 1), 250);
+    return () => clearInterval(id);
+  }, [status]);
+
+  // Heartbeat: keep the WebSocket alive during silent stretches so CF / proxies
+  // don't idle-close it. Server ignores unrecognized message types.
+  useEffect(() => {
+    if (status !== 'live') return;
+    const id = setInterval(() => {
+      if (wsRef.current?.readyState === 1) {
+        wsRef.current.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+      }
+    }, 15000);
     return () => clearInterval(id);
   }, [status]);
 
@@ -176,6 +201,12 @@ export function TestCall() {
     const idle = Date.now() - d.lastRecResultAt;
     if (idle < 5000) return 'text-emerald-400';
     if (idle < 15000) return 'text-amber-400';
+    return 'text-red-400';
+  }
+
+  function wsColor(s: string): string {
+    if (s === 'open') return 'text-emerald-400';
+    if (s === 'connecting') return 'text-amber-400';
     return 'text-red-400';
   }
 
@@ -380,15 +411,25 @@ export function TestCall() {
     const url = `${proto}://${location.host}/call?agentId=${agentId}&token=${encodeURIComponent(token ?? '')}&customer_name=${encodeURIComponent(customer)}`;
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
+    setDiag((d) => ({ ...d, wsState: 'connecting' }));
     ws.onopen = () => {
       setStatus('live');
       callStartRef.current = Date.now();
+      setDiag((d) => ({ ...d, wsState: 'open' }));
       startVad();
       startRecognition();
     };
-    ws.onclose = () => {
-      if (liveRef.current) stop();
+    ws.onclose = (e) => {
+      setDiag((d) => ({
+        ...d,
+        wsState: 'closed',
+        lastError: liveRef.current
+          ? `ws closed (code ${e.code}${e.reason ? ` ${e.reason}` : ''})`
+          : d.lastError,
+      }));
+      if (liveRef.current) stop('ws-closed');
     };
+    ws.onerror = () => setDiag((d) => ({ ...d, lastError: 'ws error' }));
     ws.onmessage = (e) => {
       setDiag((d) => ({ ...d, lastEventAt: Date.now() }));
       if (typeof e.data !== 'string') {
@@ -416,13 +457,13 @@ export function TestCall() {
       else if (ev.type === 'latency' && ev.turn.endpointToFirstAudio != null) setLatency(ev.turn.endpointToFirstAudio);
       else if (ev.type === 'ended') {
         setLines((l) => [...l, { role: 'system', text: endedLabel(ev.reason), ts: Date.now() - (callStartRef.current || Date.now()) }]);
-        stop();
+        stop('server-ended');
       }
     };
     wsRef.current = ws;
   }
 
-  function stop() {
+  function stop(reason: string = 'manual') {
     liveRef.current = false;
     if (vadRaf.current) cancelAnimationFrame(vadRaf.current);
     if (endpointTimer.current) clearTimeout(endpointTimer.current);
@@ -465,9 +506,10 @@ export function TestCall() {
     setInterim('');
     interimRef.current = '';
     stopAudio();
-    if (wsRef.current?.readyState === 1) wsRef.current.send(JSON.stringify({ type: 'hangup' }));
+    if (wsRef.current?.readyState === 1) wsRef.current.send(JSON.stringify({ type: 'hangup', reason }));
     wsRef.current?.close();
     wsRef.current = null;
+    setDiag((d) => ({ ...d, wsState: 'closed' }));
     setStatus('idle');
   }
 
@@ -672,6 +714,13 @@ export function TestCall() {
 
             {/* State grid */}
             <div className="grid grid-cols-2 gap-x-6 gap-y-3 text-[12px]">
+              <DiagRow
+                label="WebSocket"
+                value={diag.wsState}
+                valueClass={wsColor(diag.wsState)}
+                sub={`event ${ago(diag.lastEventAt)}`}
+                dot
+              />
               <DiagRow label="Engine" value={diag.engineState} sub={ago(diag.lastEventAt)} />
               <DiagRow
                 label="Recognition"
@@ -684,11 +733,7 @@ export function TestCall() {
                 value={isSpeaking() ? 'speaking' : 'silent'}
                 sub={`queue ${diag.audioQueue}`}
               />
-              <DiagRow
-                label="Restarts"
-                value={String(diag.recRestarts)}
-                sub={`since call start`}
-              />
+              <DiagRow label="Restarts" value={String(diag.recRestarts)} sub="since call start" />
             </div>
 
             {interim && (
