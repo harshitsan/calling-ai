@@ -1,9 +1,10 @@
 import { zodResolver } from '@hookform/resolvers/zod';
-import { Bot, MessageSquareQuote, Play, Plus, Settings2, Sparkles, Trash2, Webhook } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { Bot, MessageSquareQuote, Plus, Settings2, Sparkles, Trash2, Webhook } from 'lucide-react';
+import { useEffect, useState } from 'react';
 import { useFieldArray, useForm, useWatch } from 'react-hook-form';
 import { useNavigate, useParams } from 'react-router-dom';
 import { z } from 'zod';
+import { VoicePicker } from '@/components/VoicePicker';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -11,7 +12,6 @@ import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
 import { Textarea } from '@/components/ui/textarea';
 import { api } from '@/lib/api';
-import { languageLabel, VOICES, voiceById } from '@/lib/voices';
 import { cn } from '@/lib/utils';
 
 const schema = z.object({
@@ -55,7 +55,7 @@ type FormValues = z.infer<typeof schema>;
 
 const DEFAULTS: FormValues = {
   name: '',
-  voice: 'asteria',
+  voice: 'aura2en:luna',
   role: '',
   systemPromptTemplate: 'You are {{agent_name}}, a helpful voice agent. Keep replies short and natural.',
   variables: [],
@@ -96,37 +96,11 @@ export function AgentForm() {
   const [error, setError] = useState('');
   const [tab, setTab] = useState<TabId>('identity');
   const form = useForm<FormValues>({ resolver: zodResolver(schema), defaultValues: DEFAULTS });
-  const { register, control, handleSubmit, reset, formState } = form;
+  const { register, control, handleSubmit, reset, formState, setValue } = form;
   const vars = useFieldArray({ control, name: 'variables' });
   const tools = useFieldArray({ control, name: 'tools' });
   const currentVoice = useWatch({ control, name: 'voice' });
-  const currentName = useWatch({ control, name: 'name' });
-  const currentVoiceMeta = voiceById(currentVoice);
-  const [previewing, setPreviewing] = useState(false);
-  const previewAudio = useRef<HTMLAudioElement | null>(null);
-
-  async function previewVoice() {
-    if (previewing) return;
-    setPreviewing(true);
-    const speakerName = (currentName || 'Aurora').trim();
-    const text = `Hello, this is ${speakerName}. I'd love to help you today.`;
-    try {
-      const res = await fetch(`/api/tts?voice=${encodeURIComponent(currentVoice)}&text=${encodeURIComponent(text)}`);
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      if (previewAudio.current) {
-        previewAudio.current.pause();
-        try { URL.revokeObjectURL(previewAudio.current.src); } catch { /* ignore */ }
-      }
-      const audio = new Audio(url);
-      previewAudio.current = audio;
-      audio.onended = () => setPreviewing(false);
-      audio.onerror = () => setPreviewing(false);
-      await audio.play();
-    } catch {
-      setPreviewing(false);
-    }
-  }
+  const currentLanguage = useWatch({ control, name: 'language' });
 
   useEffect(() => {
     if (!id) return;
@@ -240,57 +214,18 @@ export function AgentForm() {
               </div>
               <div className="space-y-2">
                 <Label>Voice</Label>
-                <div className="flex gap-2">
-                  <Select {...register('voice')} className="flex-1">
-                    <optgroup label="◌ Female">
-                      {VOICES.filter((v) => v.gender === 'female').map((v) => (
-                        <option key={v.id} value={v.id}>
-                          {v.label} {v.description ? `· ${v.description}` : ''}
-                        </option>
-                      ))}
-                    </optgroup>
-                    <optgroup label="◌ Male">
-                      {VOICES.filter((v) => v.gender === 'male').map((v) => (
-                        <option key={v.id} value={v.id}>
-                          {v.label} {v.description ? `· ${v.description}` : ''}
-                        </option>
-                      ))}
-                    </optgroup>
-                  </Select>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="default"
-                    onClick={previewVoice}
-                    disabled={previewing}
-                    className="shrink-0 px-4"
-                  >
-                    <Play className={`h-3.5 w-3.5 ${previewing ? 'opacity-50' : ''}`} />
-                    {previewing ? 'Playing…' : 'Preview'}
-                  </Button>
-                </div>
-                {currentVoiceMeta && currentVoiceMeta.languages.length === 1 && (
-                  <p className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground/70">
-                    {languageLabel(currentVoiceMeta.languages[0]!)} only
-                  </p>
-                )}
+                <VoicePicker
+                  value={currentVoice}
+                  language={currentLanguage}
+                  onChange={(v, l) => {
+                    setValue('voice', v, { shouldDirty: true });
+                    setValue('language', l, { shouldDirty: true });
+                  }}
+                />
+                {/* RHF still needs these to track the values */}
+                <input type="hidden" {...register('voice')} />
+                <input type="hidden" {...register('language')} />
               </div>
-
-              {currentVoiceMeta && currentVoiceMeta.languages.length > 1 && (
-                <div className="space-y-2 ring-aurora rounded-md p-3">
-                  <Label>Language</Label>
-                  <Select {...register('language')} className="border-0 bg-white/[0.04]">
-                    {currentVoiceMeta.languages.map((code) => (
-                      <option key={code} value={code}>
-                        {languageLabel(code)}
-                      </option>
-                    ))}
-                  </Select>
-                  <p className="text-[11px] text-muted-foreground/80">
-                    {currentVoiceMeta.label} is multilingual — pick the language to speak in.
-                  </p>
-                </div>
-              )}
             </CardContent>
           </Card>
         )}

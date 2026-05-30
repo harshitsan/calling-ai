@@ -11,10 +11,8 @@ export const LoginSchema = z.object({
   password: z.string().min(1),
 });
 
-const AURA_VOICES = [
-  'asteria', 'luna', 'stella', 'athena', 'hera',
-  'orion', 'arcas', 'perseus', 'angus', 'orpheus', 'helios', 'zeus',
-] as const;
+// Voice IDs use a "<model>:<speaker>" form (e.g. "aura2en:luna", "aura2es:carina");
+// bare ids (e.g. "asteria") stay on Aura-1 for backwards compatibility.
 
 export const VariableSchema = z.object({
   name: z.string().min(1).regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/, 'must be a valid identifier'),
@@ -51,7 +49,7 @@ export const LlmTierPolicySchema = z.object({
 export const AgentSchema = z.object({
   name: z.string().min(1).max(120),
   avatar: z.string().url().optional(),
-  voice: z.enum(AURA_VOICES).default('asteria'),
+  voice: z.string().default('aura2en:luna'),
   role: z.string().max(200).optional(),
   systemPromptTemplate: z.string().default(''),
   variables: z.array(VariableSchema).default([]),
@@ -66,4 +64,3 @@ export const AgentSchema = z.object({
 export type AgentInput = z.infer<typeof AgentSchema>;
 export type Variable = z.infer<typeof VariableSchema>;
 export type Tool = z.infer<typeof ToolSchema>;
-export const AURA_VOICE_LIST = AURA_VOICES;

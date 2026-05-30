@@ -5,6 +5,29 @@ import type { AudioChunk, LlmDelta, Message, SttEvent } from '../engine/types';
 export type ErrorReporter = (msg: string, data?: Record<string, unknown>, level?: 'warn' | 'error') => void;
 
 /**
+ * Resolve a voice id to {model, speaker}. IDs prefixed with the model
+ * (e.g. "aura2en:luna", "aura2es:carina") map to those models; bare ids
+ * (e.g. "asteria") stay on Aura-1 for backwards compatibility.
+ */
+export function resolveVoice(voiceId: string): { model: string; speaker: string } {
+  const idx = voiceId.indexOf(':');
+  if (idx > 0) {
+    const prefix = voiceId.slice(0, idx);
+    const speaker = voiceId.slice(idx + 1);
+    if (prefix === 'aura2en') return { model: '@cf/deepgram/aura-2-en', speaker };
+    if (prefix === 'aura2es') return { model: '@cf/deepgram/aura-2-es', speaker };
+    if (prefix === 'gemini') return { model: 'google/gemini-3.1-flash-tts', speaker };
+  }
+  return { model: '@cf/deepgram/aura-1', speaker: voiceId };
+}
+
+/** Build the model-specific params object for env.AI.run. */
+export function ttsParams(model: string, text: string, speaker: string): Record<string, unknown> {
+  if (model.startsWith('google/')) return { text, voice: speaker };
+  return { text, speaker, encoding: 'mp3' };
+}
+
+/**
  * Server-side Deepgram Flux STT over Workers AI WebSocket.
  * Client streams raw linear16 16kHz PCM frames; Flux emits Update/EndOfTurn events.
  * EXPERIMENTAL: protocol per docs; needs live-audio verification.
@@ -300,28 +323,25 @@ export class OpenAiLlm implements LlmPort {
 export class AuraTts implements TtsPort {
   constructor(
     private ai: Ai,
-    private speaker = 'angus',
+    private voiceId = 'angus',
     private onError?: ErrorReporter,
   ) {}
 
   async *synthesize(text: string, opts?: { signal?: AbortSignal }): AsyncIterable<AudioChunk> {
     if (opts?.signal?.aborted) return;
+    const { model, speaker } = resolveVoice(this.voiceId);
     let res: unknown;
     try {
-      res = await this.ai.run('@cf/deepgram/aura-1' as never, {
-        text,
-        speaker: this.speaker,
-        encoding: 'mp3',
-      } as never);
+      res = await this.ai.run(model as never, ttsParams(model, text, speaker) as never);
     } catch (e) {
-      this.onError?.('Aura TTS call failed', { speaker: this.speaker, error: String(e) });
+      this.onError?.('TTS call failed', { model, speaker, error: String(e) });
       return;
     }
 
     const bytes = await toBytes(res);
     if (opts?.signal?.aborted) return;
     if (bytes.length > 0) yield { data: bytes };
-    else this.onError?.('Aura TTS returned no audio', { speaker: this.speaker, chars: text.length }, 'warn');
+    else this.onError?.('TTS returned no audio', { model, speaker, chars: text.length }, 'warn');
   }
 }
 
