@@ -1,5 +1,5 @@
 import { zodResolver } from '@hookform/resolvers/zod';
-import { Plus, Trash2 } from 'lucide-react';
+import { Bot, MessageSquareQuote, Plus, Settings2, Sparkles, Trash2, Webhook } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useFieldArray, useForm } from 'react-hook-form';
 import { useNavigate, useParams } from 'react-router-dom';
@@ -11,6 +11,7 @@ import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
 import { Textarea } from '@/components/ui/textarea';
 import { api, AURA_VOICES } from '@/lib/api';
+import { cn } from '@/lib/utils';
 
 const schema = z.object({
   name: z.string().min(1, 'name required'),
@@ -63,6 +64,15 @@ const DEFAULTS: FormValues = {
   endWebhook: { url: '', headersJson: '' },
 };
 
+const TABS = [
+  { id: 'identity', label: 'Identity', icon: Bot, hint: 'Name, voice, role' },
+  { id: 'prompt', label: 'Prompt', icon: MessageSquareQuote, hint: 'What it says' },
+  { id: 'behavior', label: 'Behavior', icon: Sparkles, hint: 'Model, turn-taking' },
+  { id: 'tools', label: 'Tools', icon: Settings2, hint: 'Webhook actions' },
+  { id: 'integrations', label: 'Integrations', icon: Webhook, hint: 'External systems' },
+] as const;
+type TabId = (typeof TABS)[number]['id'];
+
 function parseHeaders(s: string): Record<string, string> {
   if (!s.trim()) return {};
   try {
@@ -81,6 +91,7 @@ export function AgentForm() {
   const navigate = useNavigate();
   const editing = Boolean(id);
   const [error, setError] = useState('');
+  const [tab, setTab] = useState<TabId>('identity');
   const form = useForm<FormValues>({ resolver: zodResolver(schema), defaultValues: DEFAULTS });
   const { register, control, handleSubmit, reset, formState } = form;
   const vars = useFieldArray({ control, name: 'variables' });
@@ -154,188 +165,265 @@ export function AgentForm() {
         </Button>
       </header>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Identity</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="space-y-1">
-            <Label>Name</Label>
-            <Input placeholder="Support Bot" {...register('name')} />
-            {formState.errors.name && <p className="text-xs text-destructive">{formState.errors.name.message}</p>}
+      {/* Tab nav */}
+      <div className="glass rounded-2xl p-1.5 flex gap-1 flex-wrap">
+        {TABS.map((t) => {
+          const Icon = t.icon;
+          const active = tab === t.id;
+          return (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => setTab(t.id)}
+              className={cn(
+                'group flex items-center gap-2.5 rounded-xl px-4 py-2.5 text-[12px] tracking-tight transition-all duration-200',
+                active
+                  ? 'bg-white/[0.07] text-foreground border border-white/[0.08] shadow-[inset_0_1px_0_hsl(0_0%_100%/0.06)]'
+                  : 'text-muted-foreground hover:text-foreground/95 hover:bg-white/[0.025]',
+              )}
+            >
+              <Icon className="h-[14px] w-[14px] opacity-80" />
+              <span>{t.label}</span>
+              <span className="hidden md:inline text-[10px] uppercase tracking-[0.16em] opacity-50">{t.hint}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Tab content */}
+      <div className="fade-up" key={tab}>
+        {tab === 'identity' && (
+          <Card>
+            <CardHeader>
+              <CardTitle>Identity</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              <div className="space-y-2">
+                <Label>Name</Label>
+                <Input placeholder="Mira" {...register('name')} />
+                {formState.errors.name && <p className="text-xs text-destructive/90">{formState.errors.name.message}</p>}
+              </div>
+              <div className="space-y-2">
+                <Label>Role</Label>
+                <Input placeholder="customer support concierge" {...register('role')} />
+              </div>
+              <div className="space-y-2">
+                <Label>Voice</Label>
+                <Select {...register('voice')}>
+                  {AURA_VOICES.map((v) => (
+                    <option key={v} value={v}>
+                      {v}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {tab === 'prompt' && (
+          <div className="space-y-6">
+            <Card>
+              <CardHeader>
+                <CardTitle>System prompt</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <Textarea rows={7} {...register('systemPromptTemplate')} />
+                <p className="text-[11px] text-muted-foreground/80">
+                  Use <code className="text-foreground/90">{'{{variable}}'}</code> placeholders.{' '}
+                  <code className="text-foreground/90">{'{{agent_name}}'}</code> is always available.
+                </p>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center justify-between">
+                  Dynamic variables
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => vars.append({ name: '', source: 'call_init', default: '' })}
+                  >
+                    <Plus className="h-3.5 w-3.5" /> Add
+                  </Button>
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {vars.fields.length === 0 && (
+                  <p className="text-sm text-muted-foreground italic font-display">No variables.</p>
+                )}
+                {vars.fields.map((f, i) => (
+                  <div key={f.id} className="flex gap-2 items-start">
+                    <Input placeholder="customer_name" {...register(`variables.${i}.name`)} />
+                    <Select {...register(`variables.${i}.source`)} className="w-40">
+                      <option value="call_init">call_init</option>
+                      <option value="static">static</option>
+                      <option value="memory">memory</option>
+                      <option value="webhook">webhook</option>
+                    </Select>
+                    <Input placeholder="default" {...register(`variables.${i}.default`)} />
+                    <Button type="button" variant="ghost" size="icon" onClick={() => vars.remove(i)}>
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </div>
+                ))}
+              </CardContent>
+            </Card>
           </div>
-          <div className="space-y-1">
-            <Label>Role</Label>
-            <Input placeholder="customer support" {...register('role')} />
+        )}
+
+        {tab === 'behavior' && (
+          <div className="space-y-6">
+            <Card>
+              <CardHeader>
+                <CardTitle>Turn-taking</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2">
+                <Label>End-of-turn pause (ms)</Label>
+                <Input
+                  type="number"
+                  min={200}
+                  max={4000}
+                  step={50}
+                  {...register('endpointingMs')}
+                  className="w-40"
+                />
+                <p className="text-[11px] text-muted-foreground/80 leading-relaxed">
+                  How long the caller must pause before the agent treats the sentence as finished and replies.
+                  Lower = snappier; higher = more patient.
+                </p>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle>Model</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-5">
+                <div className="space-y-2">
+                  <Label>Default model</Label>
+                  <Input {...register('llmTierPolicy.defaultModel')} />
+                  <p className="text-[11px] text-muted-foreground/80">
+                    <code className="text-foreground/85">gpt-4o-mini</code> (default, fast),{' '}
+                    <code className="text-foreground/85">gpt-4o</code>, or{' '}
+                    <code className="text-foreground/85">@cf/…</code> for Workers AI.
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <Label>Escalate model (optional)</Label>
+                  <Input placeholder="gpt-4o" {...register('llmTierPolicy.escalateModel')} />
+                </div>
+                <div className="space-y-2">
+                  <Label>Escalate on</Label>
+                  <Select {...register('llmTierPolicy.escalateOn')}>
+                    <option value="never">never</option>
+                    <option value="manual">manual</option>
+                    <option value="low_confidence">low_confidence</option>
+                  </Select>
+                </div>
+              </CardContent>
+            </Card>
           </div>
-          <div className="space-y-1">
-            <Label>Voice</Label>
-            <Select {...register('voice')}>
-              {AURA_VOICES.map((v) => (
-                <option key={v} value={v}>
-                  {v}
-                </option>
+        )}
+
+        {tab === 'tools' && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center justify-between">
+                Tools (webhook actions)
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => tools.append({ name: '', description: '', webhookUrl: '' })}
+                >
+                  <Plus className="h-3.5 w-3.5" /> Add
+                </Button>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {tools.fields.length === 0 && (
+                <p className="text-sm text-muted-foreground italic font-display">
+                  No tools. <span className="not-italic font-sans text-muted-foreground/70">end_call &amp; recall_memory are built in.</span>
+                </p>
+              )}
+              {tools.fields.map((f, i) => (
+                <div key={f.id} className="space-y-2 rounded-xl border border-white/[0.05] p-3">
+                  <div className="flex gap-2 items-start">
+                    <Input placeholder="lookup_order" {...register(`tools.${i}.name`)} />
+                    <Input placeholder="description for the model" {...register(`tools.${i}.description`)} />
+                    <Button type="button" variant="ghost" size="icon" onClick={() => tools.remove(i)}>
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </div>
+                  <Input placeholder="https://api.you.com/tool" {...register(`tools.${i}.webhookUrl`)} />
+                </div>
               ))}
-            </Select>
+            </CardContent>
+          </Card>
+        )}
+
+        {tab === 'integrations' && (
+          <div className="space-y-6">
+            <Card>
+              <CardHeader>
+                <CardTitle>Inbound API call</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <p className="text-[11px] text-muted-foreground/80 leading-relaxed">
+                  Called when a call starts; its JSON response is merged into your prompt variables (any variable
+                  with source <code className="text-foreground/85">webhook</code> picks up its value by key name).
+                </p>
+                <div className="flex gap-2">
+                  <Select {...register('inboundLookup.method')} className="w-24">
+                    <option value="POST">POST</option>
+                    <option value="GET">GET</option>
+                  </Select>
+                  <Input placeholder="https://api.you.com/lookup" {...register('inboundLookup.url')} />
+                </div>
+                <Label className="text-[10px]">Headers (JSON, optional)</Label>
+                <Textarea
+                  rows={3}
+                  placeholder='{"Authorization": "Bearer ..."}'
+                  className="font-mono text-xs"
+                  {...register('inboundLookup.headersJson')}
+                />
+                <p className="text-[11px] text-muted-foreground/80">
+                  Payload: <code className="text-foreground/85">{'{caller, agentId, callId}'}</code>. Timeout (ms):{' '}
+                  <input
+                    {...register('inboundLookup.timeoutMs')}
+                    className="ml-1 w-20 rounded-md bg-white/[0.04] border border-white/[0.07] px-2 py-0.5 text-[11px] text-foreground/90"
+                  />
+                </p>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle>End-of-call webhook</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <p className="text-[11px] text-muted-foreground/80 leading-relaxed">
+                  POSTed when the call ends, with{' '}
+                  <code className="text-foreground/85">
+                    {'{callId, agentId, caller, startedAt, endedAt, durationS, endReason, summary, transcript, costUsd}'}
+                  </code>
+                  .
+                </p>
+                <Input placeholder="https://api.you.com/calls/ended" {...register('endWebhook.url')} />
+                <Label className="text-[10px]">Headers (JSON, optional)</Label>
+                <Textarea
+                  rows={3}
+                  placeholder='{"Authorization": "Bearer ..."}'
+                  className="font-mono text-xs"
+                  {...register('endWebhook.headersJson')}
+                />
+              </CardContent>
+            </Card>
           </div>
-        </CardContent>
-      </Card>
+        )}
+      </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>System prompt</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-2">
-          <Textarea rows={5} {...register('systemPromptTemplate')} />
-          <p className="text-xs text-muted-foreground">
-            Use <code>{'{{variable}}'}</code> placeholders. <code>{'{{agent_name}}'}</code> is always available.
-          </p>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center justify-between">
-            Dynamic variables
-            <Button type="button" variant="outline" size="sm" onClick={() => vars.append({ name: '', source: 'call_init', default: '' })}>
-              <Plus className="h-4 w-4" /> Add
-            </Button>
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {vars.fields.length === 0 && <p className="text-sm text-muted-foreground">No variables.</p>}
-          {vars.fields.map((f, i) => (
-            <div key={f.id} className="flex gap-2 items-start">
-              <Input placeholder="customer_name" {...register(`variables.${i}.name`)} />
-              <Select {...register(`variables.${i}.source`)} className="w-40">
-                <option value="call_init">call_init</option>
-                <option value="static">static</option>
-                <option value="memory">memory</option>
-                <option value="webhook">webhook</option>
-              </Select>
-              <Input placeholder="default" {...register(`variables.${i}.default`)} />
-              <Button type="button" variant="ghost" size="icon" onClick={() => vars.remove(i)}>
-                <Trash2 className="h-4 w-4" />
-              </Button>
-            </div>
-          ))}
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center justify-between">
-            Tools (webhooks)
-            <Button type="button" variant="outline" size="sm" onClick={() => tools.append({ name: '', description: '', webhookUrl: '' })}>
-              <Plus className="h-4 w-4" /> Add
-            </Button>
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {tools.fields.length === 0 && <p className="text-sm text-muted-foreground">No tools. (end_call & recall_memory are built in.)</p>}
-          {tools.fields.map((f, i) => (
-            <div key={f.id} className="flex gap-2 items-start">
-              <Input placeholder="lookup_order" {...register(`tools.${i}.name`)} />
-              <Input placeholder="description" {...register(`tools.${i}.description`)} />
-              <Input placeholder="https://api.you.com/tool" {...register(`tools.${i}.webhookUrl`)} />
-              <Button type="button" variant="ghost" size="icon" onClick={() => tools.remove(i)}>
-                <Trash2 className="h-4 w-4" />
-              </Button>
-            </div>
-          ))}
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Turn-taking</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-2">
-          <Label>End-of-turn pause (ms)</Label>
-          <Input type="number" min={200} max={4000} step={50} {...register('endpointingMs')} className="w-40" />
-          <p className="text-xs text-muted-foreground">
-            How long the caller must pause before the agent treats the sentence as finished and replies. Lower =
-            snappier but may cut people off; higher = more patient.
-          </p>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Model</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="space-y-1">
-            <Label>Default model</Label>
-            <Input {...register('llmTierPolicy.defaultModel')} />
-          </div>
-          <div className="space-y-1">
-            <Label>Escalate model (optional)</Label>
-            <Input placeholder="@cf/meta/llama-3.3-70b-instruct" {...register('llmTierPolicy.escalateModel')} />
-          </div>
-          <div className="space-y-1">
-            <Label>Escalate on</Label>
-            <Select {...register('llmTierPolicy.escalateOn')}>
-              <option value="never">never</option>
-              <option value="manual">manual</option>
-              <option value="low_confidence">low_confidence</option>
-            </Select>
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Integrations</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          <div className="space-y-2">
-            <Label>Inbound API call (at call start)</Label>
-            <p className="text-xs text-muted-foreground">
-              We call this URL when a call starts and merge the JSON response into your prompt variables —
-              great for looking the caller up in your CRM. Any variable with source <code>webhook</code> gets
-              its value from this response (by key name). Leave blank to skip.
-            </p>
-            <div className="flex gap-2">
-              <Select {...register('inboundLookup.method')} className="w-24">
-                <option value="POST">POST</option>
-                <option value="GET">GET</option>
-              </Select>
-              <Input placeholder="https://api.you.com/lookup" {...register('inboundLookup.url')} />
-            </div>
-            <Label className="text-xs">Headers (JSON, optional)</Label>
-            <Textarea
-              rows={3}
-              placeholder='{"Authorization": "Bearer ..."}'
-              className="font-mono text-xs"
-              {...register('inboundLookup.headersJson')}
-            />
-            <p className="text-xs text-muted-foreground">
-              Payload: <code>{`{caller, agentId, callId}`}</code> (POST as JSON body, GET as query params).
-              Timeout (ms): <input {...register('inboundLookup.timeoutMs')} className="ml-1 w-20 border rounded px-1 text-xs" />
-            </p>
-          </div>
-
-          <div className="space-y-2 border-t pt-4">
-            <Label>End-of-call webhook</Label>
-            <p className="text-xs text-muted-foreground">
-              When the call ends we POST{' '}
-              <code>{`{callId, agentId, caller, startedAt, endedAt, durationS, endReason, summary, transcript, costUsd}`}</code>{' '}
-              to this URL. Leave blank to skip.
-            </p>
-            <Input placeholder="https://api.you.com/calls/ended" {...register('endWebhook.url')} />
-            <Label className="text-xs">Headers (JSON, optional)</Label>
-            <Textarea
-              rows={3}
-              placeholder='{"Authorization": "Bearer ..."}'
-              className="font-mono text-xs"
-              {...register('endWebhook.headersJson')}
-            />
-          </div>
-        </CardContent>
-      </Card>
-
-      {error && <p className="text-sm text-destructive">{error}</p>}
+      {error && <p className="text-sm text-destructive/90">{error}</p>}
     </form>
   );
 }

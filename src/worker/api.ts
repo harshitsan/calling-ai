@@ -216,11 +216,39 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
 
   // ---- call logs ----
   if (path === '/api/calls' && method === 'GET') {
-    const { results } = await env.DB.prepare(
-      'SELECT id, agent_id, caller_ref, started_at, ended_at, duration_s, status, end_reason, cost_usd, summary, latency_p50_ms FROM calls WHERE tenant_id = ? ORDER BY started_at DESC LIMIT 100',
-    )
-      .bind(auth.tenantId)
-      .all();
+    const q = url.searchParams.get('q')?.trim() ?? '';
+    const filterAgentId = url.searchParams.get('agentId') ?? '';
+    const status = url.searchParams.get('status') ?? 'all';
+    const endReason = url.searchParams.get('endReason') ?? 'all';
+    const since = Number(url.searchParams.get('since') ?? '0');
+
+    const where: string[] = ['tenant_id = ?'];
+    const args: (string | number)[] = [auth.tenantId];
+    if (q) {
+      where.push('(caller_ref LIKE ? OR summary LIKE ?)');
+      const like = `%${q}%`;
+      args.push(like, like);
+    }
+    if (filterAgentId) {
+      where.push('agent_id = ?');
+      args.push(filterAgentId);
+    }
+    if (status === 'ended' || status === 'active') {
+      where.push('status = ?');
+      args.push(status);
+    }
+    if (endReason === 'manual') where.push("end_reason = 'client_hangup'");
+    else if (endReason === 'tool') where.push("end_reason LIKE 'tool:%'");
+    else if (endReason === 'disconnected') where.push("end_reason = 'socket_closed'");
+    if (since > 0) {
+      where.push('started_at >= ?');
+      args.push(since);
+    }
+
+    const sql = `SELECT id, agent_id, caller_ref, started_at, ended_at, duration_s, status, end_reason, cost_usd, summary, latency_p50_ms
+                 FROM calls WHERE ${where.join(' AND ')}
+                 ORDER BY started_at DESC LIMIT 200`;
+    const { results } = await env.DB.prepare(sql).bind(...args).all();
     return json({ calls: results });
   }
 
