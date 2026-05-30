@@ -1,4 +1,4 @@
-import { Phone, PhoneOff, Send } from 'lucide-react';
+import { AlertTriangle, Phone, PhoneOff, RotateCw, Send } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -24,6 +24,26 @@ interface Line {
   role: string;
   text: string;
   ts: number;
+}
+
+function DiagRow({
+  label,
+  value,
+  sub,
+  valueClass,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+  valueClass?: string;
+}) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-[0.22em] text-muted-foreground/65">{label}</div>
+      <div className={`font-mono text-[13px] tabular-nums ${valueClass ?? 'text-foreground/90'}`}>{value}</div>
+      {sub && <div className="text-[10px] font-mono text-muted-foreground/55 tabular-nums">{sub}</div>}
+    </div>
+  );
 }
 
 function fmtOffset(ms: number): string {
@@ -60,6 +80,19 @@ export function TestCall() {
   const [latency, setLatency] = useState<number | null>(null);
   const [text, setText] = useState('');
   const [interim, setInterim] = useState('');
+  const [diag, setDiag] = useState({
+    engineState: 'idle',
+    micRms: 0,
+    audioQueue: 0,
+    recRunning: false,
+    recRestarts: 0,
+    lastRecResultAt: 0,
+    lastEventAt: 0,
+    lastError: '',
+  });
+  const [, force] = useState(0);
+  const diagRef = useRef(diag);
+  diagRef.current = diag;
 
   const wsRef = useRef<WebSocket | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
@@ -90,6 +123,61 @@ export function TestCall() {
     return () => stop();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Periodic re-render so "time-ago" labels update.
+  useEffect(() => {
+    if (status !== 'live') return;
+    const id = setInterval(() => force((v) => v + 1), 250);
+    return () => clearInterval(id);
+  }, [status]);
+
+  // Watchdog: if the recognizer hasn't produced any result in 12s while the
+  // mic is clearly hearing speech, force-restart it. Common Chrome failure mode.
+  useEffect(() => {
+    if (status !== 'live') return;
+    const id = setInterval(() => {
+      const d = diagRef.current;
+      if (!d.recRunning) return;
+      if (d.lastRecResultAt === 0) return; // never heard anything yet
+      const idleMs = Date.now() - d.lastRecResultAt;
+      if (idleMs > 12000 && d.micRms > 0.025) {
+        setDiag((s) => ({ ...s, lastError: 'recognition stuck — auto-restarted' }));
+        try {
+          recRef.current?.abort();
+        } catch {
+          /* ignore */
+        }
+      }
+    }, 2000);
+    return () => clearInterval(id);
+  }, [status]);
+
+  function restartRecognition() {
+    try {
+      recRef.current?.abort();
+    } catch {
+      /* ignore */
+    }
+    setDiag((d) => ({ ...d, lastError: 'manually restarted' }));
+  }
+
+  function ago(ts: number): string {
+    if (!ts) return '—';
+    const ms = Date.now() - ts;
+    if (ms < 1000) return `${ms}ms ago`;
+    if (ms < 60000) return `${(ms / 1000).toFixed(1)}s ago`;
+    return `${Math.floor(ms / 60000)}m ago`;
+  }
+
+  function recHealthColor(): string {
+    const d = diagRef.current;
+    if (!d.recRunning) return 'text-red-400';
+    if (!d.lastRecResultAt) return 'text-muted-foreground';
+    const idle = Date.now() - d.lastRecResultAt;
+    if (idle < 5000) return 'text-emerald-400';
+    if (idle < 15000) return 'text-amber-400';
+    return 'text-red-400';
+  }
 
   useEffect(() => {
     const a = agents.find((x) => x.id === agentId);
@@ -182,6 +270,7 @@ export function TestCall() {
       const data = new Uint8Array(analyser.fftSize);
       let consec = 0;
       let baseline = 0.01;
+      let lastUiUpdate = 0;
       const loop = () => {
         if (!liveRef.current) return;
         analyser.getByteTimeDomainData(data);
@@ -191,6 +280,11 @@ export function TestCall() {
           sum += x * x;
         }
         const rms = Math.sqrt(sum / data.length);
+        const now = performance.now();
+        if (now - lastUiUpdate > 100) {
+          lastUiUpdate = now;
+          setDiag((d) => ({ ...d, micRms: rms, audioQueue: sourcesRef.current.length }));
+        }
         if (isSpeaking()) {
           if (rms > VAD_FLOOR && rms > baseline * VAD_RATIO) {
             if (++consec >= VAD_FRAMES) {
@@ -225,7 +319,9 @@ export function TestCall() {
       rec.continuous = true;
       rec.interimResults = true;
       baseIndexRef.current = 0;
+      setDiag((d) => ({ ...d, recRunning: true, lastError: '' }));
       rec.onresult = (e: any) => {
+        setDiag((d) => ({ ...d, lastRecResultAt: Date.now() }));
         resultsLenRef.current = e.results.length;
         if (isSpeaking()) {
           // skip everything heard while the agent talks (echo)
@@ -243,8 +339,11 @@ export function TestCall() {
           if (interimRef.current && !isSpeaking()) send(interimRef.current);
         }, endpointMsRef.current);
       };
-      rec.onerror = () => {};
+      rec.onerror = (ev: any) => {
+        setDiag((d) => ({ ...d, lastError: `recognition: ${ev?.error ?? 'unknown'}` }));
+      };
       rec.onend = () => {
+        setDiag((d) => ({ ...d, recRunning: false, recRestarts: d.recRestarts + 1 }));
         if (liveRef.current) setTimeout(spawn, 300);
       };
       recRef.current = rec;
@@ -291,6 +390,7 @@ export function TestCall() {
       if (liveRef.current) stop();
     };
     ws.onmessage = (e) => {
+      setDiag((d) => ({ ...d, lastEventAt: Date.now() }));
       if (typeof e.data !== 'string') {
         playAudio(e.data as ArrayBuffer);
         return;
@@ -304,6 +404,7 @@ export function TestCall() {
         return;
       }
       if (ev.type === 'meta') callIdRef.current = ev.callId;
+      else if (ev.type === 'state') setDiag((d) => ({ ...d, engineState: ev.state }));
       else if (ev.type === 'transcript')
         setLines((l) => [
           ...l,
@@ -519,6 +620,84 @@ export function TestCall() {
           <Send className="h-4 w-4" />
         </Button>
       </div>
+
+      {status === 'live' && (
+        <Card>
+          <CardHeader className="pb-3 flex flex-row items-center justify-between">
+            <CardTitle>Behind the scenes</CardTitle>
+            <Button variant="outline" size="sm" onClick={restartRecognition}>
+              <RotateCw className="h-3 w-3" /> Restart STT
+            </Button>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {/* Mic VU meter */}
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] uppercase tracking-[0.22em] text-muted-foreground/75">
+                  Mic input
+                </span>
+                <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
+                  {diag.micRms.toFixed(3)}
+                </span>
+              </div>
+              <div className="h-2 rounded-full bg-white/[0.04] border border-white/[0.04] overflow-hidden">
+                <div
+                  className={`h-full transition-[width] duration-100 ${
+                    diag.micRms > 0.05
+                      ? 'bg-emerald-400/80'
+                      : diag.micRms > 0.02
+                        ? 'bg-aurora-3/70'
+                        : 'bg-muted-foreground/30'
+                  }`}
+                  style={{ width: `${Math.min(100, diag.micRms * 400)}%` }}
+                />
+              </div>
+            </div>
+
+            <div className="hairline" />
+
+            {/* State grid */}
+            <div className="grid grid-cols-2 gap-x-6 gap-y-3 text-[12px]">
+              <DiagRow label="Engine" value={diag.engineState} sub={ago(diag.lastEventAt)} />
+              <DiagRow
+                label="Recognition"
+                value={diag.recRunning ? 'listening' : 'restarting'}
+                valueClass={recHealthColor()}
+                sub={`last result ${ago(diag.lastRecResultAt)}`}
+              />
+              <DiagRow
+                label="Agent"
+                value={isSpeaking() ? 'speaking' : 'silent'}
+                sub={`queue ${diag.audioQueue}`}
+              />
+              <DiagRow
+                label="Restarts"
+                value={String(diag.recRestarts)}
+                sub={`since call start`}
+              />
+            </div>
+
+            {interim && (
+              <>
+                <div className="hairline" />
+                <div>
+                  <div className="text-[10px] uppercase tracking-[0.22em] text-muted-foreground/75 mb-1">
+                    Recognizer interim
+                  </div>
+                  <div className="text-[13px] italic font-display text-foreground/70">{interim}…</div>
+                </div>
+              </>
+            )}
+
+            {diag.lastError && (
+              <div className="flex items-center gap-2 text-amber-400/90 text-[12px]">
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                <span>{diag.lastError}</span>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }
