@@ -107,6 +107,20 @@ export function TestCall() {
     return !!c && c.currentTime < nextStartRef.current - 0.001 + SPEAK_GRACE && nextStartRef.current > 0;
   }
 
+  function scheduleBuffer(ctx: AudioContext, decoded: AudioBuffer) {
+    const src = ctx.createBufferSource();
+    src.buffer = decoded;
+    src.connect(ctx.destination);
+    if (recDestRef.current) src.connect(recDestRef.current); // capture into recording
+    const start = Math.max(ctx.currentTime + 0.02, nextStartRef.current);
+    src.start(start);
+    nextStartRef.current = start + decoded.duration;
+    sourcesRef.current.push(src);
+    src.onended = () => {
+      sourcesRef.current = sourcesRef.current.filter((s) => s !== src);
+    };
+  }
+
   async function playAudio(buf: ArrayBuffer) {
     const ctx = await ensureCtx();
     let decoded: AudioBuffer;
@@ -115,17 +129,20 @@ export function TestCall() {
     } catch {
       return;
     }
-    const src = ctx.createBufferSource();
-    src.buffer = decoded;
-    src.connect(ctx.destination);
-    if (recDestRef.current) src.connect(recDestRef.current); // capture agent audio into recording
-    const start = Math.max(ctx.currentTime + 0.02, nextStartRef.current);
-    src.start(start);
-    nextStartRef.current = start + decoded.duration;
-    sourcesRef.current.push(src);
-    src.onended = () => {
-      sourcesRef.current = sourcesRef.current.filter((s) => s !== src);
-    };
+    scheduleBuffer(ctx, decoded);
+  }
+
+  async function playPcm(bytes: Uint8Array, sampleRate: number, channels: number) {
+    const ctx = await ensureCtx();
+    const samples = Math.floor(bytes.byteLength / 2 / channels);
+    if (samples === 0) return;
+    const buffer = ctx.createBuffer(channels, samples, sampleRate);
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let ch = 0; ch < channels; ch++) {
+      const cd = buffer.getChannelData(ch);
+      for (let i = 0; i < samples; i++) cd[i] = dv.getInt16((i * channels + ch) * 2, true) / 32768;
+    }
+    scheduleBuffer(ctx, buffer);
   }
 
   function stopAudio() {
@@ -279,6 +296,13 @@ export function TestCall() {
         return;
       }
       const ev = JSON.parse(e.data);
+      if (ev.type === 'audioPcm') {
+        const bin = atob(ev.data);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        playPcm(bytes, ev.sampleRate ?? 24000, ev.channels ?? 1);
+        return;
+      }
       if (ev.type === 'meta') callIdRef.current = ev.callId;
       else if (ev.type === 'transcript')
         setLines((l) => [

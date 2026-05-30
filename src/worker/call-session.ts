@@ -43,6 +43,12 @@ interface Turn {
   ts: number;
 }
 
+function bytesToB64(b: Uint8Array): string {
+  let s = '';
+  for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]!);
+  return btoa(s);
+}
+
 class RecordingClientPort implements ClientPort {
   constructor(
     private ws: WebSocket,
@@ -54,7 +60,19 @@ class RecordingClientPort implements ClientPort {
   ) {}
   emit(event: ClientEvent): void {
     if (event.type === 'audio') {
-      this.ws.send(event.chunk.data);
+      const c = event.chunk;
+      if (c.codec === 'pcm') {
+        this.ws.send(
+          JSON.stringify({
+            type: 'audioPcm',
+            sampleRate: c.sampleRate ?? 24000,
+            channels: c.channels ?? 1,
+            data: bytesToB64(c.data),
+          }),
+        );
+      } else {
+        this.ws.send(c.data); // binary mp3 (default)
+      }
       return;
     }
     if (event.type === 'transcript') {

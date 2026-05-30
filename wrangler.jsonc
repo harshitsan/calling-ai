@@ -14,6 +14,9 @@
   "r2_buckets": [
     { "binding": "RECORDINGS", "bucket_name": "calling-ai-recordings" }
   ],
+  "kv_namespaces": [
+    { "binding": "TTS_CACHE", "id": "cbc4a20ca23a46c6b2b78d4bf3775225" }
+  ],
   "d1_databases": [
     {
       "binding": "DB",

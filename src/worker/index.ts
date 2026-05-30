@@ -1,5 +1,5 @@
 import { handleApi } from './api';
-import { synthesizeTts } from './adapters';
+import { synthesizeTtsCached } from './adapters';
 import { verifyJwt } from './auth';
 import { CallSession } from './call-session';
 import { LogHub } from './log-hub';
@@ -64,13 +64,20 @@ export default {
       const text = url.searchParams.get('text') ?? 'Hello from Cloudflare.';
       const voiceId = url.searchParams.get('voice') ?? 'asteria';
       try {
-        const { bytes, contentType } = await synthesizeTts({
+        const { bytes, contentType, cached } = await synthesizeTtsCached({
           ai: env.AI,
           googleApiKey: (env as unknown as { GOOGLE_AI_API_KEY?: string }).GOOGLE_AI_API_KEY,
           voiceId,
           text,
+          kv: env.TTS_CACHE,
         });
-        return new Response(bytes, { headers: { 'content-type': contentType } });
+        return new Response(bytes, {
+          headers: {
+            'content-type': contentType,
+            'x-tts-cache': cached ? 'HIT' : 'MISS',
+            'cache-control': 'public, max-age=86400',
+          },
+        });
       } catch (e) {
         return new Response(`tts error: ${(e as Error).message}`, { status: 500 });
       }

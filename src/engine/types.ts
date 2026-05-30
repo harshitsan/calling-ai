@@ -11,6 +11,12 @@ export type EngineState = 'idle' | 'listening' | 'thinking' | 'speaking' | 'ende
 
 export interface AudioChunk {
   data: Uint8Array;
+  /** Codec of the bytes — 'mp3' (default, full clip), 'wav' (full clip), or 'pcm' (raw L16 streamed chunk). */
+  codec?: 'mp3' | 'wav' | 'pcm';
+  /** Required when codec === 'pcm'. */
+  sampleRate?: number;
+  /** Required when codec === 'pcm'; defaults to 1. */
+  channels?: number;
 }
 
 export type SttEvent =
