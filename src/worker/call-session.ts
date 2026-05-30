@@ -218,6 +218,7 @@ export class CallSession {
       onToolCall: (call) => this.executeTool(call, toolMap),
     });
     engine.start();
+    server.send(JSON.stringify({ type: 'meta', callId: this.callId }));
     this.log('call', 'call started', {
       agentId: this.agentId,
       caller: this.callerRef,

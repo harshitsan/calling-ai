@@ -252,6 +252,40 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     return json({ calls: results });
   }
 
+  const recMatch = path.match(/^\/api\/calls\/([a-zA-Z0-9-]+)\/recording$/);
+  if (recMatch) {
+    const callId = recMatch[1]!;
+    const call = await env.DB.prepare(
+      'SELECT recording_key FROM calls WHERE id = ? AND tenant_id = ?',
+    )
+      .bind(callId, auth.tenantId)
+      .first<{ recording_key: string | null }>();
+    if (!call) return err(404, 'call not found');
+
+    if (method === 'POST' || method === 'PUT') {
+      if (!request.body) return err(400, 'empty body');
+      const key = `t/${auth.tenantId}/${callId}.webm`;
+      const ct = request.headers.get('content-type') ?? 'audio/webm';
+      await env.RECORDINGS.put(key, request.body, { httpMetadata: { contentType: ct } });
+      await env.DB.prepare('UPDATE calls SET recording_key = ? WHERE id = ? AND tenant_id = ?')
+        .bind(key, callId, auth.tenantId)
+        .run();
+      return json({ ok: true, key });
+    }
+
+    if (method === 'GET') {
+      if (!call.recording_key) return err(404, 'no recording');
+      const obj = await env.RECORDINGS.get(call.recording_key);
+      if (!obj) return err(404, 'recording missing');
+      return new Response(obj.body, {
+        headers: {
+          'content-type': obj.httpMetadata?.contentType ?? 'audio/webm',
+          'cache-control': 'private, max-age=3600',
+        },
+      });
+    }
+  }
+
   const callMatch = path.match(/^\/api\/calls\/([a-zA-Z0-9-]+)$/);
   if (callMatch && method === 'GET') {
     const callId = callMatch[1]!;

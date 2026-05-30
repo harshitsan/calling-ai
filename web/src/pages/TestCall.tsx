@@ -7,6 +7,14 @@ import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
 import { api, getToken } from '@/lib/api';
 
+function pickRecorderMime(): string | undefined {
+  const cands = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
+  for (const m of cands) {
+    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) return m;
+  }
+  return undefined;
+}
+
 interface Agent {
   id: string;
   name: string;
@@ -53,6 +61,11 @@ export function TestCall() {
   const endpointTimer = useRef<number | null>(null);
   const endpointMsRef = useRef(900);
   const lastSent = useRef({ text: '', t: 0 });
+  // Recording (mixed mic + agent audio -> R2 on hangup).
+  const recDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recChunksRef = useRef<Blob[]>([]);
+  const callIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     api<{ agents: Agent[] }>('/api/agents').then((r) => {
@@ -90,6 +103,7 @@ export function TestCall() {
     const src = ctx.createBufferSource();
     src.buffer = decoded;
     src.connect(ctx.destination);
+    if (recDestRef.current) src.connect(recDestRef.current); // capture agent audio into recording
     const start = Math.max(ctx.currentTime + 0.02, nextStartRef.current);
     src.start(start);
     nextStartRef.current = start + decoded.duration;
@@ -124,6 +138,7 @@ export function TestCall() {
       micStreamRef.current = stream;
       const ctx = await ensureCtx();
       const srcNode = ctx.createMediaStreamSource(stream);
+      if (recDestRef.current) srcNode.connect(recDestRef.current); // capture caller audio into recording
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
       srcNode.connect(analyser);
@@ -215,8 +230,20 @@ export function TestCall() {
     setStatus('connecting');
     setLines([]);
     setLatency(null);
-    await ensureCtx();
+    const ctx = await ensureCtx();
     liveRef.current = true;
+    // Set up the recording mixer (mic + agent audio).
+    recDestRef.current = ctx.createMediaStreamDestination();
+    recChunksRef.current = [];
+    callIdRef.current = null;
+    const mime = pickRecorderMime();
+    try {
+      recorderRef.current = new MediaRecorder(recDestRef.current.stream, mime ? { mimeType: mime } : undefined);
+      recorderRef.current.ondataavailable = (e) => { if (e.data.size > 0) recChunksRef.current.push(e.data); };
+      recorderRef.current.start(1000); // 1s timeslices for safety
+    } catch {
+      recorderRef.current = null;
+    }
     const token = getToken();
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const url = `${proto}://${location.host}/call?agentId=${agentId}&token=${encodeURIComponent(token ?? '')}&customer_name=${encodeURIComponent(customer)}`;
@@ -236,7 +263,8 @@ export function TestCall() {
         return;
       }
       const ev = JSON.parse(e.data);
-      if (ev.type === 'transcript') setLines((l) => [...l, { role: ev.role, text: ev.text }]);
+      if (ev.type === 'meta') callIdRef.current = ev.callId;
+      else if (ev.type === 'transcript') setLines((l) => [...l, { role: ev.role, text: ev.text }]);
       else if (ev.type === 'flush') stopAudio();
       else if (ev.type === 'latency' && ev.turn.endpointToFirstAudio != null) setLatency(ev.turn.endpointToFirstAudio);
       else if (ev.type === 'ended') {
@@ -257,6 +285,34 @@ export function TestCall() {
       /* ignore */
     }
     recRef.current = null;
+
+    // Finalize the recording and upload it.
+    const recorder = recorderRef.current;
+    const callId = callIdRef.current;
+    if (recorder && recorder.state !== 'inactive') {
+      recorder.onstop = async () => {
+        if (!callId || recChunksRef.current.length === 0) return;
+        const type = recChunksRef.current[0]?.type || 'audio/webm';
+        const blob = new Blob(recChunksRef.current, { type });
+        try {
+          await fetch(`/api/calls/${callId}/recording`, {
+            method: 'POST',
+            headers: {
+              authorization: `Bearer ${getToken() ?? ''}`,
+              'content-type': type,
+            },
+            body: blob,
+          });
+        } catch {
+          /* best-effort */
+        }
+        recChunksRef.current = [];
+      };
+      try { recorder.stop(); } catch { /* ignore */ }
+    }
+    recorderRef.current = null;
+    recDestRef.current = null;
+
     micStreamRef.current?.getTracks().forEach((t) => t.stop());
     micStreamRef.current = null;
     setInterim('');

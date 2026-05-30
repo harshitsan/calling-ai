@@ -1,8 +1,8 @@
 import { ArrowLeft } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { api } from '@/lib/api';
+import { api, getToken } from '@/lib/api';
 
 interface Turn {
   role: string;
@@ -17,19 +17,48 @@ interface CallFull {
   end_reason: string | null;
   summary: string | null;
   latency_p50_ms: number | null;
+  recording_key: string | null;
 }
 
 export function CallDetail() {
   const { id } = useParams();
   const [call, setCall] = useState<CallFull | null>(null);
   const [turns, setTurns] = useState<Turn[]>([]);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const urlRef = useRef<string | null>(null);
 
   useEffect(() => {
     api<{ call: CallFull; turns: Turn[] }>(`/api/calls/${id}`).then((r) => {
       setCall(r.call);
       setTurns(r.turns);
     });
+    return () => {
+      if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+    };
   }, [id]);
+
+  useEffect(() => {
+    if (!call?.recording_key) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`/api/calls/${id}/recording`, {
+          headers: { authorization: `Bearer ${getToken() ?? ''}` },
+        });
+        if (!res.ok) return;
+        const blob = await res.blob();
+        if (cancelled) return;
+        const url = URL.createObjectURL(blob);
+        urlRef.current = url;
+        setAudioUrl(url);
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [call?.recording_key, id]);
 
   if (!call) return <p className="text-muted-foreground">Loading…</p>;
 
@@ -60,6 +89,25 @@ export function CallDetail() {
         <Stat label="Cost" value={call.cost_usd != null ? `$${call.cost_usd.toFixed(4)}` : '—'} />
         <Stat label="Ended" value={endLabel(call.end_reason)} />
       </div>
+
+      {call.recording_key && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Recording</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {audioUrl ? (
+              <audio
+                controls
+                src={audioUrl}
+                className="w-full [&::-webkit-media-controls-panel]:bg-white/[0.04] [&::-webkit-media-controls-panel]:rounded-md"
+              />
+            ) : (
+              <p className="text-sm text-muted-foreground italic font-display">Loading recording…</p>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       <Card>
         <CardHeader>

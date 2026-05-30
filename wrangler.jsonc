@@ -11,6 +11,9 @@
     "run_worker_first": true
   },
   "ai": { "binding": "AI" },
+  "r2_buckets": [
+    { "binding": "RECORDINGS", "bucket_name": "calling-ai-recordings" }
+  ],
   "d1_databases": [
     {
       "binding": "DB",
