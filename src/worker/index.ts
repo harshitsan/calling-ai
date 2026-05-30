@@ -1,5 +1,5 @@
 import { handleApi } from './api';
-import { resolveVoice, ttsParams } from './adapters';
+import { synthesizeTts } from './adapters';
 import { verifyJwt } from './auth';
 import { CallSession } from './call-session';
 import { LogHub } from './log-hub';
@@ -63,13 +63,17 @@ export default {
     if (url.pathname === '/api/tts') {
       const text = url.searchParams.get('text') ?? 'Hello from Cloudflare.';
       const voiceId = url.searchParams.get('voice') ?? 'asteria';
-      const { model, speaker } = resolveVoice(voiceId);
-      const res = (await env.AI.run(
-        model as never,
-        ttsParams(model, text, speaker) as never,
-      )) as unknown;
-      const audio = res instanceof ReadableStream ? res : new Response(res as BodyInit).body;
-      return new Response(audio, { headers: { 'content-type': 'audio/mpeg' } });
+      try {
+        const { bytes, contentType } = await synthesizeTts({
+          ai: env.AI,
+          googleApiKey: (env as unknown as { GOOGLE_AI_API_KEY?: string }).GOOGLE_AI_API_KEY,
+          voiceId,
+          text,
+        });
+        return new Response(bytes, { headers: { 'content-type': contentType } });
+      } catch (e) {
+        return new Response(`tts error: ${(e as Error).message}`, { status: 500 });
+      }
     }
 
     if (url.pathname === '/demo') {

@@ -30,15 +30,19 @@ export const MODELS: ModelMeta[] = [
     pricing: '≈ $0.022 / spoken min',
   },
   {
+    id: 'google/gemini-3.1-flash-tts',
+    label: 'Gemini Flash',
+    vendor: 'Google',
+    description: 'Multilingual · 30 voices',
+    pricing: 'BYOK · Google AI Studio',
+  },
+  {
     id: '@cf/deepgram/aura-1',
     label: 'Aura-1 · Legacy',
     vendor: 'Deepgram',
     description: 'Original lineup · 12 voices · English',
     pricing: '≈ $0.011 / spoken min',
   },
-  // Gemini Flash TTS (30 multilingual voices) is wired but disabled by default —
-  // it's an AI-Gateway-proxied model that needs a configured gateway + Google
-  // AI Studio key. Add it back here once that's set up at the account level.
 ];
 
 export interface VoiceMeta {
@@ -119,9 +123,7 @@ const GEMINI: VoiceMeta[] = GEMINI_NAMES.map((n) => ({
   hd: true,
 }));
 
-export const VOICES: VoiceMeta[] = [...AURA2_EN, ...AURA2_ES, ...AURA1];
-// Gemini lineup is kept defined for when AI Gateway is configured:
-export const _GEMINI_VOICES_RESERVED: VoiceMeta[] = GEMINI;
+export const VOICES: VoiceMeta[] = [...AURA2_EN, ...AURA2_ES, ...GEMINI, ...AURA1];
 
 export const LANGUAGE_LABELS: Record<string, string> = {
   'en-US': 'English (US)',

@@ -27,6 +27,96 @@ export function ttsParams(model: string, text: string, speaker: string): Record<
   return { text, speaker, encoding: 'mp3' };
 }
 
+// ---- Google Gemini TTS (direct, BYOK) ----
+function base64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function wrapPcmAsWav(pcm: Uint8Array, sampleRate: number, channels = 1, bps = 16): Uint8Array {
+  const headerSize = 44;
+  const byteRate = (sampleRate * channels * bps) / 8;
+  const blockAlign = (channels * bps) / 8;
+  const wav = new Uint8Array(headerSize + pcm.length);
+  const dv = new DataView(wav.buffer);
+  wav[0] = 0x52; wav[1] = 0x49; wav[2] = 0x46; wav[3] = 0x46; // RIFF
+  dv.setUint32(4, 36 + pcm.length, true);
+  wav[8] = 0x57; wav[9] = 0x41; wav[10] = 0x56; wav[11] = 0x45; // WAVE
+  wav[12] = 0x66; wav[13] = 0x6d; wav[14] = 0x74; wav[15] = 0x20; // fmt
+  dv.setUint32(16, 16, true);
+  dv.setUint16(20, 1, true); // PCM
+  dv.setUint16(22, channels, true);
+  dv.setUint32(24, sampleRate, true);
+  dv.setUint32(28, byteRate, true);
+  dv.setUint16(32, blockAlign, true);
+  dv.setUint16(34, bps, true);
+  wav[36] = 0x64; wav[37] = 0x61; wav[38] = 0x74; wav[39] = 0x61; // data
+  dv.setUint32(40, pcm.length, true);
+  wav.set(pcm, headerSize);
+  return wav;
+}
+
+const GEMINI_MODEL_CANDIDATES = ['gemini-2.5-flash-preview-tts', 'gemini-2.5-flash-tts'];
+
+async function callGeminiTts(
+  apiKey: string,
+  text: string,
+  voiceName: string,
+): Promise<{ bytes: Uint8Array; contentType: string }> {
+  const body = {
+    contents: [{ parts: [{ text }] }],
+    generationConfig: {
+      responseModalities: ['AUDIO'],
+      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } },
+    },
+  };
+  let lastErr = '';
+  for (const m of GEMINI_MODEL_CANDIDATES) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${apiKey}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (res.status === 404) {
+      lastErr = `404 model ${m}`;
+      continue;
+    }
+    if (!res.ok) {
+      throw new Error(`Gemini ${res.status} ${(await res.text().catch(() => '')).slice(0, 200)}`);
+    }
+    const json = (await res.json()) as {
+      candidates?: { content?: { parts?: { inlineData?: { mimeType?: string; data?: string } }[] } }[];
+    };
+    const part = json.candidates?.[0]?.content?.parts?.find((p) => p.inlineData)?.inlineData;
+    if (!part?.data) throw new Error('Gemini returned no audio');
+    const mime = part.mimeType ?? 'audio/L16;codec=pcm;rate=24000';
+    const rate = Number(/rate=(\d+)/.exec(mime)?.[1] ?? 24000);
+    const pcm = base64ToBytes(part.data);
+    return { bytes: wrapPcmAsWav(pcm, rate), contentType: 'audio/wav' };
+  }
+  throw new Error(`Gemini: ${lastErr || 'no model accepted'}`);
+}
+
+/** Unified TTS entrypoint — handles Aura via env.AI and Gemini via direct fetch. */
+export async function synthesizeTts(args: {
+  ai: Ai;
+  googleApiKey?: string;
+  voiceId: string;
+  text: string;
+}): Promise<{ bytes: Uint8Array; contentType: string }> {
+  const { model, speaker } = resolveVoice(args.voiceId);
+  if (model.startsWith('google/')) {
+    if (!args.googleApiKey) throw new Error('GOOGLE_AI_API_KEY not configured');
+    return callGeminiTts(args.googleApiKey, args.text, speaker);
+  }
+  const res = await args.ai.run(model as never, ttsParams(model, args.text, speaker) as never);
+  const bytes = await toBytes(res);
+  return { bytes, contentType: 'audio/mpeg' };
+}
+
 /**
  * Server-side Deepgram Flux STT over Workers AI WebSocket.
  * Client streams raw linear16 16kHz PCM frames; Flux emits Update/EndOfTurn events.
@@ -325,23 +415,24 @@ export class AuraTts implements TtsPort {
     private ai: Ai,
     private voiceId = 'angus',
     private onError?: ErrorReporter,
+    private googleApiKey?: string,
   ) {}
 
   async *synthesize(text: string, opts?: { signal?: AbortSignal }): AsyncIterable<AudioChunk> {
     if (opts?.signal?.aborted) return;
-    const { model, speaker } = resolveVoice(this.voiceId);
-    let res: unknown;
     try {
-      res = await this.ai.run(model as never, ttsParams(model, text, speaker) as never);
+      const { bytes } = await synthesizeTts({
+        ai: this.ai,
+        googleApiKey: this.googleApiKey,
+        voiceId: this.voiceId,
+        text,
+      });
+      if (opts?.signal?.aborted) return;
+      if (bytes.length > 0) yield { data: bytes };
+      else this.onError?.('TTS returned no audio', { voiceId: this.voiceId, chars: text.length }, 'warn');
     } catch (e) {
-      this.onError?.('TTS call failed', { model, speaker, error: String(e) });
-      return;
+      this.onError?.('TTS call failed', { voiceId: this.voiceId, error: String(e) });
     }
-
-    const bytes = await toBytes(res);
-    if (opts?.signal?.aborted) return;
-    if (bytes.length > 0) yield { data: bytes };
-    else this.onError?.('TTS returned no audio', { model, speaker, chars: text.length }, 'warn');
   }
 }
 

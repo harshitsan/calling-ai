@@ -212,7 +212,12 @@ export class CallSession {
     const engine = new ConversationEngine({
       stt,
       llm,
-      tts: new AuraTts(this.env.AI, voice, reporter('tts')),
+      tts: new AuraTts(
+        this.env.AI,
+        voice,
+        reporter('tts'),
+        (this.env as unknown as { GOOGLE_AI_API_KEY?: string }).GOOGLE_AI_API_KEY,
+      ),
       client: port,
       clock: { now: () => Date.now() },
       systemPrompt,
