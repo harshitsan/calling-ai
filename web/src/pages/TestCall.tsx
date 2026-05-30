@@ -23,6 +23,20 @@ interface Agent {
 interface Line {
   role: string;
   text: string;
+  ts: number;
+}
+
+function fmtOffset(ms: number): string {
+  if (ms < 0 || !Number.isFinite(ms)) return '—';
+  const m = Math.floor(ms / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  const mm = Math.floor(ms % 1000);
+  return `${m}:${String(s).padStart(2, '0')}.${String(mm).padStart(3, '0')}`;
+}
+function latencyColor(ms: number): string {
+  if (ms < 800) return 'text-emerald-400';
+  if (ms < 1500) return 'text-amber-400';
+  return 'text-red-400';
 }
 
 const VAD_FLOOR = 0.045;
@@ -66,6 +80,7 @@ export function TestCall() {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recChunksRef = useRef<Blob[]>([]);
   const callIdRef = useRef<string | null>(null);
+  const callStartRef = useRef(0);
 
   useEffect(() => {
     api<{ agents: Agent[] }>('/api/agents').then((r) => {
@@ -251,6 +266,7 @@ export function TestCall() {
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => {
       setStatus('live');
+      callStartRef.current = Date.now();
       startVad();
       startRecognition();
     };
@@ -264,11 +280,15 @@ export function TestCall() {
       }
       const ev = JSON.parse(e.data);
       if (ev.type === 'meta') callIdRef.current = ev.callId;
-      else if (ev.type === 'transcript') setLines((l) => [...l, { role: ev.role, text: ev.text }]);
+      else if (ev.type === 'transcript')
+        setLines((l) => [
+          ...l,
+          { role: ev.role, text: ev.text, ts: Date.now() - (callStartRef.current || Date.now()) },
+        ]);
       else if (ev.type === 'flush') stopAudio();
       else if (ev.type === 'latency' && ev.turn.endpointToFirstAudio != null) setLatency(ev.turn.endpointToFirstAudio);
       else if (ev.type === 'ended') {
-        setLines((l) => [...l, { role: 'system', text: endedLabel(ev.reason) }]);
+        setLines((l) => [...l, { role: 'system', text: endedLabel(ev.reason), ts: Date.now() - (callStartRef.current || Date.now()) }]);
         stop();
       }
     };
@@ -409,28 +429,49 @@ export function TestCall() {
               Start the call, then just speak — the agent listens continuously and you can talk over it to interrupt.
             </p>
           )}
-          {lines.map((l, i) =>
-            l.role === 'system' ? (
-              <div key={i} className="text-center py-2">
-                <span className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground/70 italic font-display normal-case">
-                  {l.text}
-                </span>
+          {lines.map((l, i) => {
+            if (l.role === 'system') {
+              return (
+                <div key={i} className="text-center py-2">
+                  <span className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground/70 italic font-display normal-case">
+                    {l.text}
+                  </span>
+                </div>
+              );
+            }
+            const prev = i > 0 ? lines[i - 1] : null;
+            const responseMs =
+              prev && prev.role === 'user' && l.role === 'assistant' ? l.ts - prev.ts : null;
+            return (
+              <div key={i}>
+                {responseMs != null && (
+                  <div className="flex items-center gap-2 ml-20 my-1">
+                    <span className="h-px w-6 bg-white/[0.06]" />
+                    <span className={`text-[10px] uppercase tracking-[0.18em] tabular-nums font-mono ${latencyColor(responseMs)}`}>
+                      ↳ {responseMs}ms
+                    </span>
+                  </div>
+                )}
+                <div className="flex gap-3 text-[14px] leading-relaxed py-1">
+                  <div className="shrink-0 mt-0.5 w-20">
+                    <div
+                      className={
+                        l.role === 'user'
+                          ? 'text-[10px] uppercase tracking-[0.18em] text-aurora-2 font-medium'
+                          : 'text-[10px] uppercase tracking-[0.18em] text-aurora-1 font-medium'
+                      }
+                    >
+                      {l.role === 'user' ? 'You' : 'Agent'}
+                    </div>
+                    <div className="text-[10px] font-mono tabular-nums text-muted-foreground/55 mt-0.5">
+                      {fmtOffset(l.ts)}
+                    </div>
+                  </div>
+                  <span className="text-foreground/90 flex-1">{l.text}</span>
+                </div>
               </div>
-            ) : (
-              <div key={i} className="flex gap-3 text-[14px] leading-relaxed">
-                <span
-                  className={
-                    l.role === 'user'
-                      ? 'shrink-0 mt-0.5 text-[10px] uppercase tracking-[0.18em] text-aurora-2 font-medium w-14'
-                      : 'shrink-0 mt-0.5 text-[10px] uppercase tracking-[0.18em] text-aurora-1 font-medium w-14'
-                  }
-                >
-                  {l.role === 'user' ? 'You' : 'Agent'}
-                </span>
-                <span className="text-foreground/90">{l.text}</span>
-              </div>
-            ),
-          )}
+            );
+          })}
           {interim && (
             <div className="flex gap-3 text-[14px] leading-relaxed opacity-55 italic font-display">
               <span className="shrink-0 mt-0.5 text-[10px] uppercase tracking-[0.18em] text-aurora-2 font-medium w-14 not-italic font-sans">

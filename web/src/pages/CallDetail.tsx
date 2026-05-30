@@ -9,9 +9,23 @@ interface Turn {
   text: string;
   ts: number;
 }
+
+function fmtOffset(ms: number): string {
+  if (ms < 0 || !Number.isFinite(ms)) return '—';
+  const m = Math.floor(ms / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  const mm = Math.floor(ms % 1000);
+  return `${m}:${String(s).padStart(2, '0')}.${String(mm).padStart(3, '0')}`;
+}
+function latencyColor(ms: number): string {
+  if (ms < 800) return 'text-emerald-400';
+  if (ms < 1500) return 'text-amber-400';
+  return 'text-red-400';
+}
 interface CallFull {
   id: string;
   caller_ref: string | null;
+  started_at: number;
   duration_s: number | null;
   cost_usd: number | null;
   end_reason: string | null;
@@ -122,22 +136,42 @@ export function CallDetail() {
         <CardHeader>
           <CardTitle>Transcript</CardTitle>
         </CardHeader>
-        <CardContent className="space-y-3">
+        <CardContent className="space-y-1.5">
           {turns.length === 0 && <p className="text-sm text-muted-foreground italic font-display">No transcript.</p>}
-          {turns.map((t, i) => (
-            <div key={i} className="flex gap-3 text-[14px] leading-relaxed">
-              <span
-                className={
-                  t.role === 'user'
-                    ? 'shrink-0 mt-0.5 text-[10px] uppercase tracking-[0.18em] text-aurora-2 font-medium w-16'
-                    : 'shrink-0 mt-0.5 text-[10px] uppercase tracking-[0.18em] text-aurora-1 font-medium w-16'
-                }
-              >
-                {t.role === 'user' ? 'Caller' : 'Agent'}
-              </span>
-              <span className="text-foreground/90">{t.text}</span>
-            </div>
-          ))}
+          {turns.map((t, i) => {
+            const prev = i > 0 ? turns[i - 1] : null;
+            const offsetMs = call.started_at ? t.ts - call.started_at : 0;
+            const responseMs = prev && prev.role === 'user' && t.role === 'assistant' ? t.ts - prev.ts : null;
+            return (
+              <div key={i}>
+                {responseMs != null && (
+                  <div className="flex items-center gap-2 ml-24 my-1">
+                    <span className="h-px w-6 bg-white/[0.06]" />
+                    <span className={`text-[10px] uppercase tracking-[0.18em] tabular-nums font-mono ${latencyColor(responseMs)}`}>
+                      ↳ {responseMs}ms
+                    </span>
+                  </div>
+                )}
+                <div className="flex gap-3 text-[14px] leading-relaxed py-1">
+                  <div className="shrink-0 mt-0.5 w-24">
+                    <div
+                      className={
+                        t.role === 'user'
+                          ? 'text-[10px] uppercase tracking-[0.18em] text-aurora-2 font-medium'
+                          : 'text-[10px] uppercase tracking-[0.18em] text-aurora-1 font-medium'
+                      }
+                    >
+                      {t.role === 'user' ? 'Caller' : 'Agent'}
+                    </div>
+                    <div className="text-[10px] font-mono tabular-nums text-muted-foreground/55 mt-0.5">
+                      {fmtOffset(offsetMs)}
+                    </div>
+                  </div>
+                  <span className="text-foreground/90 flex-1">{t.text}</span>
+                </div>
+              </div>
+            );
+          })}
         </CardContent>
       </Card>
     </div>

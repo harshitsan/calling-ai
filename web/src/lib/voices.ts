@@ -12,6 +12,7 @@ export interface ModelMeta {
   vendor: string;
   description: string;
   pricing?: string;
+  latency?: 'fast' | 'medium' | 'slow';
 }
 
 export const MODELS: ModelMeta[] = [
@@ -21,6 +22,7 @@ export const MODELS: ModelMeta[] = [
     vendor: 'Deepgram',
     description: 'HD English · 40 voices',
     pricing: '≈ $0.022 / spoken min',
+    latency: 'fast',
   },
   {
     id: '@cf/deepgram/aura-2-es',
@@ -28,13 +30,15 @@ export const MODELS: ModelMeta[] = [
     vendor: 'Deepgram',
     description: 'HD Spanish · 10 voices',
     pricing: '≈ $0.022 / spoken min',
+    latency: 'fast',
   },
   {
     id: 'google/gemini-3.1-flash-tts',
     label: 'Gemini Flash',
     vendor: 'Google',
-    description: 'Multilingual · 30 voices',
+    description: 'Multilingual · 30 voices · not for realtime',
     pricing: 'BYOK · Google AI Studio',
+    latency: 'slow',
   },
   {
     id: '@cf/deepgram/aura-1',
@@ -42,6 +46,7 @@ export const MODELS: ModelMeta[] = [
     vendor: 'Deepgram',
     description: 'Original lineup · 12 voices · English',
     pricing: '≈ $0.011 / spoken min',
+    latency: 'fast',
   },
 ];
 

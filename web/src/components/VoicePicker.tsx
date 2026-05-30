@@ -179,9 +179,23 @@ export function VoicePicker({ value, language, onChange }: Props) {
                         </span>
                       </div>
                       <div className="text-[11px] text-muted-foreground mt-0.5">{m.description}</div>
-                      {m.pricing && (
-                        <div className="text-[10px] text-muted-foreground/60 mt-1.5">{m.pricing}</div>
-                      )}
+                      <div className="flex items-center gap-1.5 mt-1.5">
+                        {m.pricing && <span className="text-[10px] text-muted-foreground/60">{m.pricing}</span>}
+                        {m.latency && (
+                          <span
+                            className={cn(
+                              'text-[9px] uppercase tracking-[0.16em] px-1.5 py-0.5 rounded-full border',
+                              m.latency === 'fast'
+                                ? 'text-emerald-400/90 border-emerald-400/20 bg-emerald-400/5'
+                                : m.latency === 'medium'
+                                  ? 'text-amber-400/90 border-amber-400/20 bg-amber-400/5'
+                                  : 'text-red-400/90 border-red-400/20 bg-red-400/5',
+                            )}
+                          >
+                            {m.latency}
+                          </span>
+                        )}
+                      </div>
                     </button>
                   );
                 })}
