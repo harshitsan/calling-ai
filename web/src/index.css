@@ -41,7 +41,12 @@
 
   * { border-color: hsl(var(--border)); }
 
+  html { color-scheme: dark; }
   html, body, #root { min-height: 100vh; }
+
+  /* Native form controls inherit our palette */
+  option { background-color: #14131c; color: hsl(var(--foreground)); }
+  select option:checked { background-color: #1b1a26; }
 
   body {
     background: hsl(var(--background));
