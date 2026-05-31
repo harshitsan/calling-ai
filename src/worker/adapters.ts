@@ -230,15 +230,28 @@ export class FluxStt implements SttPort {
     ai: Ai,
     sampleRate = '16000',
     private onError?: ErrorReporter,
+    private eotThreshold = 0.55,
+    private eotTimeoutMs = 2500,
   ) {
     this.ready = this.connect(ai, sampleRate);
+  }
+
+  /** Inject a finalized turn from a non-audio source (e.g. typed text). */
+  feedEndOfTurn(text: string): void {
+    this.handler?.({ type: 'endOfTurn', text });
   }
 
   private async connect(ai: Ai, sampleRate: string): Promise<void> {
     try {
       const resp = (await ai.run(
         '@cf/deepgram/flux' as never,
-        { encoding: 'linear16', sample_rate: sampleRate } as never,
+        {
+          encoding: 'linear16',
+          sample_rate: sampleRate,
+          // More eager endpointing — Flux's defaults wait too long for our use.
+          eot_threshold: this.eotThreshold,
+          eot_timeout_ms: this.eotTimeoutMs,
+        } as never,
         { websocket: true } as never,
       )) as unknown as { webSocket?: WebSocket };
       const ws = resp.webSocket;

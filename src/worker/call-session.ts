@@ -2,9 +2,9 @@ import { ConversationEngine } from '../engine/conversation-engine';
 import type { ClientPort } from '../engine/ports';
 import { dispatchTool, type ToolCall, type ToolResult } from '../engine/tools';
 import type { ClientEvent } from '../engine/types';
-import { AuraTts, ClientFedStt, FluxStt, OpenAiLlm, type OpenAiTool, WorkersAiLlm } from './adapters';
+import { AuraTts, FluxStt, OpenAiLlm, type OpenAiTool, WorkersAiLlm } from './adapters';
 import { END_CALL_TOOL } from '../engine/tools';
-import type { LlmPort, SttPort } from '../engine/ports';
+import type { LlmPort } from '../engine/ports';
 
 const LEGACY_WORKERS_AI_MODEL = '@cf/meta/llama-3.1-8b-instruct';
 import { verifyJwt } from './auth';
@@ -179,10 +179,11 @@ export class CallSession {
     const server = pair[1];
     server.accept();
 
-    const useFlux = params.get('stt') === 'flux';
     const reporter = (service: string) =>
       (m: string, d?: Record<string, unknown>, l?: 'warn' | 'error') => this.log(service, m, d, l ?? 'error');
-    const stt: SttPort = useFlux ? new FluxStt(this.env.AI, '16000', reporter('stt')) : new ClientFedStt();
+    // Server-side Deepgram Flux is the only STT path now. Typed text gets
+    // injected via stt.feedEndOfTurn().
+    const stt = new FluxStt(this.env.AI, '16000', reporter('stt'));
     const port = new RecordingClientPort(server, {
       onTurn: (t) => {
         this.turns.push(t);
@@ -252,13 +253,12 @@ export class CallSession {
       caller: this.callerRef,
       voice,
       model: useOpenAI ? model : `workers-ai:${model}`,
-      stt: useFlux ? 'flux' : 'browser',
+      stt: 'flux',
     });
 
-    const clientStt = useFlux ? null : (stt as ClientFedStt);
     server.addEventListener('message', (event: MessageEvent) => {
       if (event.data instanceof ArrayBuffer) {
-        stt.sendAudio(new Uint8Array(event.data)); // raw PCM -> Flux (no-op for text mode)
+        stt.sendAudio(new Uint8Array(event.data)); // raw PCM -> Flux
         return;
       }
       if (typeof event.data !== 'string') return;
@@ -268,8 +268,7 @@ export class CallSession {
       } catch {
         return;
       }
-      if (msg.type === 'userText' && typeof msg.text === 'string') clientStt?.feedEndOfTurn(msg.text);
-      else if (msg.type === 'partial' && typeof msg.text === 'string') clientStt?.feedPartial(msg.text);
+      if (msg.type === 'userText' && typeof msg.text === 'string') stt.feedEndOfTurn(msg.text);
       else if (msg.type === 'interrupt') engine.interrupt();
       else if (msg.type === 'hangup') {
         const reason = typeof (msg as { reason?: string }).reason === 'string' ? (msg as { reason: string }).reason : 'unknown';

@@ -6,7 +6,7 @@ class PcmCapture extends AudioWorkletProcessor {
   constructor() {
     super();
     this.buffer = [];
-    this.frameSize = 1600; // 100ms at 16kHz
+    this.frameSize = 960; // 60ms at 16kHz — lower-latency frames to the server
   }
 
   process(inputs) {

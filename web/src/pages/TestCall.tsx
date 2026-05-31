@@ -1,4 +1,4 @@
-import { AlertTriangle, Phone, PhoneOff, RotateCw, Send } from 'lucide-react';
+import { AlertTriangle, Phone, PhoneOff, Send } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -13,17 +13,6 @@ function pickRecorderMime(): string | undefined {
     if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) return m;
   }
   return undefined;
-}
-
-interface Agent {
-  id: string;
-  name: string;
-  endpointingMs?: number;
-}
-interface Line {
-  role: string;
-  text: string;
-  ts: number;
 }
 
 function DiagRow({
@@ -71,6 +60,17 @@ function latencyColor(ms: number): string {
   return 'text-red-400';
 }
 
+interface Agent {
+  id: string;
+  name: string;
+  endpointingMs?: number;
+}
+interface Line {
+  role: string;
+  text: string;
+  ts: number;
+}
+
 const VAD_FLOOR = 0.045;
 const VAD_RATIO = 2.2;
 const VAD_FRAMES = 3;
@@ -97,9 +97,8 @@ export function TestCall() {
     wsState: 'closed' as 'connecting' | 'open' | 'closing' | 'closed',
     micRms: 0,
     audioQueue: 0,
-    recRunning: false,
-    recRestarts: 0,
-    lastRecResultAt: 0,
+    captureRunning: false,
+    lastSttAt: 0,
     lastEventAt: 0,
     lastError: '',
   });
@@ -112,27 +111,15 @@ export function TestCall() {
   const nextStartRef = useRef(0);
   const sourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const liveRef = useRef(false);
-  const recRef = useRef<any>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const vadRaf = useRef<number | null>(null);
-  const interimRef = useRef('');
-  const baseIndexRef = useRef(0);
-  const resultsLenRef = useRef(0);
-  const endpointTimer = useRef<number | null>(null);
-  const endpointMsRef = useRef(900);
-  const lastSent = useRef({ text: '', t: 0 });
-  // Recording (mixed mic + agent audio -> R2 on hangup).
   const recDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recChunksRef = useRef<Blob[]>([]);
   const callIdRef = useRef<string | null>(null);
   const callStartRef = useRef(0);
-  // Flux server-side STT via AudioWorklet PCM streaming.
   const captureCtxRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
-  const [sttMode, setSttMode] = useState<'browser' | 'flux'>('browser');
-  const sttModeRef = useRef<'browser' | 'flux'>('browser');
-  sttModeRef.current = sttMode;
 
   useEffect(() => {
     api<{ agents: Agent[] }>('/api/agents').then((r) => {
@@ -150,8 +137,7 @@ export function TestCall() {
     return () => clearInterval(id);
   }, [status]);
 
-  // Heartbeat: keep the WebSocket alive during silent stretches so CF / proxies
-  // don't idle-close it. Server ignores unrecognized message types.
+  // Heartbeat keeps the WebSocket alive through silent stretches.
   useEffect(() => {
     if (status !== 'live') return;
     const id = setInterval(() => {
@@ -161,115 +147,6 @@ export function TestCall() {
     }, 15000);
     return () => clearInterval(id);
   }, [status]);
-
-  // Watchdog: if the recognizer hasn't produced any result in 12s while the
-  // mic is clearly hearing speech, force-restart it. Common Chrome failure mode.
-  useEffect(() => {
-    if (status !== 'live') return;
-    const id = setInterval(() => {
-      const d = diagRef.current;
-      if (!d.recRunning) return;
-      if (d.lastRecResultAt === 0) return; // never heard anything yet
-      const idleMs = Date.now() - d.lastRecResultAt;
-      if (idleMs > 12000 && d.micRms > 0.025) {
-        clientLog('recognition stuck — watchdog restart', { idleMs, micRms: d.micRms }, 'warn');
-        setDiag((s) => ({ ...s, lastError: 'recognition stuck — auto-restarted' }));
-        try {
-          recRef.current?.abort();
-        } catch {
-          /* ignore */
-        }
-      }
-    }, 2000);
-    return () => clearInterval(id);
-  }, [status]);
-
-  // Stream diagnostic events to the server so they show in Live Logs
-  // alongside the stt/tts/llm trail — invaluable for debugging stalls.
-  function clientLog(
-    msg: string,
-    data?: Record<string, unknown>,
-    level: 'info' | 'warn' | 'error' = 'info',
-  ) {
-    if (wsRef.current?.readyState !== 1) return;
-    try {
-      wsRef.current.send(JSON.stringify({ type: 'client_log', msg, data, level }));
-    } catch {
-      /* ignore */
-    }
-  }
-
-  async function startFluxCapture() {
-    if (!micStreamRef.current) return;
-    try {
-      const ctx = new AudioContext({ sampleRate: 16000 });
-      captureCtxRef.current = ctx;
-      await ctx.audioWorklet.addModule('/pcm-worklet.js');
-      const source = ctx.createMediaStreamSource(micStreamRef.current);
-      const worklet = new AudioWorkletNode(ctx, 'pcm-capture');
-      worklet.port.onmessage = (e) => {
-        if (wsRef.current?.readyState === 1) {
-          // Binary frame — server routes it to Flux STT via stt.sendAudio
-          wsRef.current.send(e.data as ArrayBuffer);
-        }
-      };
-      source.connect(worklet);
-      const sink = ctx.createGain();
-      sink.gain.value = 0;
-      worklet.connect(sink);
-      sink.connect(ctx.destination); // keep the graph pulling samples
-      workletNodeRef.current = worklet;
-      clientLog('flux capture started', { sampleRate: ctx.sampleRate });
-    } catch (e) {
-      clientLog('flux capture failed', { error: String(e) }, 'error');
-    }
-  }
-
-  function stopFluxCapture() {
-    try { workletNodeRef.current?.disconnect(); } catch { /* ignore */ }
-    workletNodeRef.current = null;
-    try { captureCtxRef.current?.close(); } catch { /* ignore */ }
-    captureCtxRef.current = null;
-  }
-
-  function restartRecognition() {
-    clientLog('recognition restart (manual)', undefined, 'warn');
-    try {
-      recRef.current?.abort();
-    } catch {
-      /* ignore */
-    }
-    setDiag((d) => ({ ...d, lastError: 'manually restarted' }));
-  }
-
-  function ago(ts: number): string {
-    if (!ts) return '—';
-    const ms = Date.now() - ts;
-    if (ms < 1000) return `${ms}ms ago`;
-    if (ms < 60000) return `${(ms / 1000).toFixed(1)}s ago`;
-    return `${Math.floor(ms / 60000)}m ago`;
-  }
-
-  function recHealthColor(): string {
-    const d = diagRef.current;
-    if (!d.recRunning) return 'text-red-400';
-    if (!d.lastRecResultAt) return 'text-muted-foreground';
-    const idle = Date.now() - d.lastRecResultAt;
-    if (idle < 5000) return 'text-emerald-400';
-    if (idle < 15000) return 'text-amber-400';
-    return 'text-red-400';
-  }
-
-  function wsColor(s: string): string {
-    if (s === 'open') return 'text-emerald-400';
-    if (s === 'connecting') return 'text-amber-400';
-    return 'text-red-400';
-  }
-
-  useEffect(() => {
-    const a = agents.find((x) => x.id === agentId);
-    if (a?.endpointingMs) endpointMsRef.current = a.endpointingMs;
-  }, [agentId, agents]);
 
   async function ensureCtx() {
     if (!ctxRef.current) ctxRef.current = new AudioContext();
@@ -286,7 +163,7 @@ export function TestCall() {
     const src = ctx.createBufferSource();
     src.buffer = decoded;
     src.connect(ctx.destination);
-    if (recDestRef.current) src.connect(recDestRef.current); // capture into recording
+    if (recDestRef.current) src.connect(recDestRef.current);
     const start = Math.max(ctx.currentTime + 0.02, nextStartRef.current);
     src.start(start);
     nextStartRef.current = start + decoded.duration;
@@ -322,11 +199,7 @@ export function TestCall() {
 
   function stopAudio() {
     for (const s of sourcesRef.current) {
-      try {
-        s.stop();
-      } catch {
-        /* ignore */
-      }
+      try { s.stop(); } catch { /* ignore */ }
     }
     sourcesRef.current = [];
     nextStartRef.current = ctxRef.current ? ctxRef.current.currentTime : 0;
@@ -345,7 +218,7 @@ export function TestCall() {
       micStreamRef.current = stream;
       const ctx = await ensureCtx();
       const srcNode = ctx.createMediaStreamSource(stream);
-      if (recDestRef.current) srcNode.connect(recDestRef.current); // capture caller audio into recording
+      if (recDestRef.current) srcNode.connect(recDestRef.current);
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
       srcNode.connect(analyser);
@@ -390,67 +263,74 @@ export function TestCall() {
       };
       vadRaf.current = requestAnimationFrame(loop);
     } catch {
-      // mic denied: barge-in disabled, text still works
+      /* mic denied: barge-in disabled; text input still works */
     }
   }
 
-  function startRecognition() {
-    const SR = window as unknown as { SpeechRecognition?: any; webkitSpeechRecognition?: any };
-    const Rec = SR.SpeechRecognition || SR.webkitSpeechRecognition;
-    if (!Rec) return;
-
-    const spawn = () => {
-      if (!liveRef.current) return;
-      const rec = new Rec();
-      rec.lang = 'en-US';
-      rec.continuous = true;
-      rec.interimResults = true;
-      baseIndexRef.current = 0;
-      setDiag((d) => ({ ...d, recRunning: true, lastError: '' }));
-      clientLog('recognition spawn', { restarts: diagRef.current.recRestarts });
-      rec.onresult = (e: any) => {
-        setDiag((d) => ({ ...d, lastRecResultAt: Date.now() }));
-        resultsLenRef.current = e.results.length;
-        if (isSpeaking()) {
-          // Drop while agent talks, but only consume FINAL results — Chrome
-          // may still be appending to the current in-progress result when the
-          // user starts speaking, so we mustn't skip past it.
-          for (let i = baseIndexRef.current; i < e.results.length; i++) {
-            if (e.results[i].isFinal) baseIndexRef.current = i + 1;
-          }
-          return;
+  async function startFluxCapture() {
+    if (!micStreamRef.current) return;
+    try {
+      const ctx = new AudioContext({ sampleRate: 16000 });
+      captureCtxRef.current = ctx;
+      await ctx.audioWorklet.addModule('/pcm-worklet.js');
+      const source = ctx.createMediaStreamSource(micStreamRef.current);
+      const worklet = new AudioWorkletNode(ctx, 'pcm-capture');
+      worklet.port.onmessage = (e) => {
+        if (wsRef.current?.readyState === 1) {
+          wsRef.current.send(e.data as ArrayBuffer);
         }
-        let full = '';
-        for (let i = baseIndexRef.current; i < e.results.length; i++) full += e.results[i][0].transcript + ' ';
-        full = full.trim();
-        if (!full) return;
-        interimRef.current = full;
-        setInterim(full);
-        // Only commit after the configured end-of-turn pause (silence).
-        if (endpointTimer.current) clearTimeout(endpointTimer.current);
-        endpointTimer.current = window.setTimeout(() => {
-          if (interimRef.current && !isSpeaking()) send(interimRef.current);
-        }, endpointMsRef.current);
       };
-      rec.onerror = (ev: any) => {
-        const err = ev?.error ?? 'unknown';
-        clientLog('recognition error', { error: err }, err === 'no-speech' ? 'info' : 'warn');
-        setDiag((d) => ({ ...d, lastError: `recognition: ${err}` }));
-      };
-      rec.onend = () => {
-        clientLog('recognition ended');
-        setDiag((d) => ({ ...d, recRunning: false, recRestarts: d.recRestarts + 1 }));
-        if (liveRef.current) setTimeout(spawn, 100);
-      };
-      recRef.current = rec;
-      try {
-        rec.start();
-      } catch (e) {
-        clientLog('recognition start threw', { error: String(e) }, 'error');
-        if (liveRef.current) setTimeout(spawn, 300);
-      }
-    };
-    spawn();
+      source.connect(worklet);
+      const sink = ctx.createGain();
+      sink.gain.value = 0;
+      worklet.connect(sink);
+      sink.connect(ctx.destination);
+      workletNodeRef.current = worklet;
+      setDiag((d) => ({ ...d, captureRunning: true }));
+      clientLog('flux capture started', { sampleRate: ctx.sampleRate });
+    } catch (e) {
+      clientLog('flux capture failed', { error: String(e) }, 'error');
+      setDiag((d) => ({ ...d, lastError: `capture failed: ${String(e)}` }));
+    }
+  }
+
+  function stopFluxCapture() {
+    try { workletNodeRef.current?.disconnect(); } catch { /* ignore */ }
+    workletNodeRef.current = null;
+    try { captureCtxRef.current?.close(); } catch { /* ignore */ }
+    captureCtxRef.current = null;
+    setDiag((d) => ({ ...d, captureRunning: false }));
+  }
+
+  function clientLog(msg: string, data?: Record<string, unknown>, level: 'info' | 'warn' | 'error' = 'info') {
+    if (wsRef.current?.readyState !== 1) return;
+    try {
+      wsRef.current.send(JSON.stringify({ type: 'client_log', msg, data, level }));
+    } catch { /* ignore */ }
+  }
+
+  function ago(ts: number): string {
+    if (!ts) return '—';
+    const ms = Date.now() - ts;
+    if (ms < 1000) return `${ms}ms ago`;
+    if (ms < 60000) return `${(ms / 1000).toFixed(1)}s ago`;
+    return `${Math.floor(ms / 60000)}m ago`;
+  }
+
+  function sttHealthColor(): string {
+    const d = diagRef.current;
+    if (!d.captureRunning) return 'text-red-400';
+    if (!d.lastSttAt) return 'text-muted-foreground';
+    const idle = Date.now() - d.lastSttAt;
+    if (idle < 4000) return 'text-emerald-400';
+    if (idle < 15000) return 'text-amber-400';
+    return 'text-red-400';
+  }
+
+  function wsColor(s: string): string {
+    if (s === 'open') return 'text-emerald-400';
+    if (s === 'connecting') return 'text-amber-400';
+    return 'text-red-400';
   }
 
   async function start() {
@@ -460,21 +340,22 @@ export function TestCall() {
     setLatency(null);
     const ctx = await ensureCtx();
     liveRef.current = true;
-    // Set up the recording mixer (mic + agent audio).
     recDestRef.current = ctx.createMediaStreamDestination();
     recChunksRef.current = [];
     callIdRef.current = null;
     const mime = pickRecorderMime();
     try {
       recorderRef.current = new MediaRecorder(recDestRef.current.stream, mime ? { mimeType: mime } : undefined);
-      recorderRef.current.ondataavailable = (e) => { if (e.data.size > 0) recChunksRef.current.push(e.data); };
-      recorderRef.current.start(1000); // 1s timeslices for safety
+      recorderRef.current.ondataavailable = (e) => {
+        if (e.data.size > 0) recChunksRef.current.push(e.data);
+      };
+      recorderRef.current.start(1000);
     } catch {
       recorderRef.current = null;
     }
     const token = getToken();
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const url = `${proto}://${location.host}/call?agentId=${agentId}&token=${encodeURIComponent(token ?? '')}&customer_name=${encodeURIComponent(customer)}${sttMode === 'flux' ? '&stt=flux' : ''}`;
+    const url = `${proto}://${location.host}/call?agentId=${agentId}&token=${encodeURIComponent(token ?? '')}&customer_name=${encodeURIComponent(customer)}`;
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
     setDiag((d) => ({ ...d, wsState: 'connecting' }));
@@ -482,19 +363,15 @@ export function TestCall() {
       setStatus('live');
       callStartRef.current = Date.now();
       setDiag((d) => ({ ...d, wsState: 'open' }));
-      clientLog('ws open', { agentId, voice: agents.find((a) => a.id === agentId)?.name, sttMode });
-      startVad().then(() => {
-        if (sttMode === 'flux') startFluxCapture();
-        else startRecognition();
-      });
+      clientLog('ws open', { agentId, voice: agents.find((a) => a.id === agentId)?.name });
+      // Mic first (VAD + recording), then the Flux PCM pipeline.
+      startVad().then(() => startFluxCapture());
     };
     ws.onclose = (e) => {
       setDiag((d) => ({
         ...d,
         wsState: 'closed',
-        lastError: liveRef.current
-          ? `ws closed (code ${e.code}${e.reason ? ` ${e.reason}` : ''})`
-          : d.lastError,
+        lastError: liveRef.current ? `ws closed (code ${e.code}${e.reason ? ` ${e.reason}` : ''})` : d.lastError,
       }));
       if (liveRef.current) stop('ws-closed');
     };
@@ -516,32 +393,26 @@ export function TestCall() {
       if (ev.type === 'meta') callIdRef.current = ev.callId;
       else if (ev.type === 'state') setDiag((d) => ({ ...d, engineState: ev.state }));
       else if (ev.type === 'partial' && ev.role === 'user') {
-        // Live interim transcript from server-side STT. Show as italic, do NOT
-        // commit as a conversation line. Use it as a barge-in signal in Flux
-        // mode — Chrome AEC can't always cancel agent voice, but Flux can
-        // segment user speech, so its partial is a strong "user is talking now"
-        // signal that should interrupt the agent immediately.
-        interimRef.current = ev.text;
+        // Live interim from Flux — italic only, also drives barge-in.
         setInterim(ev.text);
-        if (sttModeRef.current === 'flux' && isSpeaking() && ev.text.trim().length >= 2) {
-          bargeIn();
-        }
+        setDiag((d) => ({ ...d, lastSttAt: Date.now() }));
+        if (isSpeaking() && ev.text.trim().length >= 2) bargeIn();
       } else if (ev.type === 'transcript') {
-        // In browser STT mode we already committed the user line optimistically;
-        // in flux mode the server is the source of truth and we show its transcript.
-        if (ev.role === 'user' && sttModeRef.current !== 'flux') return;
-        // Clear any interim that led up to this final.
-        interimRef.current = '';
         setInterim('');
+        setDiag((d) => ({ ...d, lastSttAt: Date.now() }));
         setLines((l) => [
           ...l,
           { role: ev.role, text: ev.text, ts: Date.now() - (callStartRef.current || Date.now()) },
         ]);
-      }
-      else if (ev.type === 'flush') stopAudio();
-      else if (ev.type === 'latency' && ev.turn.endpointToFirstAudio != null) setLatency(ev.turn.endpointToFirstAudio);
-      else if (ev.type === 'ended') {
-        setLines((l) => [...l, { role: 'system', text: endedLabel(ev.reason), ts: Date.now() - (callStartRef.current || Date.now()) }]);
+      } else if (ev.type === 'flush') {
+        stopAudio();
+      } else if (ev.type === 'latency' && ev.turn.endpointToFirstAudio != null) {
+        setLatency(ev.turn.endpointToFirstAudio);
+      } else if (ev.type === 'ended') {
+        setLines((l) => [
+          ...l,
+          { role: 'system', text: endedLabel(ev.reason), ts: Date.now() - (callStartRef.current || Date.now()) },
+        ]);
         stop('server-ended');
       }
     };
@@ -551,15 +422,8 @@ export function TestCall() {
   function stop(reason: string = 'manual') {
     liveRef.current = false;
     if (vadRaf.current) cancelAnimationFrame(vadRaf.current);
-    if (endpointTimer.current) clearTimeout(endpointTimer.current);
-    try {
-      recRef.current?.stop();
-    } catch {
-      /* ignore */
-    }
-    recRef.current = null;
+    stopFluxCapture();
 
-    // Finalize the recording and upload it.
     const recorder = recorderRef.current;
     const callId = callIdRef.current;
     if (recorder && recorder.state !== 'inactive') {
@@ -576,9 +440,7 @@ export function TestCall() {
             },
             body: blob,
           });
-        } catch {
-          /* best-effort */
-        }
+        } catch { /* best-effort */ }
         recChunksRef.current = [];
       };
       try { recorder.stop(); } catch { /* ignore */ }
@@ -586,11 +448,9 @@ export function TestCall() {
     recorderRef.current = null;
     recDestRef.current = null;
 
-    stopFluxCapture();
     micStreamRef.current?.getTracks().forEach((t) => t.stop());
     micStreamRef.current = null;
     setInterim('');
-    interimRef.current = '';
     stopAudio();
     if (wsRef.current?.readyState === 1) wsRef.current.send(JSON.stringify({ type: 'hangup', reason }));
     wsRef.current?.close();
@@ -602,28 +462,7 @@ export function TestCall() {
   function send(t: string) {
     const body = t.trim();
     if (!body || wsRef.current?.readyState !== 1) return;
-    if (lastSent.current.text === body && Date.now() - lastSent.current.t < 2500) {
-      // dupe send (Chrome's late real-final following our pause-finalizer);
-      // clear interim so the UI doesn't get stuck displaying it.
-      interimRef.current = '';
-      setInterim('');
-      return;
-    }
-    lastSent.current = { text: body, t: Date.now() };
-    if (endpointTimer.current) {
-      clearTimeout(endpointTimer.current);
-      endpointTimer.current = null;
-    }
-    baseIndexRef.current = resultsLenRef.current; // consume what we just sent
-    interimRef.current = '';
-    setInterim('');
-    stopAudio();
-    // Optimistic local commit — we know what the user said; don't wait for the
-    // server's transcript echo (it can stall and leave the line never showing).
-    setLines((l) => [
-      ...l,
-      { role: 'user', text: body, ts: Date.now() - (callStartRef.current || Date.now()) },
-    ]);
+    stopAudio(); // typing interrupts the agent
     wsRef.current.send(JSON.stringify({ type: 'userText', text: body }));
     setText('');
   }
@@ -661,24 +500,12 @@ export function TestCall() {
             <Label>Caller name</Label>
             <Input value={customer} onChange={(e) => setCustomer(e.target.value)} className="w-40" disabled={live} />
           </div>
-          <div className="space-y-1">
-            <Label>STT</Label>
-            <Select
-              value={sttMode}
-              onChange={(e) => setSttMode(e.target.value as 'browser' | 'flux')}
-              className="w-44"
-              disabled={live}
-            >
-              <option value="browser">Browser (default)</option>
-              <option value="flux">Server · Deepgram Flux</option>
-            </Select>
-          </div>
           {status === 'idle' ? (
             <Button onClick={start} disabled={!agentId}>
               <Phone className="h-4 w-4" /> Start call
             </Button>
           ) : (
-            <Button variant="destructive" onClick={stop}>
+            <Button variant="destructive" onClick={() => stop('manual')}>
               <PhoneOff className="h-4 w-4" />
               {status === 'connecting' ? 'Connecting…' : 'Stop'}
             </Button>
@@ -752,8 +579,8 @@ export function TestCall() {
             );
           })}
           {interim && (
-            <div className="flex gap-3 text-[14px] leading-relaxed opacity-55 italic font-display">
-              <span className="shrink-0 mt-0.5 text-[10px] uppercase tracking-[0.18em] text-aurora-2 font-medium w-14 not-italic font-sans">
+            <div className="flex gap-3 text-[14px] leading-relaxed opacity-55 italic font-display py-1">
+              <span className="shrink-0 mt-0.5 text-[10px] uppercase tracking-[0.18em] text-aurora-2 font-medium w-20 not-italic font-sans">
                 You
               </span>
               <span>{interim}…</span>
@@ -777,31 +604,19 @@ export function TestCall() {
 
       {status === 'live' && (
         <Card>
-          <CardHeader className="pb-3 flex flex-row items-center justify-between">
+          <CardHeader>
             <CardTitle>Behind the scenes</CardTitle>
-            <Button variant="outline" size="sm" onClick={restartRecognition}>
-              <RotateCw className="h-3 w-3" /> Restart STT
-            </Button>
           </CardHeader>
           <CardContent className="space-y-4">
-            {/* Mic VU meter */}
             <div>
               <div className="flex items-center justify-between mb-2">
-                <span className="text-[10px] uppercase tracking-[0.22em] text-muted-foreground/75">
-                  Mic input
-                </span>
-                <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
-                  {diag.micRms.toFixed(3)}
-                </span>
+                <span className="text-[10px] uppercase tracking-[0.22em] text-muted-foreground/75">Mic input</span>
+                <span className="font-mono text-[11px] tabular-nums text-muted-foreground">{diag.micRms.toFixed(3)}</span>
               </div>
               <div className="h-2 rounded-full bg-white/[0.04] border border-white/[0.04] overflow-hidden">
                 <div
                   className={`h-full transition-[width] duration-100 ${
-                    diag.micRms > 0.05
-                      ? 'bg-emerald-400/80'
-                      : diag.micRms > 0.02
-                        ? 'bg-aurora-3/70'
-                        : 'bg-muted-foreground/30'
+                    diag.micRms > 0.05 ? 'bg-emerald-400/80' : diag.micRms > 0.02 ? 'bg-aurora-3/70' : 'bg-muted-foreground/30'
                   }`}
                   style={{ width: `${Math.min(100, diag.micRms * 400)}%` }}
                 />
@@ -810,7 +625,6 @@ export function TestCall() {
 
             <div className="hairline" />
 
-            {/* State grid */}
             <div className="grid grid-cols-2 gap-x-6 gap-y-3 text-[12px]">
               <DiagRow
                 label="WebSocket"
@@ -821,17 +635,16 @@ export function TestCall() {
               />
               <DiagRow label="Engine" value={diag.engineState} sub={ago(diag.lastEventAt)} />
               <DiagRow
-                label="Recognition"
-                value={diag.recRunning ? 'listening' : 'restarting'}
-                valueClass={recHealthColor()}
-                sub={`last result ${ago(diag.lastRecResultAt)}`}
+                label="Flux STT"
+                value={diag.captureRunning ? 'streaming' : 'stopped'}
+                valueClass={sttHealthColor()}
+                sub={`last result ${ago(diag.lastSttAt)}`}
               />
               <DiagRow
                 label="Agent"
                 value={isSpeaking() ? 'speaking' : 'silent'}
                 sub={`queue ${diag.audioQueue}`}
               />
-              <DiagRow label="Restarts" value={String(diag.recRestarts)} sub="since call start" />
             </div>
 
             {interim && (
@@ -839,7 +652,7 @@ export function TestCall() {
                 <div className="hairline" />
                 <div>
                   <div className="text-[10px] uppercase tracking-[0.22em] text-muted-foreground/75 mb-1">
-                    Recognizer interim
+                    Server STT interim
                   </div>
                   <div className="text-[13px] italic font-display text-foreground/70">{interim}…</div>
                 </div>
