@@ -21,6 +21,10 @@ export class ConversationEngine {
   private history: Message[] = [];
   private turnId = 0;
   private abort: AbortController | null = null;
+  /** In-flight assistant text for the current turn, exposed so interrupt() can
+   *  commit it to history before cancelling — keeps context intact across
+   *  barge-ins so the next LLM call has the full conversation. */
+  private inflightAssist = '';
 
   constructor(private deps: EngineDeps) {
     this.history.push({ role: 'system', content: deps.systemPrompt });
@@ -37,6 +41,12 @@ export class ConversationEngine {
 
   interrupt(): void {
     if (this.state === 'speaking' || this.state === 'thinking') {
+      // Commit whatever the agent had generated so far BEFORE we cancel,
+      // so the next turn's LLM call still has full conversation context.
+      if (this.inflightAssist.trim().length > 0) {
+        this.finishAssistantTurn(this.inflightAssist);
+        this.inflightAssist = '';
+      }
       this.cancelCurrentTurn();
       this.deps.client.emit({ type: 'flush' });
       this.setState('listening');
@@ -91,6 +101,7 @@ export class ConversationEngine {
     let assistantText = '';
     let firstToken = false;
     let firstAudio = false;
+    this.inflightAssist = '';
 
     const speak = async (text: string): Promise<void> => {
       if (text.trim().length === 0) return;
@@ -114,6 +125,7 @@ export class ConversationEngine {
             latency.mark('llmFirstToken');
           }
           assistantText += delta.text;
+          this.inflightAssist = assistantText;
           if (this.state !== 'speaking') this.setState('speaking');
           for (const chunk of chunker.push(delta.text)) await speak(chunk);
         } else if (delta.type === 'toolCall') {
@@ -139,6 +151,7 @@ export class ConversationEngine {
       if (tail) await speak(tail);
       if (myTurn !== this.turnId) return;
       this.finishAssistantTurn(assistantText);
+      this.inflightAssist = '';
       this.setState('listening');
     } catch (err) {
       if (signal.aborted) return;
