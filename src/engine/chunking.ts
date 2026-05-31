@@ -1,3 +1,5 @@
+import { stripMarkdownForTts } from './text-utils';
+
 export interface ChunkerOptions {
   minWords?: number;
   maxWords?: number;
@@ -17,14 +19,19 @@ export class TextChunker {
     this.buffer += delta;
     const out: string[] = [];
     let chunk: string | null;
-    while ((chunk = this.extract()) !== null) out.push(chunk);
+    while ((chunk = this.extract()) !== null) {
+      const scrubbed = stripMarkdownForTts(chunk).trim();
+      if (scrubbed.length > 0) out.push(scrubbed);
+    }
     return out;
   }
 
   flush(): string | null {
     const text = this.buffer.trim();
     this.buffer = '';
-    return text.length > 0 ? text : null;
+    if (text.length === 0) return null;
+    const scrubbed = stripMarkdownForTts(text).trim();
+    return scrubbed.length > 0 ? scrubbed : null;
   }
 
   private wordCount(s: string): number {
