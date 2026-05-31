@@ -15,6 +15,34 @@ export const VOICEOVERS_ENABLED = true;
 
 const MAX_CHARS = 5000;
 
+export type Speed = 'slow' | 'normal' | 'fast';
+
+/**
+ * Expand author-friendly tokens into TTS-ready text.
+ *
+ * Pauses — `[pause:short|medium|long]` → punctuation patterns both Aura and
+ * Gemini respect as natural breath/beat pauses.
+ *
+ * Speed — for Gemini we prepend a natural-language style directive (Gemini
+ * Flash TTS interprets pacing prompts). Aura has no documented speed knob via
+ * Workers AI, so for Aura we no-op; the UI surfaces this to the user.
+ */
+export function expandScript(text: string, speed: Speed, provider: Provider): string {
+  const expanded = text
+    .replace(/\[pause:short\]/gi, ', ')
+    .replace(/\[pause:medium\]/gi, '. ')
+    .replace(/\[pause:long\]/gi, '... ')
+    .trim();
+
+  if (speed === 'normal') return expanded;
+  if (provider.voicePrefix !== 'gemini') return expanded; // Aura: no speed control
+  const directive =
+    speed === 'slow'
+      ? 'Speak at a slow, measured pace.'
+      : 'Speak at a brisk, energetic pace.';
+  return `${directive} ${expanded}`;
+}
+
 export type RoutedModel =
   | '@cf/deepgram/aura-2-en'
   | '@cf/deepgram/aura-2-es'
@@ -149,6 +177,7 @@ interface CreateBody {
   voiceId?: unknown;
   language?: unknown;
   title?: unknown;
+  speed?: unknown;
 }
 
 /**
@@ -202,6 +231,7 @@ export async function handleVoiceoverApi(
     const voiceId = typeof body.voiceId === 'string' ? body.voiceId : '';
     const language = typeof body.language === 'string' ? body.language : 'en-US';
     const title = typeof body.title === 'string' ? body.title.trim() : '';
+    const speed: Speed = body.speed === 'slow' || body.speed === 'fast' ? body.speed : 'normal';
 
     if (!scriptText) return err(400, 'scriptText is required');
     if (scriptText.length > MAX_CHARS) return err(400, `script exceeds ${MAX_CHARS} character limit`);
@@ -221,11 +251,12 @@ export async function handleVoiceoverApi(
     // Render synchronously (≤2 min audio jobs only — fine within Worker wall-clock).
     try {
       const env2 = env as unknown as { GOOGLE_AI_API_KEY?: string };
+      const renderText = expandScript(scriptText, speed, provider);
       const { bytes, contentType } = await synthesizeTts({
         ai: env.AI,
         googleApiKey: env2.GOOGLE_AI_API_KEY,
         voiceId,
-        text: scriptText,
+        text: renderText,
       });
 
       await env.RECORDINGS.put(r2Key, bytes, {

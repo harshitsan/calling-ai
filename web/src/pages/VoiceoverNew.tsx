@@ -1,4 +1,4 @@
-import { ArrowLeft, Loader2, Play, Sparkles } from 'lucide-react';
+import { ArrowLeft, Gauge, Loader2, Pause, Play, Sparkles } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Badge } from '@/components/ui/badge';
@@ -25,6 +25,35 @@ const LANGUAGES = [
   { code: 'ja', label: 'Japanese' },
   { code: 'zh', label: 'Chinese' },
 ] as const;
+
+type Speed = 'slow' | 'normal' | 'fast';
+const SPEEDS: { id: Speed; label: string }[] = [
+  { id: 'slow', label: 'Slow' },
+  { id: 'normal', label: 'Normal' },
+  { id: 'fast', label: 'Fast' },
+];
+
+// Localized preview greeting per language. `{name}` is replaced by the voice label.
+const PREVIEW_TEXTS: Record<string, string> = {
+  'en-US': "Hi, I'm {name}. Pleasure to meet you.",
+  'en-GB': "Hello, I'm {name}. Lovely to meet you.",
+  es: 'Hola, soy {name}. Encantado de conocerte.',
+  fr: 'Bonjour, je suis {name}. Ravi de vous rencontrer.',
+  de: 'Hallo, ich bin {name}. Schön, Sie kennenzulernen.',
+  it: 'Ciao, sono {name}. Piacere di conoscerti.',
+  pt: 'Olá, sou {name}. Prazer em conhecê-lo.',
+  hi: 'नमस्ते, मैं {name} हूँ। आपसे मिलकर खुशी हुई।',
+  ja: 'こんにちは、{name} です。お会いできて嬉しいです。',
+  zh: '你好，我是 {name}。很高兴认识你。',
+};
+
+function previewTextFor(language: string, voiceName: string): string {
+  const template =
+    PREVIEW_TEXTS[language] ??
+    PREVIEW_TEXTS[language.split('-')[0] ?? ''] ??
+    PREVIEW_TEXTS['en-US']!;
+  return template.replace('{name}', voiceName);
+}
 
 interface VoiceItem {
   id: string;
@@ -55,6 +84,7 @@ export function VoiceoverNew() {
   const [language, setLanguage] = useState<string>('en-US');
   const [voiceId, setVoiceId] = useState<string>('');
   const [script, setScript] = useState('');
+  const [speed, setSpeed] = useState<Speed>('normal');
 
   const [voicesMeta, setVoicesMeta] = useState<VoicesResponse | null>(null);
   const [genderFilter, setGenderFilter] = useState<'all' | 'female' | 'male'>('all');
@@ -64,7 +94,10 @@ export function VoiceoverNew() {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<CreateResponse['voiceover'] | null>(null);
 
+  const scriptRef = useRef<HTMLTextAreaElement | null>(null);
   const audioPreviewRef = useRef<HTMLAudioElement | null>(null);
+
+  const isGemini = voicesMeta?.model.startsWith('google/') ?? false;
 
   // Load voices whenever language changes.
   useEffect(() => {
@@ -95,6 +128,25 @@ export function VoiceoverNew() {
   const estSeconds = Math.round(chars / (voicesMeta?.model.startsWith('google/') ? 12 : 15));
   const estDuration = chars === 0 ? '—' : `≈ ${estSeconds}s`;
 
+  function insertPauseToken(kind: 'short' | 'medium' | 'long') {
+    const ta = scriptRef.current;
+    const token = `[pause:${kind}]`;
+    if (!ta) {
+      setScript((s) => s + token);
+      return;
+    }
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    const next = script.slice(0, start) + token + script.slice(end);
+    setScript(next);
+    // Restore cursor after the inserted token on next paint.
+    requestAnimationFrame(() => {
+      ta.focus();
+      const caret = start + token.length;
+      ta.setSelectionRange(caret, caret);
+    });
+  }
+
   async function previewVoice(v: VoiceItem) {
     if (previewingId === v.id) {
       audioPreviewRef.current?.pause();
@@ -104,8 +156,9 @@ export function VoiceoverNew() {
     audioPreviewRef.current?.pause();
     setPreviewingId(v.id);
     try {
+      const text = previewTextFor(language, v.label);
       const res = await fetch(
-        `/api/tts?voice=${encodeURIComponent(v.id)}&text=${encodeURIComponent(`Hi, I'm ${v.label}. Pleasure to meet you.`)}`,
+        `/api/tts?voice=${encodeURIComponent(v.id)}&text=${encodeURIComponent(text)}`,
       );
       if (!res.ok) {
         setPreviewingId(null);
@@ -137,7 +190,7 @@ export function VoiceoverNew() {
     try {
       const r = await api<CreateResponse>('/api/voiceovers', {
         method: 'POST',
-        body: JSON.stringify({ title, scriptText: script, voiceId, language }),
+        body: JSON.stringify({ title, scriptText: script, voiceId, language, speed }),
       });
       setResult(r.voiceover);
     } catch (e) {
@@ -287,7 +340,7 @@ export function VoiceoverNew() {
           </div>
         </div>
 
-        {/* Script */}
+        {/* Script + insert tools */}
         <div>
           <div className="flex items-baseline justify-between mb-1.5">
             <Label htmlFor="script">Script</Label>
@@ -300,17 +353,71 @@ export function VoiceoverNew() {
               {chars} / {MAX_CHARS} chars · {estDuration}
             </span>
           </div>
+
+          <div className="flex flex-wrap items-center gap-2 mb-2">
+            <span className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground/60 mr-1">
+              Insert pause
+            </span>
+            {(['short', 'medium', 'long'] as const).map((k) => (
+              <button
+                key={k}
+                type="button"
+                onClick={() => insertPauseToken(k)}
+                className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.07] bg-white/[0.02] px-3 py-1 text-[11px] tracking-tight text-muted-foreground hover:text-foreground/95 hover:bg-white/[0.05] transition-colors"
+                title={`Insert a ${k} pause at the cursor`}
+              >
+                <Pause className="h-3 w-3" />
+                {k}
+              </button>
+            ))}
+            <span className="ml-auto text-[10px] text-muted-foreground/50 italic">
+              Tokens stay visible in your script; we expand them at render.
+            </span>
+          </div>
+
           <Textarea
             id="script"
+            ref={scriptRef}
             value={script}
             onChange={(e) => setScript(e.target.value)}
-            placeholder="Paste your script here…"
+            placeholder="Paste your script here. Use the buttons above to insert [pause:short|medium|long] tokens at the cursor."
             rows={8}
             className={cn(
               'font-serif leading-relaxed',
               overLimit && 'border-red-500/40 focus-visible:ring-red-500/40',
             )}
           />
+        </div>
+
+        {/* Speed */}
+        <div>
+          <div className="flex items-baseline justify-between mb-1.5">
+            <Label className="inline-flex items-center gap-1.5">
+              <Gauge className="h-3 w-3" /> Speed
+            </Label>
+            {!isGemini && speed !== 'normal' && voicesMeta && (
+              <span className="text-[10px] text-amber-400/85 italic">
+                Speed control is only available on multilingual voices — Aura voices use a fixed natural pace.
+              </span>
+            )}
+          </div>
+          <div className="flex gap-1.5">
+            {SPEEDS.map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => setSpeed(s.id)}
+                className={cn(
+                  'rounded-full border px-4 py-1.5 text-[11px] uppercase tracking-[0.18em] transition-all',
+                  speed === s.id
+                    ? 'bg-white/[0.07] border-white/[0.12] text-foreground/95'
+                    : 'border-white/[0.06] bg-white/[0.02] text-muted-foreground hover:text-foreground/90',
+                )}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
         </div>
 
         {error && (

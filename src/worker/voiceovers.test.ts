@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { pickProvider, voicesForProvider } from './voiceovers';
+import { expandScript, pickProvider, voicesForProvider } from './voiceovers';
 
 describe('pickProvider', () => {
   it('routes en-US to Aura-2 English', () => {
@@ -63,5 +63,48 @@ describe('voicesForProvider', () => {
     const es = voicesForProvider(pickProvider('es'));
     expect(en.every((v) => v.gender === 'female' || v.gender === 'male')).toBe(true);
     expect(es.every((v) => v.gender === 'female' || v.gender === 'male')).toBe(true);
+  });
+});
+
+describe('expandScript', () => {
+  const aura = pickProvider('en-US');
+  const gemini = pickProvider('fr');
+
+  it('passes plain text through unchanged at normal speed', () => {
+    expect(expandScript('Hello world.', 'normal', aura)).toBe('Hello world.');
+  });
+
+  it('expands short/medium/long pause tokens', () => {
+    expect(expandScript('Hi[pause:short]there.', 'normal', aura)).toBe('Hi, there.');
+    expect(expandScript('Hi[pause:medium]there.', 'normal', aura)).toBe('Hi. there.');
+    expect(expandScript('Hi[pause:long]there.', 'normal', aura)).toBe('Hi... there.');
+  });
+
+  it('is case-insensitive for pause tokens', () => {
+    expect(expandScript('Hi[PAUSE:short]there.', 'normal', aura)).toBe('Hi, there.');
+  });
+
+  it('expands multiple pauses in one script', () => {
+    expect(expandScript('A[pause:short]B[pause:long]C', 'normal', aura)).toBe('A, B... C');
+  });
+
+  it('prepends slow-pace directive only for Gemini', () => {
+    expect(expandScript('Hello.', 'slow', gemini)).toContain('slow');
+    expect(expandScript('Hello.', 'slow', gemini).endsWith('Hello.')).toBe(true);
+  });
+
+  it('prepends fast-pace directive only for Gemini', () => {
+    expect(expandScript('Hello.', 'fast', gemini)).toContain('brisk');
+  });
+
+  it('does not modify text for non-normal speed on Aura (no API knob)', () => {
+    expect(expandScript('Hello.', 'slow', aura)).toBe('Hello.');
+    expect(expandScript('Hello.', 'fast', aura)).toBe('Hello.');
+  });
+
+  it('combines pause expansion and speed directive for Gemini', () => {
+    const out = expandScript('Hi[pause:medium]there.', 'slow', gemini);
+    expect(out).toContain('slow');
+    expect(out).toContain('Hi. there.');
   });
 });
