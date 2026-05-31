@@ -1,6 +1,7 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { Layout } from './components/Layout';
 import { getToken } from './lib/api';
+import { VOICEOVERS_ENABLED } from './lib/features';
 import { AgentForm } from './pages/AgentForm';
 import { Agents } from './pages/Agents';
 import { CallDetail } from './pages/CallDetail';
@@ -8,6 +9,8 @@ import { Calls } from './pages/Calls';
 import { Login } from './pages/Login';
 import { Logs } from './pages/Logs';
 import { TestCall } from './pages/TestCall';
+import { Voiceovers } from './pages/Voiceovers';
+import { VoiceoverNew } from './pages/VoiceoverNew';
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   return getToken() ? <>{children}</> : <Navigate to="/login" replace />;
@@ -33,6 +36,12 @@ export function App() {
           <Route path="/calls/:id" element={<CallDetail />} />
           <Route path="/test" element={<TestCall />} />
           <Route path="/logs" element={<Logs />} />
+          {VOICEOVERS_ENABLED && (
+            <>
+              <Route path="/voiceovers" element={<Voiceovers />} />
+              <Route path="/voiceovers/new" element={<VoiceoverNew />} />
+            </>
+          )}
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

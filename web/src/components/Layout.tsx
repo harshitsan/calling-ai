@@ -1,10 +1,12 @@
-import { Bot, LogOut, Phone, PhoneCall, ScrollText } from 'lucide-react';
+import { Bot, LogOut, Mic, Phone, PhoneCall, ScrollText } from 'lucide-react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { clearToken } from '@/lib/api';
+import { VOICEOVERS_ENABLED } from '@/lib/features';
 import { cn } from '@/lib/utils';
 
 const nav = [
   { to: '/agents', label: 'Agents', icon: Bot },
+  ...(VOICEOVERS_ENABLED ? [{ to: '/voiceovers', label: 'Voiceovers', icon: Mic }] : []),
   { to: '/calls', label: 'Call Logs', icon: Phone },
   { to: '/test', label: 'Test Call', icon: PhoneCall },
   { to: '/logs', label: 'Live Logs', icon: ScrollText },

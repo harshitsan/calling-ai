@@ -1,9 +1,10 @@
-import { handleApi } from './api';
+import { handleApi, authenticate } from './api';
 import { synthesizeTtsCached } from './adapters';
 import { verifyJwt } from './auth';
 import { CallSession } from './call-session';
 import { LogHub } from './log-hub';
 import { MemoryStore } from './memory-store';
+import { VOICEOVERS_ENABLED, handleVoiceoverApi } from './voiceovers';
 
 export { CallSession, LogHub, MemoryStore };
 
@@ -34,6 +35,23 @@ export default {
       const headers = new Headers(res.headers);
       for (const [k, v] of Object.entries(CORS)) headers.set(k, v);
       return new Response(res.body, { status: res.status, headers });
+    }
+
+    // Voiceovers (isolated module — flip VOICEOVERS_ENABLED in src/worker/voiceovers.ts to disable).
+    if (VOICEOVERS_ENABLED && url.pathname.startsWith('/api/voiceovers')) {
+      let auth = await authenticate(request, env);
+      // <audio src=...> can't send headers — accept `?token=<jwt>` on the audio sub-path only.
+      if (!auth && /^\/api\/voiceovers\/[a-f0-9-]+\/audio$/.test(url.pathname) && request.method === 'GET') {
+        const secret = (env as unknown as { JWT_SECRET?: string }).JWT_SECRET ?? 'dev-insecure-secret-change-me';
+        const claims = await verifyJwt(url.searchParams.get('_t') ?? '', secret);
+        if (claims) auth = { tenantId: claims.tid, userId: claims.sub };
+      }
+      const res = await handleVoiceoverApi(request, env, auth);
+      if (res) {
+        const headers = new Headers(res.headers);
+        for (const [k, v] of Object.entries(CORS)) headers.set(k, v);
+        return new Response(res.body, { status: res.status, headers });
+      }
     }
 
     if (url.pathname === '/call') {
