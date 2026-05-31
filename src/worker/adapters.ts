@@ -385,10 +385,21 @@ interface OpenAiDelta {
   tool_calls?: { index?: number; id?: string; function?: { name?: string; arguments?: string } }[];
 }
 
-/** Streaming LLM over the OpenAI Chat Completions API, with function calling. */
+/**
+ * Streaming LLM over the OpenAI **Responses API** (the modern endpoint).
+ *
+ * Conversation state lives on OpenAI as a thread: the first call sets
+ * `instructions` (the system prompt) + the user's input and gets back a
+ * response id; every subsequent call passes `previous_response_id` so OpenAI
+ * resolves the full thread server-side. We only ever send the latest user
+ * message after the first turn, which cuts token usage and makes context
+ * authoritative on OpenAI's side.
+ */
 export class OpenAiLlm implements LlmPort {
   private tools?: OpenAiTool[];
   private onError?: ErrorReporter;
+  /** OpenAI thread head — the most recent response id. Null until first turn. */
+  private lastResponseId: string | null = null;
   constructor(
     private apiKey: string,
     private model = 'gpt-4o-mini',
@@ -399,30 +410,56 @@ export class OpenAiLlm implements LlmPort {
     this.onError = opts.onError;
   }
 
+  getThreadId(): string | null {
+    return this.lastResponseId;
+  }
+
   async *generate(messages: Message[], opts?: { signal?: AbortSignal }): AsyncIterable<LlmDelta> {
+    // Responses API: only send the latest user input — OpenAI loads the rest
+    // of the thread via previous_response_id.
+    const latestUser = [...messages].reverse().find((m) => m.role === 'user');
+    const userInput = latestUser?.content ?? '';
+    const systemMsg = messages.find((m) => m.role === 'system');
+
+    const body: Record<string, unknown> = {
+      model: this.model,
+      input: userInput,
+      stream: true,
+      max_output_tokens: 320,
+      temperature: 0.6,
+    };
+    if (this.lastResponseId) {
+      body.previous_response_id = this.lastResponseId;
+    } else if (systemMsg) {
+      // First turn — anchor the thread with the system prompt as instructions.
+      body.instructions = systemMsg.content;
+    }
+    if (this.tools && this.tools.length) {
+      body.tools = this.tools.map((t) => ({
+        type: 'function',
+        name: t.function.name,
+        description: t.function.description,
+        parameters: t.function.parameters,
+      }));
+      body.tool_choice = 'auto';
+    }
+
     let res: Response;
     try {
-      res = await fetch(`${this.baseUrl}/chat/completions`, {
+      res = await fetch(`${this.baseUrl}/responses`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${this.apiKey}` },
-        body: JSON.stringify({
-          model: this.model,
-          messages: messages.map((m) => ({ role: m.role === 'tool' ? 'user' : m.role, content: m.content })),
-          stream: true,
-          max_tokens: 300,
-          temperature: 0.6,
-          ...(this.tools ? { tools: this.tools, tool_choice: 'auto' } : {}),
-        }),
+        body: JSON.stringify(body),
         signal: opts?.signal,
       });
     } catch (e) {
-      if (!opts?.signal?.aborted) this.onError?.('OpenAI request threw', { model: this.model, error: String(e) });
+      if (!opts?.signal?.aborted) this.onError?.('OpenAI Responses request threw', { model: this.model, error: String(e) });
       yield { type: 'done' };
       return;
     }
     if (!res.ok || !res.body) {
-      const body = await res.text().catch(() => '');
-      this.onError?.('OpenAI request failed', { status: res.status, body: body.slice(0, 300) });
+      const errBody = await res.text().catch(() => '');
+      this.onError?.('OpenAI Responses failed', { status: res.status, body: errBody.slice(0, 300) });
       yield { type: 'done' };
       return;
     }
@@ -430,19 +467,16 @@ export class OpenAiLlm implements LlmPort {
     const decoder = new TextDecoder();
     let buf = '';
     let produced = false;
-    const toolAcc = new Map<number, { id: string; name: string; args: string }>();
 
-    const flushTools = (): LlmDelta[] => {
+    type FnCall = { id: string; name: string; args: string };
+    const fns = new Map<string, FnCall>();
+    const flushFns = (): LlmDelta[] => {
       const out: LlmDelta[] = [];
-      for (const [, t] of toolAcc) {
-        if (!t.name) continue;
+      for (const [, c] of fns) {
+        if (!c.name) continue;
         let args: Record<string, unknown> = {};
-        try {
-          args = t.args ? JSON.parse(t.args) : {};
-        } catch {
-          args = {};
-        }
-        out.push({ type: 'toolCall', id: t.id || t.name, name: t.name, arguments: args });
+        try { args = c.args ? JSON.parse(c.args) : {}; } catch { /* malformed */ }
+        out.push({ type: 'toolCall', id: c.id || c.name, name: c.name, arguments: args });
       }
       return out;
     };
@@ -459,49 +493,55 @@ export class OpenAiLlm implements LlmPort {
           const t = line.trim();
           if (!t.startsWith('data:')) continue;
           const data = t.slice(5).trim();
-          if (data === '[DONE]') {
-            const tools = flushTools();
-            for (const d of tools) yield d;
-            if (!produced && tools.length === 0) {
-              this.onError?.('OpenAI returned an empty response', { model: this.model }, 'warn');
+          if (!data || data === '[DONE]') continue;
+          let j: Record<string, unknown>;
+          try { j = JSON.parse(data) as Record<string, unknown>; } catch { continue; }
+          const type = j.type as string | undefined;
+          if (!type) continue;
+
+          if (type === 'response.created') {
+            const id = (j.response as { id?: string } | undefined)?.id;
+            if (id) {
+              const wasNew = !this.lastResponseId;
+              this.lastResponseId = id;
+              this.onError?.(wasNew ? 'thread started' : 'thread continued', { threadId: id, model: this.model }, 'info');
             }
+          } else if (type === 'response.output_text.delta' && typeof j.delta === 'string') {
+            produced = true;
+            yield { type: 'text', text: j.delta };
+          } else if (type === 'response.output_item.added') {
+            const item = j.item as { type?: string; id?: string; call_id?: string; name?: string } | undefined;
+            if (item?.type === 'function_call') {
+              const key = item.id ?? item.call_id ?? String(j.output_index ?? fns.size);
+              fns.set(key, { id: item.call_id ?? key, name: item.name ?? '', args: '' });
+              produced = true;
+            }
+          } else if (type === 'response.function_call_arguments.delta') {
+            const key = (j.item_id as string | undefined) ?? String(j.output_index ?? '');
+            const cur = fns.get(key) ?? { id: key, name: '', args: '' };
+            if (typeof j.delta === 'string') cur.args += j.delta;
+            fns.set(key, cur);
+          } else if (type === 'response.completed') {
+            const id = (j.response as { id?: string } | undefined)?.id;
+            if (id) this.lastResponseId = id;
+            for (const d of flushFns()) yield d;
+            if (!produced) this.onError?.('OpenAI Responses returned empty', { model: this.model }, 'warn');
             yield { type: 'done' };
             return;
-          }
-          try {
-            const j = JSON.parse(data) as { choices?: { delta?: OpenAiDelta }[] };
-            const delta = j.choices?.[0]?.delta;
-            if (delta?.content) {
-              produced = true;
-              yield { type: 'text', text: delta.content };
-            }
-            if (delta?.tool_calls) {
-              produced = true;
-              for (const tc of delta.tool_calls) {
-                const idx = tc.index ?? 0;
-                const cur = toolAcc.get(idx) ?? { id: '', name: '', args: '' };
-                if (tc.id) cur.id = tc.id;
-                if (tc.function?.name) cur.name = tc.function.name;
-                if (tc.function?.arguments) cur.args += tc.function.arguments;
-                toolAcc.set(idx, cur);
-              }
-            }
-          } catch {
-            // partial SSE line; ignore
+          } else if (type === 'response.failed' || type === 'response.error' || type === 'error') {
+            const err = (j.error as { message?: string } | undefined)?.message ?? type;
+            this.onError?.('OpenAI Responses error', { error: err }, 'error');
+            yield { type: 'done' };
+            return;
           }
         }
       }
     } finally {
-      try {
-        await reader.cancel();
-      } catch {
-        // already closed
-      }
+      try { await reader.cancel(); } catch { /* already closed */ }
     }
-    const tools = flushTools();
-    for (const d of tools) yield d;
-    if (!produced && tools.length === 0 && !opts?.signal?.aborted) {
-      this.onError?.('OpenAI stream ended with no output', { model: this.model }, 'warn');
+    for (const d of flushFns()) yield d;
+    if (!produced && !opts?.signal?.aborted) {
+      this.onError?.('OpenAI Responses stream ended empty', { model: this.model }, 'warn');
     }
     yield { type: 'done' };
   }

@@ -127,6 +127,12 @@ export function TestCall() {
   const recChunksRef = useRef<Blob[]>([]);
   const callIdRef = useRef<string | null>(null);
   const callStartRef = useRef(0);
+  // Flux server-side STT via AudioWorklet PCM streaming.
+  const captureCtxRef = useRef<AudioContext | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const [sttMode, setSttMode] = useState<'browser' | 'flux'>('browser');
+  const sttModeRef = useRef<'browser' | 'flux'>('browser');
+  sttModeRef.current = sttMode;
 
   useEffect(() => {
     api<{ agents: Agent[] }>('/api/agents').then((r) => {
@@ -191,6 +197,39 @@ export function TestCall() {
     } catch {
       /* ignore */
     }
+  }
+
+  async function startFluxCapture() {
+    if (!micStreamRef.current) return;
+    try {
+      const ctx = new AudioContext({ sampleRate: 16000 });
+      captureCtxRef.current = ctx;
+      await ctx.audioWorklet.addModule('/pcm-worklet.js');
+      const source = ctx.createMediaStreamSource(micStreamRef.current);
+      const worklet = new AudioWorkletNode(ctx, 'pcm-capture');
+      worklet.port.onmessage = (e) => {
+        if (wsRef.current?.readyState === 1) {
+          // Binary frame — server routes it to Flux STT via stt.sendAudio
+          wsRef.current.send(e.data as ArrayBuffer);
+        }
+      };
+      source.connect(worklet);
+      const sink = ctx.createGain();
+      sink.gain.value = 0;
+      worklet.connect(sink);
+      sink.connect(ctx.destination); // keep the graph pulling samples
+      workletNodeRef.current = worklet;
+      clientLog('flux capture started', { sampleRate: ctx.sampleRate });
+    } catch (e) {
+      clientLog('flux capture failed', { error: String(e) }, 'error');
+    }
+  }
+
+  function stopFluxCapture() {
+    try { workletNodeRef.current?.disconnect(); } catch { /* ignore */ }
+    workletNodeRef.current = null;
+    try { captureCtxRef.current?.close(); } catch { /* ignore */ }
+    captureCtxRef.current = null;
   }
 
   function restartRecognition() {
@@ -435,7 +474,7 @@ export function TestCall() {
     }
     const token = getToken();
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const url = `${proto}://${location.host}/call?agentId=${agentId}&token=${encodeURIComponent(token ?? '')}&customer_name=${encodeURIComponent(customer)}`;
+    const url = `${proto}://${location.host}/call?agentId=${agentId}&token=${encodeURIComponent(token ?? '')}&customer_name=${encodeURIComponent(customer)}${sttMode === 'flux' ? '&stt=flux' : ''}`;
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
     setDiag((d) => ({ ...d, wsState: 'connecting' }));
@@ -443,9 +482,11 @@ export function TestCall() {
       setStatus('live');
       callStartRef.current = Date.now();
       setDiag((d) => ({ ...d, wsState: 'open' }));
-      clientLog('ws open', { agentId, voice: agents.find((a) => a.id === agentId)?.name });
-      startVad();
-      startRecognition();
+      clientLog('ws open', { agentId, voice: agents.find((a) => a.id === agentId)?.name, sttMode });
+      startVad().then(() => {
+        if (sttMode === 'flux') startFluxCapture();
+        else startRecognition();
+      });
     };
     ws.onclose = (e) => {
       setDiag((d) => ({
@@ -474,8 +515,10 @@ export function TestCall() {
       }
       if (ev.type === 'meta') callIdRef.current = ev.callId;
       else if (ev.type === 'state') setDiag((d) => ({ ...d, engineState: ev.state }));
-      else if (ev.type === 'transcript' && ev.role !== 'user') {
-        // user lines are committed optimistically in send(); skip the server echo.
+      else if (ev.type === 'transcript') {
+        // In browser STT mode we already committed the user line optimistically;
+        // in flux mode the server is the source of truth and we show its transcript.
+        if (ev.role === 'user' && sttModeRef.current !== 'flux') return;
         setLines((l) => [
           ...l,
           { role: ev.role, text: ev.text, ts: Date.now() - (callStartRef.current || Date.now()) },
@@ -529,6 +572,7 @@ export function TestCall() {
     recorderRef.current = null;
     recDestRef.current = null;
 
+    stopFluxCapture();
     micStreamRef.current?.getTracks().forEach((t) => t.stop());
     micStreamRef.current = null;
     setInterim('');
@@ -602,6 +646,18 @@ export function TestCall() {
           <div className="space-y-1">
             <Label>Caller name</Label>
             <Input value={customer} onChange={(e) => setCustomer(e.target.value)} className="w-40" disabled={live} />
+          </div>
+          <div className="space-y-1">
+            <Label>STT</Label>
+            <Select
+              value={sttMode}
+              onChange={(e) => setSttMode(e.target.value as 'browser' | 'flux')}
+              className="w-44"
+              disabled={live}
+            >
+              <option value="browser">Browser (default)</option>
+              <option value="flux">Server · Deepgram Flux</option>
+            </Select>
           </div>
           {status === 'idle' ? (
             <Button onClick={start} disabled={!agentId}>
