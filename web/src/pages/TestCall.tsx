@@ -515,10 +515,24 @@ export function TestCall() {
       }
       if (ev.type === 'meta') callIdRef.current = ev.callId;
       else if (ev.type === 'state') setDiag((d) => ({ ...d, engineState: ev.state }));
-      else if (ev.type === 'transcript') {
+      else if (ev.type === 'partial' && ev.role === 'user') {
+        // Live interim transcript from server-side STT. Show as italic, do NOT
+        // commit as a conversation line. Use it as a barge-in signal in Flux
+        // mode — Chrome AEC can't always cancel agent voice, but Flux can
+        // segment user speech, so its partial is a strong "user is talking now"
+        // signal that should interrupt the agent immediately.
+        interimRef.current = ev.text;
+        setInterim(ev.text);
+        if (sttModeRef.current === 'flux' && isSpeaking() && ev.text.trim().length >= 2) {
+          bargeIn();
+        }
+      } else if (ev.type === 'transcript') {
         // In browser STT mode we already committed the user line optimistically;
         // in flux mode the server is the source of truth and we show its transcript.
         if (ev.role === 'user' && sttModeRef.current !== 'flux') return;
+        // Clear any interim that led up to this final.
+        interimRef.current = '';
+        setInterim('');
         setLines((l) => [
           ...l,
           { role: ev.role, text: ev.text, ts: Date.now() - (callStartRef.current || Date.now()) },

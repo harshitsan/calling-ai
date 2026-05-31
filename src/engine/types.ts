@@ -41,6 +41,7 @@ export interface TurnLatencySummary {
 export type ClientEvent =
   | { type: 'state'; state: EngineState }
   | { type: 'transcript'; role: Role; text: string }
+  | { type: 'partial'; role: Role; text: string }
   | { type: 'audio'; chunk: AudioChunk }
   | { type: 'flush' }
   | { type: 'ended'; reason: string }

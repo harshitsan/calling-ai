@@ -77,7 +77,9 @@ export class ConversationEngine {
 
   private onStt(e: SttEvent): void {
     if (e.type === 'partial') {
-      this.deps.client.emit({ type: 'transcript', role: 'user', text: e.text });
+      // Interim transcript — NOT a finalized turn. Client should show this
+      // as live italic text, not commit it as a conversation line.
+      this.deps.client.emit({ type: 'partial', role: 'user', text: e.text });
       return;
     }
     if (e.type === 'endOfTurn') {
@@ -87,6 +89,18 @@ export class ConversationEngine {
 
   private async handleTurn(userText: string): Promise<void> {
     if (this.state === 'ended') return;
+    // If a turn is already in flight (e.g. server STT emitted a new
+    // EndOfTurn while the agent is still speaking), implicitly interrupt
+    // it — commit what was said to history AND flush the client's queued
+    // audio so playback stops immediately.
+    if (this.state === 'speaking' || this.state === 'thinking') {
+      if (this.inflightAssist.trim().length > 0) {
+        this.finishAssistantTurn(this.inflightAssist);
+        this.inflightAssist = '';
+      }
+      this.cancelCurrentTurn();
+      this.deps.client.emit({ type: 'flush' });
+    }
     const myTurn = ++this.turnId;
     this.abort = new AbortController();
     const signal = this.abort.signal;
