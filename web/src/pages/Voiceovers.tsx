@@ -1,19 +1,15 @@
-import { Mic, Plus, Sparkles, Trash2 } from 'lucide-react';
+import { Layers, Plus, Sparkles, Trash2 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { api, getToken } from '@/lib/api';
-import { languageLabel } from '@/lib/voices';
 
 interface Voiceover {
   id: string;
   title: string;
-  scriptText: string;
-  voiceId: string;
-  model: string;
-  language: string;
+  totalDurationMs: number | null;
   format: 'mp3' | 'wav';
   chars: number;
   durationMs: number | null;
@@ -21,6 +17,7 @@ interface Voiceover {
   error?: string;
   createdAt: number;
   audioUrl: string;
+  snippetCount: number;
 }
 
 function fmtDuration(ms: number | null): string {
@@ -112,7 +109,7 @@ export function Voiceovers() {
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2 flex-wrap">
                     <h3 className="font-display text-xl tracking-tight text-foreground/95 truncate">
-                      {v.title || 'Untitled voiceover'}
+                      {v.title || 'Untitled project'}
                     </h3>
                     {v.status === 'failed' && (
                       <Badge className="bg-red-500/15 text-red-400 border-red-500/20">failed</Badge>
@@ -123,9 +120,6 @@ export function Voiceovers() {
                       </Badge>
                     )}
                   </div>
-                  <p className="mt-1.5 text-[12px] text-muted-foreground line-clamp-2 leading-relaxed">
-                    {v.scriptText}
-                  </p>
                 </div>
                 <button
                   onClick={() => remove(v.id)}
@@ -153,11 +147,11 @@ export function Voiceovers() {
               <div className="hairline my-4" />
               <div className="flex items-center justify-between gap-4 text-[10px] uppercase tracking-[0.18em] text-muted-foreground/70 flex-wrap">
                 <span className="flex items-center gap-1.5">
-                  <Mic className="h-3 w-3" />
-                  {v.voiceId.includes(':') ? v.voiceId.split(':')[1] : v.voiceId}
+                  <Layers className="h-3 w-3" />
+                  {v.snippetCount} {v.snippetCount === 1 ? 'snippet' : 'snippets'}
                 </span>
-                <span>{languageLabel(v.language)}</span>
-                <span>{fmtDuration(v.durationMs)} · {v.chars} chars</span>
+                <span>{fmtDuration(v.totalDurationMs ?? v.durationMs)}</span>
+                <span>{v.chars} chars</span>
                 <span className="opacity-60">{fmtAge(v.createdAt)}</span>
               </div>
             </Card>

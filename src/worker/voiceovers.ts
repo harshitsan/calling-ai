@@ -1,47 +1,37 @@
-// Voiceovers — isolated module for async video-voiceover generation.
-// Disable by flipping VOICEOVERS_ENABLED to false; the worker stops routing
-// /api/voiceovers/* and the frontend (web/src/lib/features.ts) hides the nav.
+// Voiceovers — timeline-based async TTS render-and-store.
+// Disable: flip VOICEOVERS_ENABLED to false here AND in web/src/lib/features.ts.
 //
-// Pillars: quality > cost > speed. We route language → best provider:
-//   en-* → Aura-2 EN (HD, fast, $0.022/min)
-//   es-* → Aura-2 ES (HD, fast, $0.022/min)
-//   else → Gemini Flash multilingual (slow, BYOK)
+// Architecture
+//   POST /api/voiceovers     → create project + snippets, render mixed WAV
+//   GET  /api/voiceovers     → list projects
+//   GET  /api/voiceovers/:id → project + snippet list
+//   GET  /api/voiceovers/:id/audio → stream the mixed WAV
+//   DEL  /api/voiceovers/:id → delete project + snippets + R2 object
+//   GET  /api/voiceovers/voices?lang=… → voices for the language-routed provider
+//
+// Render pipeline (server, in-worker, ≤5 minute projects):
+//   1. Synthesize each snippet to raw 16-bit PCM at MIX_SAMPLE_RATE (24 kHz).
+//   2. Resample to fit snippet.durationMs (linear interp — pitch shifts at
+//      extreme ratios; transparent within ±20%; future v2 = WASM SoundTouch).
+//   3. Allocate silence buffer of project totalDurationMs.
+//   4. Copy each resampled snippet into the buffer at snippet.startMs.
+//   5. Wrap as WAV and store in R2.
+//
+// Pillars unchanged: quality > cost > speed; en→Aura-2 EN, es→Aura-2 ES,
+// else→Gemini Flash multilingual.
 
-import { synthesizeTts } from './adapters';
+import { synthesizePcm, wrapPcmAsWav } from './adapters';
 import { authenticate } from './api';
 import { err, json, now, uuid } from './util';
 
 export const VOICEOVERS_ENABLED = true;
 
-const MAX_CHARS = 5000;
-
-export type Speed = 'slow' | 'normal' | 'fast';
-
-/**
- * Expand author-friendly tokens into TTS-ready text.
- *
- * Pauses — `[pause:short|medium|long]` → punctuation patterns both Aura and
- * Gemini respect as natural breath/beat pauses.
- *
- * Speed — for Gemini we prepend a natural-language style directive (Gemini
- * Flash TTS interprets pacing prompts). Aura has no documented speed knob via
- * Workers AI, so for Aura we no-op; the UI surfaces this to the user.
- */
-export function expandScript(text: string, speed: Speed, provider: Provider): string {
-  const expanded = text
-    .replace(/\[pause:short\]/gi, ', ')
-    .replace(/\[pause:medium\]/gi, '. ')
-    .replace(/\[pause:long\]/gi, '... ')
-    .trim();
-
-  if (speed === 'normal') return expanded;
-  if (provider.voicePrefix !== 'gemini') return expanded; // Aura: no speed control
-  const directive =
-    speed === 'slow'
-      ? 'Speak at a slow, measured pace.'
-      : 'Speak at a brisk, energetic pace.';
-  return `${directive} ${expanded}`;
-}
+const MAX_CHARS_PER_SNIPPET = 5000;
+const MAX_SNIPPETS = 30;
+const MIN_TOTAL_DURATION_MS = 1000;
+const MAX_TOTAL_DURATION_MS = 5 * 60 * 1000;
+const MIN_SNIPPET_DURATION_MS = 500;
+const MIX_SAMPLE_RATE = 24000;
 
 export type RoutedModel =
   | '@cf/deepgram/aura-2-en'
@@ -56,10 +46,8 @@ export interface Provider {
   pricePerMinUsd: number;
 }
 
-/**
- * Pure function: BCP-47 language code → preferred provider.
- * Falls back to Gemini for anything we don't have an HD Aura voice for.
- */
+export type Speed = 'slow' | 'normal' | 'fast';
+
 export function pickProvider(language: string): Provider {
   const code = language.toLowerCase().split('-')[0];
   if (code === 'en') {
@@ -85,11 +73,30 @@ export function pickProvider(language: string): Provider {
     voicePrefix: 'gemini',
     modelLabel: 'Gemini Flash · Multilingual',
     format: 'wav',
-    pricePerMinUsd: 0.0, // BYOK — Google bills the user directly
+    pricePerMinUsd: 0,
   };
 }
 
-// Voice catalogue (kept server-side so the voices endpoint stays the single source of truth).
+/**
+ * Expand author-friendly tokens into TTS-ready text.
+ * `[pause:short|medium|long]` → punctuation; for Gemini, speed cues become
+ * natural-language pacing directives. Aura has no speed knob.
+ */
+export function expandScript(text: string, speed: Speed, provider: Provider): string {
+  const expanded = text
+    .replace(/\[pause:short\]/gi, ', ')
+    .replace(/\[pause:medium\]/gi, '. ')
+    .replace(/\[pause:long\]/gi, '... ')
+    .trim();
+  if (speed === 'normal' || provider.voicePrefix !== 'gemini') return expanded;
+  const directive =
+    speed === 'slow'
+      ? 'Speak at a slow, measured pace.'
+      : 'Speak at a brisk, energetic pace.';
+  return `${directive} ${expanded}`;
+}
+
+// ----- Voice catalogue (server-side source of truth) -----
 const AURA2_EN_FEMALE = [
   'amalthea','andromeda','asteria','athena','aurora','callista','cora','cordelia','delia',
   'electra','harmonia','helena','hera','iris','juno','luna','minerva','ophelia','pandora',
@@ -107,15 +114,9 @@ const GEMINI_NAMES = [
   'Laomedeia','Achernar','Alnilam','Schedar','Gacrux','Pulcherrima','Achird','Zubenelgenubi',
   'Vindemiatrix','Sadachbia','Sadaltager','Sulafat',
 ];
-
 const cap = (s: string) => s[0]!.toUpperCase() + s.slice(1);
 
-interface VoiceMeta {
-  id: string;
-  label: string;
-  gender?: 'female' | 'male';
-}
-
+interface VoiceMeta { id: string; label: string; gender?: 'female' | 'male' }
 export function voicesForProvider(p: Provider): VoiceMeta[] {
   if (p.voicePrefix === 'aura2en') {
     return [
@@ -132,6 +133,76 @@ export function voicesForProvider(p: Provider): VoiceMeta[] {
   return GEMINI_NAMES.map((n) => ({ id: `gemini:${n}`, label: n }));
 }
 
+// ----- DSP helpers -----
+
+/**
+ * Linear-interpolation resampler. Used for two distinct jobs:
+ *   - true sample-rate conversion (source rate → 24 kHz)
+ *   - duration-fit by treating srcRate/dstRate as a virtual playback ratio
+ * Pitch shifts when the ratio ≠ 1. Acceptable for ±20% time-fit. v2 = SoundTouch.
+ */
+export function resamplePcm(input: Int16Array, srcRate: number, dstRate: number): Int16Array {
+  if (input.length === 0) return new Int16Array(0);
+  if (srcRate === dstRate) return input;
+  const ratio = srcRate / dstRate;
+  const dstLen = Math.max(1, Math.floor(input.length / ratio));
+  const out = new Int16Array(dstLen);
+  for (let i = 0; i < dstLen; i++) {
+    const srcIdx = i * ratio;
+    const lo = Math.floor(srcIdx);
+    const hi = Math.min(lo + 1, input.length - 1);
+    const frac = srcIdx - lo;
+    out[i] = Math.round(input[lo]! * (1 - frac) + input[hi]! * frac);
+  }
+  return out;
+}
+
+/**
+ * Stretch/compress PCM so its play length matches targetMs at sampleRate.
+ * Implementation: nearest-integer ratio resample. ±20% sounds natural; beyond
+ * that the pitch shifts noticeably.
+ */
+export function fitToDuration(pcm: Int16Array, sampleRate: number, targetMs: number): Int16Array {
+  const targetSamples = Math.floor((targetMs / 1000) * sampleRate);
+  if (targetSamples <= 0 || pcm.length === 0) return new Int16Array(targetSamples);
+  if (targetSamples === pcm.length) return pcm;
+  // virtual src rate so resampler emits exactly targetSamples samples
+  const virtualSrcRate = sampleRate * (pcm.length / targetSamples);
+  return resamplePcm(pcm, virtualSrcRate, sampleRate);
+}
+
+export interface SnippetRender {
+  pcm: Int16Array;
+  sampleRate: number;
+  startMs: number;
+  durationMs: number;
+}
+
+/**
+ * Mix N already-PCM snippets into one buffer.
+ * Each snippet is fitted to its slot, then copied at its startMs offset.
+ * Gaps stay zero-filled (silence).
+ */
+export function mixSnippetsToPcm(
+  snippets: SnippetRender[],
+  totalMs: number,
+  outRate: number,
+): Int16Array {
+  const totalSamples = Math.floor((totalMs / 1000) * outRate);
+  const out = new Int16Array(totalSamples);
+  for (const s of snippets) {
+    // Normalize sample rate first (so durations are measured in the same units),
+    // then stretch to fit the slot.
+    const rateAligned = s.sampleRate === outRate ? s.pcm : resamplePcm(s.pcm, s.sampleRate, outRate);
+    const fitted = fitToDuration(rateAligned, outRate, s.durationMs);
+    const startSample = Math.floor((s.startMs / 1000) * outRate);
+    const writeLen = Math.min(fitted.length, totalSamples - startSample);
+    if (writeLen > 0) out.set(fitted.subarray(0, writeLen), startSample);
+  }
+  return out;
+}
+
+// ----- DB rows -----
 interface JobRow {
   id: string;
   tenant_id: string;
@@ -150,16 +221,41 @@ interface JobRow {
   error: string | null;
   created_at: number;
   rendered_at: number | null;
+  total_duration_ms: number | null;
+}
+interface SnippetRow {
+  id: string;
+  job_id: string;
+  position: number;
+  start_ms: number;
+  duration_ms: number;
+  script_text: string;
+  voice_id: string;
+  model: string;
+  language: string;
+  speed: string;
+  created_at: number;
 }
 
-function rowToJson(r: JobRow): Record<string, unknown> {
+function snippetToJson(r: SnippetRow): Record<string, unknown> {
   return {
     id: r.id,
-    title: r.title ?? '',
+    position: r.position,
+    startMs: r.start_ms,
+    durationMs: r.duration_ms,
     scriptText: r.script_text,
     voiceId: r.voice_id,
     model: r.model,
     language: r.language,
+    speed: r.speed,
+  };
+}
+
+function rowToJson(r: JobRow, snippets: SnippetRow[] = []): Record<string, unknown> {
+  return {
+    id: r.id,
+    title: r.title ?? '',
+    totalDurationMs: r.total_duration_ms ?? r.duration_ms ?? null,
     format: r.format,
     chars: r.chars,
     durationMs: r.duration_ms,
@@ -169,21 +265,83 @@ function rowToJson(r: JobRow): Record<string, unknown> {
     createdAt: r.created_at,
     renderedAt: r.rendered_at,
     audioUrl: `/api/voiceovers/${r.id}/audio`,
+    snippets: snippets.map(snippetToJson),
   };
 }
 
-interface CreateBody {
+interface ClientSnippet {
+  startMs?: unknown;
+  durationMs?: unknown;
   scriptText?: unknown;
   voiceId?: unknown;
   language?: unknown;
-  title?: unknown;
   speed?: unknown;
 }
 
-/**
- * Route dispatcher. Returns null if the path isn't ours, letting the worker
- * fall through to the SPA. All responses are JSON or audio bytes.
- */
+interface CreateBody {
+  title?: unknown;
+  totalDurationMs?: unknown;
+  snippets?: unknown;
+}
+
+interface ValidSnippet {
+  startMs: number;
+  durationMs: number;
+  scriptText: string;
+  voiceId: string;
+  language: string;
+  speed: Speed;
+}
+
+function validateSnippets(
+  raw: unknown,
+  totalDurationMs: number,
+): { ok: true; snippets: ValidSnippet[] } | { ok: false; error: string } {
+  if (!Array.isArray(raw)) return { ok: false, error: 'snippets must be an array' };
+  if (raw.length === 0) return { ok: false, error: 'project must contain at least one snippet' };
+  if (raw.length > MAX_SNIPPETS) return { ok: false, error: `too many snippets (max ${MAX_SNIPPETS})` };
+
+  const out: ValidSnippet[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const s = raw[i] as ClientSnippet;
+    const startMs = Number(s.startMs);
+    const durationMs = Number(s.durationMs);
+    const scriptText = typeof s.scriptText === 'string' ? s.scriptText.trim() : '';
+    const voiceId = typeof s.voiceId === 'string' ? s.voiceId : '';
+    const language = typeof s.language === 'string' ? s.language : 'en-US';
+    const speed: Speed = s.speed === 'slow' || s.speed === 'fast' ? s.speed : 'normal';
+
+    if (!Number.isFinite(startMs) || startMs < 0) return { ok: false, error: `snippet ${i}: bad startMs` };
+    if (!Number.isFinite(durationMs) || durationMs < MIN_SNIPPET_DURATION_MS) {
+      return { ok: false, error: `snippet ${i}: durationMs must be ≥ ${MIN_SNIPPET_DURATION_MS}` };
+    }
+    if (startMs + durationMs > totalDurationMs) {
+      return { ok: false, error: `snippet ${i}: extends past project end` };
+    }
+    if (!scriptText) return { ok: false, error: `snippet ${i}: scriptText required` };
+    if (scriptText.length > MAX_CHARS_PER_SNIPPET) {
+      return { ok: false, error: `snippet ${i}: script exceeds ${MAX_CHARS_PER_SNIPPET} chars` };
+    }
+    if (!voiceId) return { ok: false, error: `snippet ${i}: voiceId required` };
+
+    // voice ↔ language consistency
+    const provider = pickProvider(language);
+    const valid = new Set(voicesForProvider(provider).map((v) => v.id));
+    if (!valid.has(voiceId)) {
+      return { ok: false, error: `snippet ${i}: voice "${voiceId}" not valid for language "${language}"` };
+    }
+    out.push({ startMs, durationMs, scriptText, voiceId, language, speed });
+  }
+  // Sort + overlap check
+  out.sort((a, b) => a.startMs - b.startMs);
+  for (let i = 1; i < out.length; i++) {
+    if (out[i]!.startMs < out[i - 1]!.startMs + out[i - 1]!.durationMs) {
+      return { ok: false, error: `snippets ${i - 1} and ${i} overlap` };
+    }
+  }
+  return { ok: true, snippets: out };
+}
+
 export async function handleVoiceoverApi(
   request: Request,
   env: Env,
@@ -195,12 +353,10 @@ export async function handleVoiceoverApi(
   const method = request.method;
 
   if (!path.startsWith('/api/voiceovers')) return null;
-
-  // Public sub-paths still need auth — voiceovers is fully tenant-scoped.
   if (!authResult) return err(401, 'unauthorized');
   const auth = authResult;
 
-  // GET /api/voiceovers/voices?lang=xx-XX  — voice list for routed provider
+  // GET /api/voiceovers/voices?lang=xx-XX
   if (path === '/api/voiceovers/voices' && method === 'GET') {
     const lang = url.searchParams.get('lang') ?? 'en-US';
     const provider = pickProvider(lang);
@@ -213,92 +369,130 @@ export async function handleVoiceoverApi(
     });
   }
 
-  // GET /api/voiceovers  — list jobs for tenant
+  // GET /api/voiceovers — list
   if (path === '/api/voiceovers' && method === 'GET') {
     const { results } = await env.DB.prepare(
-      `SELECT * FROM voiceover_jobs WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 200`,
+      'SELECT * FROM voiceover_jobs WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 200',
     )
       .bind(auth.tenantId)
       .all<JobRow>();
-    return json({ voiceovers: results.map(rowToJson) });
+    // Snippet counts in a single follow-up query.
+    const counts = new Map<string, number>();
+    if (results.length > 0) {
+      const ids = results.map((r) => r.id);
+      const placeholders = ids.map(() => '?').join(',');
+      const { results: cs } = await env.DB.prepare(
+        `SELECT job_id, COUNT(*) as n FROM voiceover_snippets WHERE job_id IN (${placeholders}) GROUP BY job_id`,
+      )
+        .bind(...ids)
+        .all<{ job_id: string; n: number }>();
+      for (const c of cs) counts.set(c.job_id, c.n);
+    }
+    return json({
+      voiceovers: results.map((r) => ({
+        ...rowToJson(r),
+        snippetCount: counts.get(r.id) ?? 0,
+      })),
+    });
   }
 
-  // POST /api/voiceovers  — synthesize + persist
+  // POST /api/voiceovers — render timeline
   if (path === '/api/voiceovers' && method === 'POST') {
     const body = (await request.json().catch(() => null)) as CreateBody | null;
     if (!body) return err(400, 'invalid body');
-    const scriptText = typeof body.scriptText === 'string' ? body.scriptText.trim() : '';
-    const voiceId = typeof body.voiceId === 'string' ? body.voiceId : '';
-    const language = typeof body.language === 'string' ? body.language : 'en-US';
-    const title = typeof body.title === 'string' ? body.title.trim() : '';
-    const speed: Speed = body.speed === 'slow' || body.speed === 'fast' ? body.speed : 'normal';
-
-    if (!scriptText) return err(400, 'scriptText is required');
-    if (scriptText.length > MAX_CHARS) return err(400, `script exceeds ${MAX_CHARS} character limit`);
-    if (!voiceId) return err(400, 'voiceId is required');
-
-    const provider = pickProvider(language);
-    const allowedVoices = new Set(voicesForProvider(provider).map((v) => v.id));
-    if (!allowedVoices.has(voiceId)) {
-      return err(400, `voice "${voiceId}" is not valid for language "${language}"`);
-    }
     if (!auth.userId) return err(403, 'user context required');
 
+    const title = typeof body.title === 'string' ? body.title.trim() : '';
+    const totalDurationMs = Number(body.totalDurationMs);
+    if (!Number.isFinite(totalDurationMs) || totalDurationMs < MIN_TOTAL_DURATION_MS ||
+        totalDurationMs > MAX_TOTAL_DURATION_MS) {
+      return err(400, `totalDurationMs must be ${MIN_TOTAL_DURATION_MS}–${MAX_TOTAL_DURATION_MS}`);
+    }
+    const validated = validateSnippets(body.snippets, totalDurationMs);
+    if (!validated.ok) return err(400, validated.error);
+    const snippets = validated.snippets;
+
     const id = uuid();
-    const r2Key = `voiceovers/${auth.tenantId}/${id}.${provider.format}`;
+    const r2Key = `voiceovers/${auth.tenantId}/${id}.wav`;
     const createdAt = now();
+    const env2 = env as unknown as { GOOGLE_AI_API_KEY?: string };
 
-    // Render synchronously (≤2 min audio jobs only — fine within Worker wall-clock).
-    try {
-      const env2 = env as unknown as { GOOGLE_AI_API_KEY?: string };
-      const renderText = expandScript(scriptText, speed, provider);
-      const { bytes, contentType } = await synthesizeTts({
-        ai: env.AI,
-        googleApiKey: env2.GOOGLE_AI_API_KEY,
-        voiceId,
-        text: renderText,
-      });
-
-      await env.RECORDINGS.put(r2Key, bytes, {
-        httpMetadata: { contentType, cacheControl: 'private, max-age=86400' },
-      });
-
-      const durationMs = estimateDuration(scriptText, provider);
-      const costUsdMicro = Math.round((durationMs / 60_000) * provider.pricePerMinUsd * 1_000_000);
-
-      await env.DB.prepare(
-        `INSERT INTO voiceover_jobs
-         (id, tenant_id, user_id, title, script_text, voice_id, model, language, format,
-          chars, duration_ms, cost_usd_micro, r2_key, status, error, created_at, rendered_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', NULL, ?, ?)`,
+    // Insert the job row up front as "rendering" so the UI can show progress
+    // (and a failure row gets cleaned up below if mixing fails).
+    const totalChars = snippets.reduce((n, s) => n + s.scriptText.length, 0);
+    await env.DB.prepare(
+      `INSERT INTO voiceover_jobs
+       (id, tenant_id, user_id, title, script_text, voice_id, model, language, format,
+        chars, duration_ms, cost_usd_micro, r2_key, status, error, created_at, rendered_at, total_duration_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'wav', ?, NULL, NULL, ?, 'rendering', NULL, ?, NULL, ?)`,
+    )
+      .bind(
+        id, auth.tenantId, auth.userId, title || null,
+        // legacy single-script fields snapshot the first snippet for back-compat
+        snippets[0]!.scriptText, snippets[0]!.voiceId, pickProvider(snippets[0]!.language).model,
+        snippets[0]!.language,
+        totalChars, r2Key, createdAt, totalDurationMs,
       )
-        .bind(
-          id, auth.tenantId, auth.userId, title || null, scriptText, voiceId, provider.model,
-          language, provider.format, scriptText.length, durationMs, costUsdMicro, r2Key,
-          createdAt, now(),
-        )
-        .run();
+      .run();
 
-      const row = await env.DB.prepare('SELECT * FROM voiceover_jobs WHERE id = ?').bind(id).first<JobRow>();
-      return json({ voiceover: rowToJson(row!) }, { status: 201 });
+    try {
+      // Render every snippet's TTS in parallel.
+      const renders = await Promise.all(
+        snippets.map(async (s) => {
+          const provider = pickProvider(s.language);
+          const text = expandScript(s.scriptText, s.speed, provider);
+          const { pcm, sampleRate } = await synthesizePcm({
+            ai: env.AI,
+            googleApiKey: env2.GOOGLE_AI_API_KEY,
+            voiceId: s.voiceId,
+            text,
+          });
+          return { pcm, sampleRate, startMs: s.startMs, durationMs: s.durationMs };
+        }),
+      );
+
+      const mixed = mixSnippetsToPcm(renders, totalDurationMs, MIX_SAMPLE_RATE);
+      const pcmBytes = new Uint8Array(mixed.buffer, mixed.byteOffset, mixed.byteLength);
+      const wav = wrapPcmAsWav(pcmBytes, MIX_SAMPLE_RATE, 1, 16);
+
+      await env.RECORDINGS.put(r2Key, wav, {
+        httpMetadata: { contentType: 'audio/wav', cacheControl: 'private, max-age=86400' },
+      });
+
+      // Persist snippet rows + flip job to ready, in one batch.
+      const stmts = [
+        env.DB.prepare(
+          `UPDATE voiceover_jobs SET status='ready', duration_ms=?, rendered_at=? WHERE id=?`,
+        ).bind(totalDurationMs, now(), id),
+        ...snippets.map((s, idx) =>
+          env.DB.prepare(
+            `INSERT INTO voiceover_snippets
+             (id, job_id, position, start_ms, duration_ms, script_text, voice_id, model, language, speed, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).bind(
+            uuid(), id, idx, s.startMs, s.durationMs, s.scriptText, s.voiceId,
+            pickProvider(s.language).model, s.language, s.speed, createdAt,
+          ),
+        ),
+      ];
+      await env.DB.batch(stmts);
+
+      const jobRow = await env.DB.prepare('SELECT * FROM voiceover_jobs WHERE id = ?')
+        .bind(id).first<JobRow>();
+      const { results: snipRows } = await env.DB.prepare(
+        'SELECT * FROM voiceover_snippets WHERE job_id = ? ORDER BY position ASC',
+      ).bind(id).all<SnippetRow>();
+      return json({ voiceover: rowToJson(jobRow!, snipRows) }, { status: 201 });
     } catch (e) {
       const msg = (e as Error).message.slice(0, 500);
       await env.DB.prepare(
-        `INSERT INTO voiceover_jobs
-         (id, tenant_id, user_id, title, script_text, voice_id, model, language, format,
-          chars, duration_ms, cost_usd_micro, r2_key, status, error, created_at, rendered_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 'failed', ?, ?, NULL)`,
-      )
-        .bind(
-          id, auth.tenantId, auth.userId, title || null, scriptText, voiceId, provider.model,
-          language, provider.format, scriptText.length, r2Key, msg, createdAt,
-        )
-        .run();
+        `UPDATE voiceover_jobs SET status='failed', error=? WHERE id=?`,
+      ).bind(msg, id).run();
       return err(500, msg || 'render failed');
     }
   }
 
-  // GET /api/voiceovers/:id/audio  — stream the audio bytes
+  // GET /api/voiceovers/:id/audio
   const audioMatch = path.match(/^\/api\/voiceovers\/([a-f0-9-]+)\/audio$/);
   if (audioMatch && method === 'GET') {
     const id = audioMatch[1]!;
@@ -311,7 +505,7 @@ export async function handleVoiceoverApi(
     if (row.status !== 'ready') return err(409, `voiceover is ${row.status}`);
     const obj = await env.RECORDINGS.get(row.r2_key);
     if (!obj) return err(404, 'audio missing');
-    const contentType = row.format === 'wav' ? 'audio/wav' : 'audio/mpeg';
+    const contentType = row.format === 'mp3' ? 'audio/mpeg' : 'audio/wav';
     return new Response(obj.body, {
       headers: {
         'content-type': obj.httpMetadata?.contentType ?? contentType,
@@ -320,7 +514,7 @@ export async function handleVoiceoverApi(
     });
   }
 
-  // GET /api/voiceovers/:id  — single row
+  // GET /api/voiceovers/:id
   const oneMatch = path.match(/^\/api\/voiceovers\/([a-f0-9-]+)$/);
   if (oneMatch && method === 'GET') {
     const id = oneMatch[1]!;
@@ -328,7 +522,10 @@ export async function handleVoiceoverApi(
       .bind(id, auth.tenantId)
       .first<JobRow>();
     if (!row) return err(404, 'voiceover not found');
-    return json({ voiceover: rowToJson(row) });
+    const { results: snips } = await env.DB.prepare(
+      'SELECT * FROM voiceover_snippets WHERE job_id = ? ORDER BY position ASC',
+    ).bind(id).all<SnippetRow>();
+    return json({ voiceover: rowToJson(row, snips) });
   }
 
   // DELETE /api/voiceovers/:id
@@ -341,24 +538,14 @@ export async function handleVoiceoverApi(
       .first<{ r2_key: string }>();
     if (!row) return err(404, 'voiceover not found');
     await env.RECORDINGS.delete(row.r2_key).catch(() => {});
-    await env.DB.prepare('DELETE FROM voiceover_jobs WHERE id = ? AND tenant_id = ?')
-      .bind(id, auth.tenantId)
-      .run();
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM voiceover_snippets WHERE job_id = ?').bind(id),
+      env.DB.prepare('DELETE FROM voiceover_jobs WHERE id = ? AND tenant_id = ?').bind(id, auth.tenantId),
+    ]);
     return json({ ok: true });
   }
 
   return err(404, 'not found');
 }
 
-/**
- * Coarse duration estimate from char count. English ~15 chars/sec at natural pace;
- * Spanish slightly faster; Gemini's expressive style runs slower. Good enough
- * for cost attribution + UI duration badge; replace with actual audio probe if needed.
- */
-function estimateDuration(text: string, provider: Provider): number {
-  const charsPerSec = provider.voicePrefix === 'gemini' ? 12 : 15;
-  return Math.round((text.length / charsPerSec) * 1000);
-}
-
-// Re-export the auth helper to keep the module's import surface flat.
 export { authenticate };

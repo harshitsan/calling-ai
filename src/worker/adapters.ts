@@ -35,7 +35,7 @@ function base64ToBytes(b64: string): Uint8Array {
   return out;
 }
 
-function wrapPcmAsWav(pcm: Uint8Array, sampleRate: number, channels = 1, bps = 16): Uint8Array {
+export function wrapPcmAsWav(pcm: Uint8Array, sampleRate: number, channels = 1, bps = 16): Uint8Array {
   const headerSize = 44;
   const byteRate = (sampleRate * channels * bps) / 8;
   const blockAlign = (channels * bps) / 8;
@@ -178,6 +178,87 @@ export async function synthesizeTts(args: {
   const res = await args.ai.run(model as never, ttsParams(model, args.text, speaker) as never);
   const bytes = await toBytes(res);
   return { bytes, contentType: 'audio/mpeg' };
+}
+
+/**
+ * Synthesize TTS as raw 16-bit signed mono PCM at a known sample rate.
+ *
+ * Aura is asked for `linear16` directly (skipping our worker's mp3 decode).
+ * Gemini already streams PCM — we aggregate and report its native rate.
+ * Both branches normalize to little-endian Int16 mono.
+ *
+ * Used by the voiceover timeline renderer where we need to slice, resample,
+ * and mix multiple TTS outputs into one offset-aligned WAV.
+ */
+export async function synthesizePcm(args: {
+  ai: Ai;
+  googleApiKey?: string;
+  voiceId: string;
+  text: string;
+}): Promise<{ pcm: Int16Array; sampleRate: number }> {
+  const { model, speaker } = resolveVoice(args.voiceId);
+
+  if (model.startsWith('google/')) {
+    if (!args.googleApiKey) throw new Error('GOOGLE_AI_API_KEY not configured');
+    const chunks: { bytes: Uint8Array; sampleRate: number }[] = [];
+    for await (const c of streamGeminiTts(args.googleApiKey, args.text, speaker)) {
+      chunks.push(c);
+    }
+    if (chunks.length === 0) throw new Error('Gemini returned no audio');
+    const sampleRate = chunks[0]!.sampleRate;
+    const totalBytes = chunks.reduce((n, c) => n + c.bytes.length, 0);
+    const merged = new Uint8Array(totalBytes);
+    let off = 0;
+    for (const c of chunks) {
+      merged.set(c.bytes, off);
+      off += c.bytes.length;
+    }
+    return { pcm: bytesToInt16Le(merged), sampleRate };
+  }
+
+  // Aura via Workers AI — request linear16 PCM directly.
+  const res = await args.ai.run(model as never, {
+    text: args.text,
+    speaker,
+    encoding: 'linear16',
+    sample_rate: 24000,
+    container: 'none',
+  } as never);
+  const bytes = await toBytes(res);
+  if (bytes.length === 0) throw new Error('Aura returned no audio');
+  // If Workers AI ignored `container: 'none'` and wrapped the PCM in a WAV
+  // header, transparently strip the 44-byte prefix.
+  const stripped = stripWavHeader(bytes);
+  return { pcm: bytesToInt16Le(stripped), sampleRate: 24000 };
+}
+
+function bytesToInt16Le(bytes: Uint8Array): Int16Array {
+  // Copy into an aligned buffer in case `bytes.byteOffset` is odd.
+  const len = bytes.length - (bytes.length % 2);
+  const out = new Int16Array(len / 2);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, len);
+  for (let i = 0; i < out.length; i++) out[i] = dv.getInt16(i * 2, true);
+  return out;
+}
+
+function stripWavHeader(bytes: Uint8Array): Uint8Array {
+  // Detect "RIFF....WAVE" magic; if present, locate the "data" subchunk.
+  if (bytes.length < 44) return bytes;
+  if (
+    bytes[0] !== 0x52 || bytes[1] !== 0x49 || bytes[2] !== 0x46 || bytes[3] !== 0x46 ||
+    bytes[8] !== 0x57 || bytes[9] !== 0x41 || bytes[10] !== 0x56 || bytes[11] !== 0x45
+  ) {
+    return bytes; // not a WAV — assume raw PCM
+  }
+  for (let i = 12; i < bytes.length - 8; i++) {
+    if (
+      bytes[i] === 0x64 && bytes[i + 1] === 0x61 &&
+      bytes[i + 2] === 0x74 && bytes[i + 3] === 0x61
+    ) {
+      return bytes.subarray(i + 8);
+    }
+  }
+  return bytes.subarray(44);
 }
 
 async function sha256Hex(s: string): Promise<string> {
