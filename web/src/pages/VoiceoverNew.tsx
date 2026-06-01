@@ -122,6 +122,7 @@ export function VoiceoverNew() {
 
   // Voices cache keyed by language so switching a snippet is instant.
   const [voicesByLang, setVoicesByLang] = useState<Record<string, VoicesResponse>>({});
+  const [genderFilter, setGenderFilter] = useState<'all' | 'female' | 'male'>('all');
   const [previewingId, setPreviewingId] = useState<string | null>(null);
   const audioPreviewRef = useRef<HTMLAudioElement | null>(null);
 
@@ -337,6 +338,13 @@ export function VoiceoverNew() {
     ? selectedVoices.voices.find((v) => v.id === selected.voiceId)
     : undefined;
   const isGemini = selectedVoices?.model.startsWith('google/') ?? false;
+  const hasGenderData = (selectedVoices?.voices ?? []).some((v) => v.gender);
+  const filteredVoices = !selectedVoices
+    ? []
+    : !hasGenderData || genderFilter === 'all'
+      ? selectedVoices.voices
+      : selectedVoices.voices.filter((v) => v.gender === genderFilter);
+  const genderGlyph = (g?: 'female' | 'male') => (g === 'female' ? '♀' : g === 'male' ? '♂' : '');
 
   const resultAudioSrc = useMemo(() => {
     if (!result) return '';
@@ -563,31 +571,70 @@ export function VoiceoverNew() {
                   Loading voices…
                 </div>
               ) : (
-                <div className="mt-1.5 flex gap-2">
-                  <Select
-                    value={selected.voiceId || selectedVoices.voices[0]?.id || ''}
-                    onChange={(e) => updateSnippet(selected.localId, { voiceId: e.target.value })}
-                    className="flex-1"
-                  >
-                    {selectedVoices.voices.map((v) => (
-                      <option key={v.id} value={v.id}>
-                        {v.label}{v.gender ? ` · ${v.gender}` : ''}
-                      </option>
-                    ))}
-                  </Select>
-                  <button
-                    type="button"
-                    onClick={() => selectedVoice && previewVoice(selectedVoice, selected.language)}
-                    className="shrink-0 h-10 w-10 rounded-md border border-white/[0.08] bg-white/[0.04] hover:bg-white/[0.08] flex items-center justify-center"
-                    aria-label="Preview voice"
-                  >
-                    {previewingId === selectedVoice?.id ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <Play className="h-3.5 w-3.5" />
-                    )}
-                  </button>
-                </div>
+                <>
+                  {hasGenderData && (
+                    <div className="flex gap-1.5 mt-1.5 mb-2">
+                      {(['all', 'female', 'male'] as const).map((g) => (
+                        <button
+                          key={g}
+                          type="button"
+                          onClick={() => setGenderFilter(g)}
+                          className={cn(
+                            'rounded-full border px-3 py-1 text-[10px] uppercase tracking-[0.18em] transition-all',
+                            genderFilter === g
+                              ? 'bg-white/[0.07] border-white/[0.12] text-foreground/95'
+                              : 'border-white/[0.06] bg-white/[0.02] text-muted-foreground hover:text-foreground/90',
+                          )}
+                        >
+                          {g === 'female' ? '♀ Female' : g === 'male' ? '♂ Male' : 'All'}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <div className="flex gap-2">
+                    <Select
+                      value={selected.voiceId || filteredVoices[0]?.id || ''}
+                      onChange={(e) => updateSnippet(selected.localId, { voiceId: e.target.value })}
+                      className="flex-1"
+                    >
+                      {filteredVoices.map((v) => {
+                        const g = genderGlyph(v.gender);
+                        return (
+                          <option key={v.id} value={v.id}>
+                            {g ? `${g}  ${v.label}` : v.label}
+                          </option>
+                        );
+                      })}
+                    </Select>
+                    <button
+                      type="button"
+                      onClick={() => selectedVoice && previewVoice(selectedVoice, selected.language)}
+                      className="shrink-0 h-10 w-10 rounded-md border border-white/[0.08] bg-white/[0.04] hover:bg-white/[0.08] flex items-center justify-center"
+                      aria-label="Preview voice"
+                    >
+                      {previewingId === selectedVoice?.id ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Play className="h-3.5 w-3.5" />
+                      )}
+                    </button>
+                  </div>
+                  {selectedVoice && (
+                    <p className="mt-1.5 text-[11px] text-muted-foreground/80">
+                      Selected: <span className="text-foreground/90">{selectedVoice.label}</span>
+                      {selectedVoice.gender && (
+                        <span className="ml-1.5 inline-flex items-center gap-1 rounded-full bg-white/[0.05] border border-white/[0.07] px-2 py-[1px] text-[10px] uppercase tracking-[0.16em] text-foreground/80">
+                          {genderGlyph(selectedVoice.gender)} {selectedVoice.gender}
+                        </span>
+                      )}
+                      {!selectedVoice.gender && (
+                        <span className="ml-1.5 text-[10px] uppercase tracking-[0.16em] text-muted-foreground/60">
+                          gender unlabeled
+                        </span>
+                      )}
+                    </p>
+                  )}
+                </>
               )}
             </div>
           </div>
