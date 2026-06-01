@@ -23,9 +23,10 @@ import { cn } from '@/lib/utils';
 const MAX_CHARS = 5000;
 
 const LANGUAGES = [
-  { code: 'en-US', label: 'English (US)' },
-  { code: 'en-GB', label: 'English (UK)' },
-  { code: 'es', label: 'Spanish' },
+  { code: 'multi', label: 'Multilingual (Gemini)' },
+  { code: 'en-US', label: 'English (US) — Aura HD' },
+  { code: 'en-GB', label: 'English (UK) — Aura HD' },
+  { code: 'es', label: 'Spanish — Aura HD' },
   { code: 'fr', label: 'French' },
   { code: 'de', label: 'German' },
   { code: 'it', label: 'Italian' },
@@ -34,6 +35,8 @@ const LANGUAGES = [
   { code: 'ja', label: 'Japanese' },
   { code: 'zh', label: 'Chinese' },
 ] as const;
+
+const DEFAULT_LANGUAGE = 'multi';
 
 const DURATION_PRESETS = [
   { label: '15s', ms: 15_000 },
@@ -147,9 +150,9 @@ export function VoiceoverNew() {
     if (selected) loadVoicesFor(selected.language).catch(() => {});
   }, [selected, loadVoicesFor]);
 
-  // Eagerly load en-US so the first snippet has voices ready.
+  // Eagerly load the default language so the first snippet has voices ready.
   useEffect(() => {
-    loadVoicesFor('en-US').catch(() => {});
+    loadVoicesFor(DEFAULT_LANGUAGE).catch(() => {});
   }, [loadVoicesFor]);
 
   useEffect(() => () => audioPreviewRef.current?.pause(), []);
@@ -180,13 +183,18 @@ export function VoiceoverNew() {
     const duration = Math.min(DEFAULT_SNIPPET_MS, gap.max);
     const sorted = sortedSnippets(snippets);
     const prev = sorted.length > 0 ? sorted[sorted.length - 1] : undefined;
+    const defaultLang = prev?.language ?? DEFAULT_LANGUAGE;
+    const defaultVoice =
+      prev?.voiceId ??
+      voicesByLang[defaultLang]?.voices[0]?.id ??
+      'gemini:Zephyr';
     const newSnip: Snippet = {
       localId: uid(),
       startMs: gap.start,
       durationMs: duration,
       scriptText: '',
-      voiceId: prev?.voiceId ?? (voicesByLang['en-US']?.voices[0]?.id ?? 'aura2en:asteria'),
-      language: prev?.language ?? 'en-US',
+      voiceId: defaultVoice,
+      language: defaultLang,
       speed: 'normal',
     };
     setSnippets((cur) => [...cur, newSnip]);
