@@ -80,6 +80,7 @@ export function VoiceoverNew() {
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<CreateResponse['voiceover'] | null>(null);
+  const [customPauseSec, setCustomPauseSec] = useState('1.5');
 
   const scriptRef = useRef<HTMLTextAreaElement | null>(null);
   const audioPreviewRef = useRef<HTMLAudioElement | null>(null);
@@ -112,10 +113,12 @@ export function VoiceoverNew() {
   const chars = script.length;
   const overLimit = chars > MAX_CHARS;
 
-  function insertPauseToken(kind: 'short' | 'medium' | 'long') {
+  function insertPauseSeconds(seconds: number) {
+    const s = Math.max(0.05, Math.min(10, seconds));
+    const display = Number.isInteger(s) ? `${s}s` : `${s.toFixed(2).replace(/\.?0+$/, '')}s`;
+    const token = `[pause:${display}]`;
     const ta = scriptRef.current;
-    const token = `[pause:${kind}]`;
-    if (!ta) { setScript((s) => s + token); return; }
+    if (!ta) { setScript((cur) => cur + token); return; }
     const start = ta.selectionStart;
     const end = ta.selectionEnd;
     const next = script.slice(0, start) + token + script.slice(end);
@@ -316,19 +319,53 @@ export function VoiceoverNew() {
             <span className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground/60 mr-1">
               Insert pause
             </span>
-            {(['short', 'medium', 'long'] as const).map((k) => (
+            {[0.5, 1, 2].map((sec) => (
               <button
-                key={k}
+                key={sec}
                 type="button"
-                onClick={() => insertPauseToken(k)}
+                onClick={() => insertPauseSeconds(sec)}
                 className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.07] bg-white/[0.02] px-3 py-1 text-[11px] text-muted-foreground hover:text-foreground/95 hover:bg-white/[0.05] transition-colors"
-                title={`Insert a ${k} pause at the cursor`}
+                title={`Insert a ${sec}s pause at the cursor`}
               >
-                <PauseIcon className="h-3 w-3" /> {k}
+                <PauseIcon className="h-3 w-3" /> {sec}s
               </button>
             ))}
+            <span className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground/40 px-1">or</span>
+            <div className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.07] bg-white/[0.02] pl-3 pr-1 py-0.5 text-[11px]">
+              <input
+                type="number"
+                inputMode="decimal"
+                step="0.1"
+                min={0.1}
+                max={10}
+                value={customPauseSec}
+                onChange={(e) => setCustomPauseSec(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const n = Number(customPauseSec);
+                    if (Number.isFinite(n) && n > 0) insertPauseSeconds(n);
+                  }
+                }}
+                className="w-12 bg-transparent text-foreground/95 outline-none text-right tabular-nums"
+                aria-label="Custom pause seconds"
+              />
+              <span className="text-muted-foreground/70">s</span>
+              <button
+                type="button"
+                onClick={() => {
+                  const n = Number(customPauseSec);
+                  if (Number.isFinite(n) && n > 0) insertPauseSeconds(n);
+                }}
+                className="ml-1 h-6 w-6 rounded-full bg-white/[0.05] hover:bg-white/[0.1] flex items-center justify-center text-foreground/80"
+                aria-label="Insert custom pause"
+                title="Insert custom pause"
+              >
+                +
+              </button>
+            </div>
             <span className="ml-auto text-[10px] text-muted-foreground/50 italic">
-              Tokens stay visible; we expand them at render.
+              Exact silence is spliced into the audio.
             </span>
           </div>
           <Textarea

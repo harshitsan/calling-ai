@@ -87,6 +87,8 @@ export function expandScript(text: string, speed: Speed, provider: Provider): st
     .replace(/\[pause:short\]/gi, ', ')
     .replace(/\[pause:medium\]/gi, '. ')
     .replace(/\[pause:long\]/gi, '... ')
+    .replace(/\[pause:\d+(?:\.\d+)?s\]/gi, '... ')  // legacy fallback if used outside the splice path
+    .replace(/\[pause:\d+ms\]/gi, '... ')
     .trim();
   if (speed === 'normal' || provider.voicePrefix !== 'gemini') return expanded;
   const directive =
@@ -94,6 +96,51 @@ export function expandScript(text: string, speed: Speed, provider: Provider): st
       ? 'Speak at a slow, measured pace.'
       : 'Speak at a brisk, energetic pace.';
   return `${directive} ${expanded}`;
+}
+
+/**
+ * Parse a script into alternating text and silence segments.
+ * Recognized pause tokens:
+ *   [pause:1.5s]   precise seconds
+ *   [pause:750ms]  precise milliseconds
+ *   [pause:short]  legacy preset (500 ms)
+ *   [pause:medium] legacy preset (1000 ms)
+ *   [pause:long]   legacy preset (2000 ms)
+ *
+ * Splice mode renders silence for exact-duration control; the legacy
+ * presets keep working with sensible defaults.
+ */
+export type Segment =
+  | { kind: 'text'; value: string }
+  | { kind: 'silence'; durationMs: number };
+
+export function parseSegments(text: string): Segment[] {
+  const re = /\[pause:(?:(\d+(?:\.\d+)?)s|(\d+)ms|(short|medium|long))\]/gi;
+  const out: Segment[] = [];
+  let lastEnd = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > lastEnd) {
+      const before = text.slice(lastEnd, m.index);
+      if (before.trim() !== '') out.push({ kind: 'text', value: before });
+    }
+    let durationMs = 0;
+    if (m[1]) durationMs = Math.round(parseFloat(m[1]) * 1000);
+    else if (m[2]) durationMs = parseInt(m[2], 10);
+    else if (m[3]) {
+      const k = m[3].toLowerCase();
+      durationMs = k === 'short' ? 500 : k === 'medium' ? 1000 : 2000;
+    }
+    // Clamp 50 ms .. 10 s so a typo can't allocate huge buffers.
+    durationMs = Math.max(50, Math.min(10_000, durationMs));
+    out.push({ kind: 'silence', durationMs });
+    lastEnd = m.index + m[0].length;
+  }
+  if (lastEnd < text.length) {
+    const tail = text.slice(lastEnd);
+    if (tail.trim() !== '') out.push({ kind: 'text', value: tail });
+  }
+  return out;
 }
 
 // ----- Voice catalogue (server-side source of truth) -----
@@ -422,26 +469,74 @@ export async function handleVoiceoverApi(
       if (!valid.has(voiceId)) {
         return err(400, `voice "${voiceId}" is not valid for language "${language}"`);
       }
+
+      const segments = parseSegments(scriptText);
+      const hasSilenceSplice = segments.some((s) => s.kind === 'silence');
       const id = uuid();
-      const r2Key = `voiceovers/${auth.tenantId}/${id}.${provider.format}`;
+      const format: 'mp3' | 'wav' = hasSilenceSplice ? 'wav' : provider.format;
+      const r2Key = `voiceovers/${auth.tenantId}/${id}.${format}`;
       const createdAt = now();
+      const env2 = env as unknown as { GOOGLE_AI_API_KEY?: string };
+
       try {
-        const env2 = env as unknown as { GOOGLE_AI_API_KEY?: string };
-        const renderText = expandScript(scriptText, 'normal', provider);
-        // Use the existing synthesizeTts (whatever format the provider emits).
-        const { synthesizeTts } = await import('./adapters');
-        const { bytes, contentType } = await synthesizeTts({
-          ai: env.AI,
-          googleApiKey: env2.GOOGLE_AI_API_KEY,
-          voiceId,
-          text: renderText,
-        });
+        let bytes: Uint8Array;
+        let contentType: string;
+        let renderedMs: number;
+
+        if (!hasSilenceSplice) {
+          // Fast path: no precise pauses requested. Synthesize once, save native format.
+          const { synthesizeTts } = await import('./adapters');
+          const out = await synthesizeTts({
+            ai: env.AI,
+            googleApiKey: env2.GOOGLE_AI_API_KEY,
+            voiceId,
+            text: scriptText,
+          });
+          bytes = out.bytes;
+          contentType = out.contentType;
+          const cps = provider.voicePrefix === 'gemini' ? 12 : 15;
+          renderedMs = Math.round((scriptText.length / cps) * 1000);
+        } else {
+          // Splice path: synthesize each text segment to PCM, insert exact-duration
+          // silence between segments, concatenate, wrap as WAV. Output is always WAV
+          // because we need to work in PCM to splice precisely.
+          const parts: Int16Array[] = [];
+          let silenceTotalMs = 0;
+          let speechTotalMs = 0;
+          for (const seg of segments) {
+            if (seg.kind === 'text') {
+              const { pcm, sampleRate } = await synthesizePcm({
+                ai: env.AI,
+                googleApiKey: env2.GOOGLE_AI_API_KEY,
+                voiceId,
+                text: seg.value,
+              });
+              const aligned = sampleRate === MIX_SAMPLE_RATE
+                ? pcm
+                : resamplePcm(pcm, sampleRate, MIX_SAMPLE_RATE);
+              parts.push(aligned);
+              speechTotalMs += Math.round((aligned.length / MIX_SAMPLE_RATE) * 1000);
+            } else {
+              const samples = Math.round((seg.durationMs / 1000) * MIX_SAMPLE_RATE);
+              parts.push(new Int16Array(samples));
+              silenceTotalMs += seg.durationMs;
+            }
+          }
+          const total = parts.reduce((n, p) => n + p.length, 0);
+          const merged = new Int16Array(total);
+          let off = 0;
+          for (const p of parts) { merged.set(p, off); off += p.length; }
+          const pcmBytes = new Uint8Array(merged.buffer, merged.byteOffset, merged.byteLength);
+          bytes = wrapPcmAsWav(pcmBytes, MIX_SAMPLE_RATE, 1, 16);
+          contentType = 'audio/wav';
+          renderedMs = silenceTotalMs + speechTotalMs;
+        }
+
         await env.RECORDINGS.put(r2Key, bytes, {
           httpMetadata: { contentType, cacheControl: 'private, max-age=86400' },
         });
-        const charsPerSec = provider.voicePrefix === 'gemini' ? 12 : 15;
-        const durationMs = Math.round((scriptText.length / charsPerSec) * 1000);
-        const costUsdMicro = Math.round((durationMs / 60_000) * provider.pricePerMinUsd * 1_000_000);
+
+        const costUsdMicro = Math.round((renderedMs / 60_000) * provider.pricePerMinUsd * 1_000_000);
         await env.DB.prepare(
           `INSERT INTO voiceover_jobs
            (id, tenant_id, user_id, title, script_text, voice_id, model, language, format,
@@ -450,7 +545,7 @@ export async function handleVoiceoverApi(
         )
           .bind(
             id, auth.tenantId, auth.userId, title || null, scriptText, voiceId, provider.model,
-            language, provider.format, scriptText.length, durationMs, costUsdMicro, r2Key,
+            language, format, scriptText.length, renderedMs, costUsdMicro, r2Key,
             createdAt, now(),
           )
           .run();

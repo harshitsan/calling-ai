@@ -3,6 +3,7 @@ import {
   expandScript,
   fitToDuration,
   mixSnippetsToPcm,
+  parseSegments,
   pickProvider,
   resamplePcm,
   voicesForProvider,
@@ -50,6 +51,55 @@ describe('expandScript', () => {
   it('prepends pacing directive only for Gemini', () => {
     expect(expandScript('Hello.', 'slow', gemini)).toContain('slow');
     expect(expandScript('Hello.', 'slow', aura)).toBe('Hello.');
+  });
+});
+
+describe('parseSegments', () => {
+  it('returns a single text segment when no pauses are present', () => {
+    const segs = parseSegments('Hello world.');
+    expect(segs).toEqual([{ kind: 'text', value: 'Hello world.' }]);
+  });
+  it('parses precise seconds with a decimal', () => {
+    const segs = parseSegments('Hi.[pause:1.5s]There.');
+    expect(segs).toEqual([
+      { kind: 'text', value: 'Hi.' },
+      { kind: 'silence', durationMs: 1500 },
+      { kind: 'text', value: 'There.' },
+    ]);
+  });
+  it('parses precise milliseconds', () => {
+    const segs = parseSegments('A[pause:750ms]B');
+    expect(segs).toEqual([
+      { kind: 'text', value: 'A' },
+      { kind: 'silence', durationMs: 750 },
+      { kind: 'text', value: 'B' },
+    ]);
+  });
+  it('maps legacy short/medium/long to fixed durations', () => {
+    expect(parseSegments('A[pause:short]B')[1]).toEqual({ kind: 'silence', durationMs: 500 });
+    expect(parseSegments('A[pause:medium]B')[1]).toEqual({ kind: 'silence', durationMs: 1000 });
+    expect(parseSegments('A[pause:long]B')[1]).toEqual({ kind: 'silence', durationMs: 2000 });
+  });
+  it('clamps absurd durations into a safe range', () => {
+    // 30s would otherwise allocate way too much.
+    expect(parseSegments('A[pause:30s]B')[1]).toEqual({ kind: 'silence', durationMs: 10_000 });
+    // 5ms clamps up to 50ms.
+    expect(parseSegments('A[pause:5ms]B')[1]).toEqual({ kind: 'silence', durationMs: 50 });
+  });
+  it('handles consecutive pauses', () => {
+    const segs = parseSegments('A[pause:1s][pause:0.5s]B');
+    const silenceParts = segs.filter((s) => s.kind === 'silence');
+    expect(silenceParts).toHaveLength(2);
+    expect(silenceParts[0]).toEqual({ kind: 'silence', durationMs: 1000 });
+    expect(silenceParts[1]).toEqual({ kind: 'silence', durationMs: 500 });
+  });
+  it('drops empty-string text segments between adjacent tokens', () => {
+    const segs = parseSegments('[pause:0.5s][pause:0.5s]');
+    expect(segs.every((s) => s.kind === 'silence')).toBe(true);
+    expect(segs.length).toBe(2);
+  });
+  it('is case-insensitive on the token', () => {
+    expect(parseSegments('A[PAUSE:1S]B')[1]).toEqual({ kind: 'silence', durationMs: 1000 });
   });
 });
 
