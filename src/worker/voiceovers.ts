@@ -282,6 +282,10 @@ interface CreateBody {
   title?: unknown;
   totalDurationMs?: unknown;
   snippets?: unknown;
+  // Simple single-script mode (no timeline) — preserved as the primary UX:
+  scriptText?: unknown;
+  voiceId?: unknown;
+  language?: unknown;
 }
 
 interface ValidSnippet {
@@ -396,13 +400,70 @@ export async function handleVoiceoverApi(
     });
   }
 
-  // POST /api/voiceovers — render timeline
+  // POST /api/voiceovers — render
   if (path === '/api/voiceovers' && method === 'POST') {
     const body = (await request.json().catch(() => null)) as CreateBody | null;
     if (!body) return err(400, 'invalid body');
     if (!auth.userId) return err(403, 'user context required');
 
     const title = typeof body.title === 'string' ? body.title.trim() : '';
+
+    // Simple single-script mode: body has scriptText + voiceId + language, no snippets.
+    if (typeof body.scriptText === 'string' && typeof body.voiceId === 'string') {
+      const scriptText = body.scriptText.trim();
+      const voiceId = body.voiceId;
+      const language = typeof body.language === 'string' ? body.language : 'en-US';
+      if (!scriptText) return err(400, 'scriptText is required');
+      if (scriptText.length > MAX_CHARS_PER_SNIPPET) {
+        return err(400, `script exceeds ${MAX_CHARS_PER_SNIPPET} chars`);
+      }
+      const provider = pickProvider(language);
+      const valid = new Set(voicesForProvider(provider).map((v) => v.id));
+      if (!valid.has(voiceId)) {
+        return err(400, `voice "${voiceId}" is not valid for language "${language}"`);
+      }
+      const id = uuid();
+      const r2Key = `voiceovers/${auth.tenantId}/${id}.${provider.format}`;
+      const createdAt = now();
+      try {
+        const env2 = env as unknown as { GOOGLE_AI_API_KEY?: string };
+        const renderText = expandScript(scriptText, 'normal', provider);
+        // Use the existing synthesizeTts (whatever format the provider emits).
+        const { synthesizeTts } = await import('./adapters');
+        const { bytes, contentType } = await synthesizeTts({
+          ai: env.AI,
+          googleApiKey: env2.GOOGLE_AI_API_KEY,
+          voiceId,
+          text: renderText,
+        });
+        await env.RECORDINGS.put(r2Key, bytes, {
+          httpMetadata: { contentType, cacheControl: 'private, max-age=86400' },
+        });
+        const charsPerSec = provider.voicePrefix === 'gemini' ? 12 : 15;
+        const durationMs = Math.round((scriptText.length / charsPerSec) * 1000);
+        const costUsdMicro = Math.round((durationMs / 60_000) * provider.pricePerMinUsd * 1_000_000);
+        await env.DB.prepare(
+          `INSERT INTO voiceover_jobs
+           (id, tenant_id, user_id, title, script_text, voice_id, model, language, format,
+            chars, duration_ms, cost_usd_micro, r2_key, status, error, created_at, rendered_at, total_duration_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', NULL, ?, ?, NULL)`,
+        )
+          .bind(
+            id, auth.tenantId, auth.userId, title || null, scriptText, voiceId, provider.model,
+            language, provider.format, scriptText.length, durationMs, costUsdMicro, r2Key,
+            createdAt, now(),
+          )
+          .run();
+        const row = await env.DB.prepare('SELECT * FROM voiceover_jobs WHERE id = ?')
+          .bind(id).first<JobRow>();
+        return json({ voiceover: rowToJson(row!) }, { status: 201 });
+      } catch (e) {
+        const msg = (e as Error).message.slice(0, 500);
+        return err(500, msg || 'render failed');
+      }
+    }
+
+    // Timeline mode (legacy): body has totalDurationMs + snippets array.
     const totalDurationMs = Number(body.totalDurationMs);
     if (!Number.isFinite(totalDurationMs) || totalDurationMs < MIN_TOTAL_DURATION_MS ||
         totalDurationMs > MAX_TOTAL_DURATION_MS) {
