@@ -68,8 +68,11 @@ export default {
       }
     }
 
-    // Carrier streaming endpoint — Tata/Twilio Media Streams compatible.
-    if (VOICE_INTEGRATIONS_ENABLED && url.pathname === '/voice/stream/tata') {
+    // Carrier streaming endpoint — Twilio Media Streams format (also spoken
+    // by Tata, Acefone, and others). The /voice/stream/tata alias keeps any
+    // pre-existing carrier-side config working.
+    if (VOICE_INTEGRATIONS_ENABLED &&
+        (url.pathname === '/voice/stream' || url.pathname === '/voice/stream/tata')) {
       return handleTataStream(request, env);
     }
 

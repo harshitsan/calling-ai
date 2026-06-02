@@ -96,7 +96,7 @@ function Step({ n, title, icon, children }: StepProps) {
 export function TataSetup() {
   const wsHost = typeof window !== 'undefined' ? window.location.host : 'YOUR-DOMAIN';
   const wsProto = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws';
-  const wsTata = `${wsProto}://${wsHost}/voice/stream/tata`;
+  const wsCarrier = `${wsProto}://${wsHost}/voice/stream`;
   const clickToCallUrl = `${typeof window !== 'undefined' ? window.location.origin : 'https://your-domain'}/api/voice-integrations/pstn/call`;
 
   const curlExample = `curl -X POST ${clickToCallUrl} \\
@@ -111,7 +111,7 @@ export function TataSetup() {
   const wsClientExample = `// Tata-side configuration in the carrier portal — typically a URL field
 // plus a custom Authorization header.
 
-URL:    ${wsTata}
+URL:    ${wsCarrier}
 Header: Authorization: Bearer cai_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 // Wire envelope (Tata sends to us):
@@ -176,7 +176,7 @@ Header: Authorization: Bearer cai_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
           <p>
             In Tata's portal, configure your DID's bidirectional streaming URL to point at:
           </p>
-          <Code value={wsTata} multiline lang="WebSocket URL" />
+          <Code value={wsCarrier} multiline lang="WebSocket URL" />
           <p>
             Auth goes in <strong>any</strong> of these headers (use whichever Tata's portal lets you set):
           </p>

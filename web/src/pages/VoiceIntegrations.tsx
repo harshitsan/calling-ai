@@ -237,7 +237,7 @@ function StreamingEditor({ data, reload }: { data: StreamingCfg; reload: () => P
   const wsHost = typeof window !== 'undefined' ? window.location.host : 'YOUR-DOMAIN';
   const wsProto = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws';
   const wsRaw = `${wsProto}://${wsHost}/call`;
-  const wsTata = `${wsProto}://${wsHost}/voice/stream/tata`;
+  const wsCarrier = `${wsProto}://${wsHost}/voice/stream`;
 
   async function toggle(next: boolean) {
     setSaving(true);
@@ -291,7 +291,7 @@ function StreamingEditor({ data, reload }: { data: StreamingCfg; reload: () => P
           </p>
           <div className="space-y-2">
             <EndpointRow label="Raw PCM (internal)" url={wsRaw} onCopy={() => copy(wsRaw)} note="16 kHz linear16, 60 ms frames, our JSON envelope." />
-            <EndpointRow label="Tata / Twilio Media Streams" url={wsTata} onCopy={() => copy(wsTata)} note="8 kHz μ-law base64, 20 ms frames, connected/start/media/stop events." />
+            <EndpointRow label="Carrier (Twilio Media Streams)" url={wsCarrier} onCopy={() => copy(wsCarrier)} note="8 kHz μ-law base64, 20 ms frames, connected/start/media/stop. Works for Twilio, Tata, Acefone, and any compatible carrier." />
           </div>
         </div>
 
@@ -352,7 +352,7 @@ function StreamingEditor({ data, reload }: { data: StreamingCfg; reload: () => P
           <div className="mt-2 space-y-1 leading-relaxed">
             <p>• Auth: <code className="text-foreground/85">Authorization: Bearer &lt;key&gt;</code>, <code className="text-foreground/85">X-Api-Key: &lt;key&gt;</code>, or <code className="text-foreground/85">?key=&lt;key&gt;</code> on either endpoint</p>
             <p>• Raw PCM: send 16-bit linear PCM at 16 kHz mono, 60 ms per frame</p>
-            <p>• Tata format: send <code className="text-foreground/85">connected</code> → <code className="text-foreground/85">start</code> → <code className="text-foreground/85">media</code> events with base64 μ-law payload (160-byte chunks); we reply with <code className="text-foreground/85">media</code> / <code className="text-foreground/85">mark</code> / <code className="text-foreground/85">clear</code></p>
+            <p>• Carrier format: send <code className="text-foreground/85">connected</code> → <code className="text-foreground/85">start</code> → <code className="text-foreground/85">media</code> events with base64 μ-law payload (160-byte chunks); we reply with <code className="text-foreground/85">media</code> / <code className="text-foreground/85">mark</code> / <code className="text-foreground/85">clear</code></p>
           </div>
         </details>
       </div>
