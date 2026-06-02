@@ -127,7 +127,7 @@ export function VoiceIntegrations() {
           icon={<Phone className="h-5 w-5" />}
           title="PSTN / VoIP"
           description="Own a phone number; route inbound/outbound dialing through a carrier."
-          status="coming-soon"
+          status="live"
           enabled={data.pstn.enabled}
           configured={!!data.pstn.provider}
           expanded={expanded === 'pstn'}
