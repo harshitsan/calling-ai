@@ -238,29 +238,33 @@ export async function handleVoiceIntegrationsApi(
     if (!cfg.pstn_endpoint_url) return err(409, 'carrier endpoint URL is not configured');
     if (!cfg.pstn_auth_token) return err(409, 'carrier API key is not configured');
 
-    let payload: Record<string, unknown>;
-    if (cfg.pstn_provider === 'tata') {
-      payload = {
-        api_key: cfg.pstn_auth_token,
-        customer_number: customerNumber,
-        ...(callerId ? { caller_id: callerId } : {}),
-        ...(async ? { async: 1 } : {}),
-      };
-    } else {
-      // Generic providers — pass through the canonical names; tenants
-      // configure the URL to match.
-      payload = {
-        api_key: cfg.pstn_auth_token,
-        customer_number: customerNumber,
-        ...(callerId ? { caller_id: callerId } : {}),
-        ...(async ? { async: 1 } : {}),
-      };
+    // Body — same shape across carriers we proxy. api_key is kept in the
+    // body too so older Tata Click-to-Call API versions (which want it in the
+    // body) keep working alongside the modern Authorization-header version.
+    const payload: Record<string, unknown> = {
+      api_key: cfg.pstn_auth_token,
+      customer_number: customerNumber,
+      ...(callerId ? { caller_id: callerId } : {}),
+      ...(async ? { async: 1 } : {}),
+    };
+
+    // Headers — Tata's newer click-to-call API requires Authorization: Bearer.
+    // Telnyx and most modern carriers use the same convention; Twilio uses
+    // HTTP Basic which carrier-specific config can override later.
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (
+      cfg.pstn_provider === 'tata' ||
+      cfg.pstn_provider === 'telnyx' ||
+      cfg.pstn_provider === 'other' ||
+      !cfg.pstn_provider
+    ) {
+      headers['Authorization'] = `Bearer ${cfg.pstn_auth_token}`;
     }
 
     try {
       const res = await fetch(cfg.pstn_endpoint_url, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers,
         body: JSON.stringify(payload),
       });
       const text = await res.text();
