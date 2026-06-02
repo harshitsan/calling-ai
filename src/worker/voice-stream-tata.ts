@@ -120,7 +120,7 @@ const DEFAULT_SYSTEM_PROMPT =
 
 interface AgentRoutingInputs {
   explicitAgentId: string | null;   // from start.customParameters.agentId
-  toNumber: string | null;          // the DID that was dialed
+  ourDid: string | null;            // our DID on this call — `to` if inbound, `from` if outbound
 }
 
 function rowToAgentConfig(row: {
@@ -140,12 +140,13 @@ function rowToAgentConfig(row: {
 }
 
 /**
- * Three-tier routing precedence:
+ * Three-tier routing precedence — works for both inbound and outbound calls:
  *   1. start.customParameters.agentId — explicit per-call override.
  *      Set this in your carrier's Stream/Channel config when you want a
  *      specific agent for a specific campaign.
- *   2. Match start.to against agents.inbound_dids — "calls to this DID get
- *      this agent".
+ *   2. Match our DID against agents.inbound_dids:
+ *      - inbound calls: our DID is `start.to`
+ *      - outbound calls: our DID is `start.from` (the caller_id we dialed from)
  *   3. Fall back to the most-recently-updated agent for the tenant.
  *      Empty tenants get the built-in friendly assistant.
  */
@@ -166,9 +167,9 @@ async function pickAgentForCall(
     console.warn('[tata] explicit agentId', inputs.explicitAgentId, 'not found for tenant', tenantId);
   }
 
-  // 2. Match DID
-  if (inputs.toNumber) {
-    const normalized = inputs.toNumber.replace(/[^\d]/g, ''); // strip + for LIKE match
+  // 2. Match our DID (direction-aware: `to` for inbound, `from` for outbound)
+  if (inputs.ourDid) {
+    const normalized = inputs.ourDid.replace(/[^\d]/g, ''); // digits-only for comparison
     const candidates = await env.DB.prepare(
       `SELECT id, voice, system_prompt_template, llm_tier_policy, inbound_dids
        FROM agents WHERE tenant_id = ? AND inbound_dids != '[]'`,
@@ -343,13 +344,16 @@ export async function handleTataStream(request: Request, env: Env): Promise<Resp
 
   function initializeAgentForCall(m: StartEvent): void {
     if (agent || !m.start) return;
-    // Routing inputs from Tata's start envelope.
+    // Routing inputs from Tata's start envelope. Our DID on this call is
+    // `to` when someone is calling us, `from` when we're calling them out.
     const explicitAgentId =
       (m.start.customParameters?.agentId as string | undefined) ?? null;
-    const toNumber = m.start.to ?? null;
+    const direction = m.start.direction;
+    const ourDid =
+      direction === 'outbound' ? (m.start.from ?? null) : (m.start.to ?? null);
 
     // pickAgentForCall is async; resolve and then build the LLM + STT.
-    void pickAgentForCall(env, auth.tenantId, { explicitAgentId, toNumber }).then((picked) => {
+    void pickAgentForCall(env, auth.tenantId, { explicitAgentId, ourDid }).then((picked) => {
       if (state.closed) return;
       agent = picked;
       state.history.push({ role: 'system', content: picked.systemPrompt });

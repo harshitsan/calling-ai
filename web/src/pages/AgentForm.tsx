@@ -437,24 +437,24 @@ export function AgentForm() {
             </Card>
             <Card>
               <CardHeader>
-                <CardTitle>Inbound phone numbers (DIDs)</CardTitle>
+                <CardTitle>Phone numbers (DIDs)</CardTitle>
               </CardHeader>
               <CardContent className="space-y-3">
                 <p className="text-[11px] text-muted-foreground/80 leading-relaxed">
-                  Calls arriving via the carrier stream (Tata, Twilio, …) whose{' '}
-                  <code className="text-foreground/85">to</code> field matches one of these
-                  numbers will be routed to <strong>this</strong> agent. Numbers can be E.164
-                  (<code className="text-foreground/85">+919800000000</code>) or carrier-local
-                  digits (<code className="text-foreground/85">9800000000</code>) — we compare
-                  digits-only.
+                  DIDs this agent owns. Routing is direction-aware:
                 </p>
+                <ul className="text-[11px] text-muted-foreground/80 ml-3 space-y-1 leading-relaxed">
+                  <li>• <strong>Inbound</strong> — carrier's <code className="text-foreground/85">to</code> matches → this agent picks up.</li>
+                  <li>• <strong>Outbound</strong> — carrier's <code className="text-foreground/85">from</code> (the <code className="text-foreground/85">caller_id</code> we dialed from) matches → this agent runs the call.</li>
+                </ul>
                 <Input
                   placeholder="911244637992, +14155551234"
                   className="font-mono"
                   {...register('inboundDidsRaw')}
                 />
                 <p className="text-[10px] text-muted-foreground/60 italic">
-                  Comma- or newline-separated. The carrier-side <code className="text-foreground/85">customParameters.agentId</code> still overrides this if set per-call.
+                  E.164 (<code className="text-foreground/85">+919800000000</code>) or local digits-only — we compare digits.
+                  Carrier-side <code className="text-foreground/85">customParameters.agentId</code> still overrides this per-call.
                 </p>
               </CardContent>
             </Card>
