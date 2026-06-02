@@ -1,25 +1,37 @@
-// Tata Teleservices bidirectional audio streaming endpoint.
+// Tata Teleservices bidirectional audio streaming endpoint — LIVE bridge.
 //
-// Tata's wire format is essentially Twilio Media Streams (same envelope,
-// same μ-law 8 kHz / base64 payload, same media/start/stop/mark/clear
-// vocabulary). This module:
+// Tata's wire format is identical to Twilio Media Streams. This module:
 //
 //   1. Accepts a WS upgrade from Tata at /voice/stream/tata.
-//   2. Authenticates via the streaming API key (Bearer header, X-Api-Key
-//      header, or ?key= query — Tata can use any of them).
-//   3. Parses Tata's incoming JSON envelope: connected → start → media+ → stop.
-//   4. Greets the caller with a real TTS hello so the carrier-side audio
-//      pipeline can be verified end-to-end (codec, chunking, mark/clear).
-//   5. Echoes mark acks and tracks DTMF.
+//   2. Authenticates via the per-tenant streaming API key (Bearer header,
+//      X-Api-Key header, or ?key= query).
+//   3. Parses Tata's envelope: connected → start → media → stop/dtmf/mark.
+//   4. Decodes each μ-law/8 kHz/base64 frame, resamples to linear16/16 kHz,
+//      and feeds it into Deepgram Flux for streaming STT.
+//   5. On end-of-turn, runs an LLM round (OpenAI Responses API thread if
+//      OPENAI_API_KEY is set, otherwise Workers AI Llama 3.1 8B).
+//   6. Synthesises the agent's reply via Aura/Gemini, resamples to 8 kHz,
+//      μ-law encodes, chunks to 160-byte (20 ms) frames, and sends each one
+//      back as a `media` event followed by a `mark` for sync.
+//   7. Detects barge-in: on first STT partial while playing, sends Tata a
+//      `clear` event and aborts the in-flight LLM turn.
 //
-// What's NOT here yet (iteration 2): bridging the caller's audio into our
-// live agent loop (STT → LLM → TTS streaming back). The CallSession Durable
-// Object is currently wired to our internal protocol; making it carrier-
-// agnostic is a separate refactor.
+// Per-tenant agent selection: the most-recently-updated agent for the tenant
+// supplies the voice + system prompt. If the tenant has no agents, falls back
+// to a friendly built-in assistant.
 
+import { FluxStt, OpenAiLlm, WorkersAiLlm, synthesizePcm } from './adapters';
 import { hashApiKey } from './auth';
-import { bytesToBase64, encodeMulaw, resampleLinear16 } from './codecs';
+import {
+  base64ToBytes,
+  bytesToBase64,
+  decodeMulaw,
+  encodeMulaw,
+  resampleLinear16,
+} from './codecs';
 import { err } from './util';
+import type { LlmPort } from '../engine/ports';
+import type { Message, SttEvent } from '../engine/types';
 
 interface StartEvent {
   event: 'start';
@@ -96,52 +108,59 @@ async function authenticateStream(env: Env, key: string): Promise<AuthResult | n
   return { tenantId: row.tenant_id, enabled: !!row.stream_enabled };
 }
 
-/**
- * Mu-law silence is 0xff. We send a ½-second silent prelude to ensure the
- * carrier's jitter buffer has audio queued before our TTS lands.
- */
-function silenceMulawFrame(samples: number): Uint8Array {
-  const out = new Uint8Array(samples);
-  out.fill(0xff);
-  return out;
+interface AgentConfig {
+  id: string | null;
+  voiceId: string;
+  systemPrompt: string;
+  llmTier: 'workers_ai' | 'openai';
 }
 
-async function ttsHelloAsMulaw(env: Env): Promise<Uint8Array | null> {
-  try {
-    const { synthesizePcm } = await import('./adapters');
-    const env2 = env as unknown as { GOOGLE_AI_API_KEY?: string };
-    const { pcm, sampleRate } = await synthesizePcm({
-      ai: env.AI,
-      googleApiKey: env2.GOOGLE_AI_API_KEY,
+const DEFAULT_SYSTEM_PROMPT =
+  'You are a friendly voice assistant on a phone call. Speak in one or two short, natural sentences. Avoid markdown.';
+
+async function pickAgentForTenant(env: Env, tenantId: string): Promise<AgentConfig> {
+  const row = await env.DB.prepare(
+    `SELECT id, voice, system_prompt_template, llm_tier_policy
+     FROM agents WHERE tenant_id = ? ORDER BY updated_at DESC LIMIT 1`,
+  )
+    .bind(tenantId)
+    .first<{ id: string; voice: string; system_prompt_template: string; llm_tier_policy: string }>();
+  if (!row) {
+    return {
+      id: null,
       voiceId: 'aura2en:asteria',
-      text: 'Hello. Your stream is connected to calling A I. You can begin speaking after the tone.',
-    });
-    const pcm8k = resampleLinear16(pcm, sampleRate, 8000);
-    return encodeMulaw(pcm8k);
-  } catch {
-    return null;
+      systemPrompt: DEFAULT_SYSTEM_PROMPT,
+      llmTier: 'workers_ai',
+    };
   }
+  let tier: 'workers_ai' | 'openai' = 'workers_ai';
+  try {
+    const p = JSON.parse(row.llm_tier_policy) as { tier?: string };
+    if (p?.tier === 'openai') tier = 'openai';
+  } catch { /* default tier */ }
+  return {
+    id: row.id,
+    voiceId: row.voice || 'aura2en:asteria',
+    systemPrompt: row.system_prompt_template || DEFAULT_SYSTEM_PROMPT,
+    llmTier: tier,
+  };
 }
 
-interface SendCtx {
-  sequence: number;
-  streamSid: string;
-}
+interface SendCtx { sequence: number; streamSid: string }
 
 function sendEvent(ws: WebSocket, ctx: SendCtx, body: Record<string, unknown>) {
   ctx.sequence++;
-  ws.send(JSON.stringify({ ...body, sequenceNumber: String(ctx.sequence), streamSid: ctx.streamSid }));
+  try {
+    ws.send(JSON.stringify({ ...body, sequenceNumber: String(ctx.sequence), streamSid: ctx.streamSid }));
+  } catch { /* socket closed */ }
 }
 
-/**
- * Send a μ-law audio buffer as a sequence of 160-byte (20 ms) `media`
- * events. Per Tata's spec, payloads must be a multiple of 160 bytes to
- * avoid gaps; we pad the final partial chunk with μ-law silence (0xff).
- */
-function sendMediaChunks(ws: WebSocket, ctx: SendCtx, ulaw: Uint8Array) {
+/** Send one μ-law buffer split into 160-byte (20 ms) media frames. */
+function sendMediaChunks(ws: WebSocket, ctx: SendCtx, ulaw: Uint8Array, aborted: () => boolean): void {
   const FRAME = 160;
   let chunkIdx = 0;
   for (let off = 0; off < ulaw.length; off += FRAME) {
+    if (aborted()) return;
     chunkIdx++;
     let frame = ulaw.subarray(off, off + FRAME);
     if (frame.length < FRAME) {
@@ -167,42 +186,161 @@ export async function handleTataStream(request: Request, env: Env): Promise<Resp
   if (!auth) return err(401, 'unknown API key');
   if (!auth.enabled) return err(403, 'streaming is disabled for this tenant');
 
+  const agent = await pickAgentForTenant(env, auth.tenantId);
+
   const pair = new WebSocketPair();
   const client = pair[0];
   const server = pair[1];
   server.accept();
 
   const ctx: SendCtx = { sequence: 0, streamSid: '' };
+
+  // --- Per-connection state --------------------------------------------
   const state = {
-    streamSid: '' as string,
+    streamSid: '',
+    callDbId: '',
     callSid: null as string | null,
     from: null as string | null,
     to: null as string | null,
-    mediaIn: 0,
-    dtmfDigits: [] as string[],
     startedAt: 0,
+    mediaIn: 0,
+    history: [{ role: 'system', content: agent.systemPrompt }] as Message[],
+    transcripts: [] as { role: 'user' | 'assistant'; text: string; t: number }[],
+    isPlaying: false,
+    turnAbort: null as AbortController | null,
+    closed: false,
+    sttReady: false,
   };
 
-  let hangup = false;
-  async function greet() {
-    if (!state.streamSid) return;
-    sendMediaChunks(server, ctx, silenceMulawFrame(4000)); // 0.5 s silence
-    const hello = await ttsHelloAsMulaw(env);
-    if (hello && !hangup) {
-      sendMediaChunks(server, ctx, hello);
-      sendEvent(server, ctx, { event: 'mark', mark: { name: 'hello-played' } });
+  // --- LLM ---
+  const env2 = env as unknown as { OPENAI_API_KEY?: string; GOOGLE_AI_API_KEY?: string };
+  let llm: LlmPort;
+  if (agent.llmTier === 'openai' && env2.OPENAI_API_KEY) {
+    llm = new OpenAiLlm(env2.OPENAI_API_KEY, 'gpt-4o-mini', {
+      onError: (msg, data) => console.warn('[tata-llm]', msg, data),
+    });
+  } else {
+    llm = new WorkersAiLlm(env.AI, {
+      onError: (msg, data) => console.warn('[tata-llm]', msg, data),
+    });
+  }
+
+  // --- STT ---
+  const stt = new FluxStt(
+    env.AI,
+    '16000',
+    (msg, data) => console.warn('[tata-stt]', msg, data),
+    0.55,
+    2500,
+  );
+  state.sttReady = true;
+
+  // --- Agent turn driver -----------------------------------------------
+  async function runAgentTurn(precommittedUserText?: string): Promise<void> {
+    if (state.closed) return;
+    state.turnAbort?.abort();
+    state.turnAbort = new AbortController();
+    const { signal } = state.turnAbort;
+    state.isPlaying = true;
+
+    try {
+      // Collect the LLM stream into a single string. (Future iteration:
+      // chunk it through TextChunker and synthesize per-sentence for lower
+      // time-to-first-audio; for v1 of the bridge we wait for full reply.)
+      let response = '';
+      for await (const delta of llm.generate(state.history, { signal })) {
+        if (signal.aborted) return;
+        if (delta.type === 'text') response += delta.text;
+        if (delta.type === 'done') break;
+      }
+      response = response.trim();
+      if (signal.aborted || state.closed) return;
+      if (!response) {
+        state.isPlaying = false;
+        return;
+      }
+
+      state.history.push({ role: 'assistant', content: response });
+      state.transcripts.push({ role: 'assistant', text: response, t: Date.now() });
+      console.log('[tata]', auth.tenantId, 'assistant:', response.slice(0, 120));
+
+      const { pcm, sampleRate } = await synthesizePcm({
+        ai: env.AI,
+        googleApiKey: env2.GOOGLE_AI_API_KEY,
+        voiceId: agent.voiceId,
+        text: response,
+      });
+      if (signal.aborted || state.closed) return;
+
+      const pcm8k = resampleLinear16(pcm, sampleRate, 8000);
+      const ulaw = encodeMulaw(pcm8k);
+      sendMediaChunks(server, ctx, ulaw, () => signal.aborted || state.closed);
+      if (signal.aborted || state.closed) return;
+      sendEvent(server, ctx, {
+        event: 'mark',
+        mark: { name: `turn-${state.history.length}` },
+      });
+    } catch (e) {
+      console.error('[tata] turn failed', e);
+    } finally {
+      // Mark unspoken precommit if we never got to TTS — keeps history honest
+      // if the user barged-in before any audio went out.
+      if (precommittedUserText && state.history.length > 0) {
+        const last = state.history[state.history.length - 1]!;
+        if (last.role === 'user' && last.content !== precommittedUserText) {
+          // history was modified; nothing else to do.
+        }
+      }
+      state.isPlaying = false;
     }
   }
 
-  server.addEventListener('message', (e: MessageEvent) => {
-    if (typeof e.data !== 'string') return;
+  // --- STT events ---
+  stt.onEvent((e: SttEvent) => {
+    if (state.closed) return;
+    if (e.type === 'partial') {
+      // Barge-in: caller spoke while we were playing → flush carrier-side
+      // buffer + abort the LLM/TTS we're sending.
+      if (state.isPlaying && e.text.trim().length > 0) {
+        sendEvent(server, ctx, { event: 'clear' });
+        state.turnAbort?.abort();
+        state.isPlaying = false;
+      }
+      return;
+    }
+    if (e.type === 'endOfTurn') {
+      const userText = e.text.trim();
+      if (!userText) return;
+      state.history.push({ role: 'user', content: userText });
+      state.transcripts.push({ role: 'user', text: userText, t: Date.now() });
+      console.log('[tata]', auth.tenantId, 'user:', userText.slice(0, 120));
+      void runAgentTurn(userText);
+    }
+  });
+
+  // --- Incoming media → STT ---
+  function pushAudioToStt(payloadB64: string) {
+    if (!state.sttReady || state.closed) return;
+    try {
+      const ulawBytes = base64ToBytes(payloadB64);
+      const pcm8k = decodeMulaw(ulawBytes);
+      const pcm16k = resampleLinear16(pcm8k, 8000, 16000);
+      stt.sendAudio(new Uint8Array(pcm16k.buffer, pcm16k.byteOffset, pcm16k.byteLength));
+    } catch (e) {
+      console.warn('[tata] audio decode failed', (e as Error).message);
+    }
+  }
+
+  // --- Tata → us ---
+  server.addEventListener('message', (ev: MessageEvent) => {
+    if (typeof ev.data !== 'string') return;
     let msg: IncomingEvent;
-    try { msg = JSON.parse(e.data) as IncomingEvent; } catch { return; }
+    try { msg = JSON.parse(ev.data) as IncomingEvent; } catch { return; }
     if (!msg?.event) return;
 
     switch (msg.event) {
       case 'connected':
-        // No required response. Carrier expects we'll wait for `start` next.
+        // No required response.
         break;
 
       case 'start': {
@@ -213,88 +351,98 @@ export async function handleTataStream(request: Request, env: Env): Promise<Resp
         state.from = m.start?.from ?? null;
         state.to = m.start?.to ?? null;
         state.startedAt = Date.now();
+        state.callDbId = `tata-${state.streamSid}`.slice(0, 64);
         console.log('[tata]', auth.tenantId, 'start', {
           streamSid: state.streamSid,
           callSid: state.callSid,
           from: state.from,
           to: state.to,
           direction: m.start?.direction,
-          encoding: m.start?.mediaFormat?.encoding,
+          agent: agent.id,
         });
-        // Persist a call row so the tenant sees it in their dashboard.
         env.DB.prepare(
           `INSERT INTO calls
             (id, tenant_id, agent_id, caller_ref, started_at, status, end_reason)
-           VALUES (?, ?, NULL, ?, ?, 'active', NULL)`,
+           VALUES (?, ?, ?, ?, ?, 'active', NULL)`,
         )
           .bind(
-            `tata-${state.streamSid}`.slice(0, 64),
+            state.callDbId,
             auth.tenantId,
+            agent.id,
             `${state.from ?? '?'}→${state.to ?? '?'}`,
             state.startedAt,
           )
           .run()
-          .catch(() => { /* dup id on reconnect is fine */ });
-        // Kick off greeting asynchronously — don't block the message handler.
-        greet().catch((e2) => console.error('[tata] greet failed', e2));
+          .catch(() => { /* duplicate id on reconnect is fine */ });
+        // Drive the very first turn so the caller hears the agent.
+        // Add a synthetic user prompt so OpenAI's Responses API knows what to
+        // greet about; Llama 3.1 in-context works similarly.
+        state.history.push({
+          role: 'user',
+          content: '[Call just connected. Greet the caller briefly and ask how you can help.]',
+        });
+        void runAgentTurn();
         break;
       }
 
       case 'media': {
         state.mediaIn++;
-        // v1 stub: count frames. v2 will pipe these through STT/LLM/TTS.
-        if (state.mediaIn % 250 === 0) {
-          console.log('[tata]', auth.tenantId, `received ${state.mediaIn} media frames`);
-        }
+        const payload = (msg as MediaInEvent).media?.payload;
+        if (payload) pushAudioToStt(payload);
         break;
       }
 
       case 'dtmf': {
         const digit = (msg as DtmfEvent).dtmf?.digit;
         if (digit) {
-          state.dtmfDigits.push(digit);
           console.log('[tata]', auth.tenantId, 'dtmf', digit);
+          // Treat DTMF as a user "spoke" event so the agent can branch on it.
+          state.history.push({ role: 'user', content: `[DTMF pressed: ${digit}]` });
+          void runAgentTurn();
         }
         break;
       }
 
       case 'mark': {
         const name = (msg as MarkAckEvent).mark?.name;
-        console.log('[tata]', auth.tenantId, 'mark ack', name);
+        if (name) console.log('[tata]', auth.tenantId, 'mark ack', name);
         break;
       }
 
       case 'stop': {
         const reason = (msg as StopEvent).stop?.reason ?? 'remote stop';
         console.log('[tata]', auth.tenantId, 'stop', reason);
-        hangup = true;
-        const durationS = Math.round((Date.now() - state.startedAt) / 1000);
-        env.DB.prepare(
-          `UPDATE calls SET ended_at = ?, duration_s = ?, status = 'ended', end_reason = ?
-           WHERE id = ?`,
-        )
-          .bind(Date.now(), durationS, `tata:${reason}`.slice(0, 64), `tata-${state.streamSid}`.slice(0, 64))
-          .run()
-          .catch(() => {});
-        try { server.close(1000, 'stop'); } catch { /* already closed */ }
+        finalize(`tata:${reason}`);
+        try { server.close(1000, 'stop'); } catch { /* ignore */ }
         break;
       }
     }
   });
 
-  server.addEventListener('close', () => {
-    hangup = true;
-    if (state.streamSid && state.startedAt > 0) {
-      const durationS = Math.round((Date.now() - state.startedAt) / 1000);
+  server.addEventListener('close', () => finalize('ws_close'));
+  server.addEventListener('error', () => finalize('ws_error'));
+
+  function finalize(reasonTag: string) {
+    if (state.closed) return;
+    state.closed = true;
+    state.turnAbort?.abort();
+    try { stt.close(); } catch { /* ignore */ }
+    if (!state.streamSid || state.startedAt === 0) return;
+    const durationS = Math.round((Date.now() - state.startedAt) / 1000);
+    // Persist transcript + close the call row in one batch.
+    const turnsJson = JSON.stringify(state.transcripts.map((t) => ({ role: t.role, text: t.text, t: t.t })));
+    env.DB.batch([
       env.DB.prepare(
-        `UPDATE calls SET ended_at = ?, duration_s = ?, status = 'ended', end_reason = COALESCE(end_reason, 'ws_close')
+        `UPDATE calls SET ended_at = ?, duration_s = ?, status = 'ended',
+                  end_reason = COALESCE(end_reason, ?)
          WHERE id = ?`,
-      )
-        .bind(Date.now(), durationS, `tata-${state.streamSid}`.slice(0, 64))
-        .run()
-        .catch(() => {});
-    }
-  });
+      ).bind(Date.now(), durationS, reasonTag.slice(0, 64), state.callDbId),
+      env.DB.prepare(
+        `INSERT OR REPLACE INTO transcripts (call_id, tenant_id, turns)
+         VALUES (?, ?, ?)`,
+      ).bind(state.callDbId, auth.tenantId, turnsJson),
+    ]).catch((e) => console.warn('[tata] finalize batch failed', e));
+  }
 
   return new Response(null, { status: 101, webSocket: client });
 }

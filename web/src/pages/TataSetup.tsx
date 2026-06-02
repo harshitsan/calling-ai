@@ -191,21 +191,24 @@ Header: Authorization: Bearer cai_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
           </p>
         </Step>
 
-        <Step n={3} title="Verify the stream handshake" icon={<Check className="h-5 w-5" />}>
+        <Step n={3} title="Verify the live agent loop" icon={<Check className="h-5 w-5" />}>
           <p>
-            Trigger a test call to the DID you just configured. On answer, the caller should hear a short
-            English greeting (<em>"Hello. Your stream is connected to calling A I."</em>) — that's us
-            replying with TTS audio re-encoded into Tata's μ-law/8000 frames.
+            Trigger a test call to the DID you just configured. On answer, the caller hears your agent
+            greet them, then can have a full back-and-forth — Flux STT transcribes their voice in real
+            time, the LLM responds in conversation context, and the reply is streamed back as μ-law/8000
+            audio. Speaking over the agent triggers a <Code value="clear" /> event so playback flushes
+            immediately.
           </p>
           <p>
             Check your call shows up under <Link to="/calls" className="text-aurora-1 hover:underline">Call Logs</Link> with
             <Badge className="mx-1.5 align-middle">tata:&lt;reason&gt;</Badge>
-            as the end-reason.
+            as the end-reason. The full transcript is attached to the call detail page.
           </p>
           <p className="text-muted-foreground/85">
             <AlertTriangle className="h-3.5 w-3.5 inline align-text-bottom text-amber-400/85 mr-1" />
-            v1 plays the greeting and logs the call. Live agent (STT → LLM → TTS streaming) bridging
-            is iteration 2 — coming soon. If you only hear the greeting and then silence, that's expected.
+            The agent's voice + system prompt come from the most-recently-updated agent for your tenant
+            under <Link to="/agents" className="text-aurora-1 hover:underline">Agents</Link>. If you
+            have no agents, a friendly fallback is used.
           </p>
         </Step>
 
@@ -284,9 +287,9 @@ Header: Authorization: Bearer cai_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
             fix={<>Read the response body shown inline. <Code value="Please provide a valid caller_id" /> means the DID isn't on your account; re-check the value or pick a stored DID from the list.</>}
           />
           <Trouble
-            symptom="Stream connects, we greet, then silence — caller hears nothing on talkback."
-            cause="Expected in iteration 1. We log incoming media frames but don't yet pipe them through the agent loop."
-            fix={<>This will land when the CallSession Durable Object becomes carrier-format-agnostic. Track progress in <Code value="docs/voice-calling-options.md" />.</>}
+            symptom="Caller hears the greeting but talkback gets no response."
+            cause="The tenant has no agent configured, so the LLM is using the built-in fallback prompt; OR the LLM/TTS provider key is missing."
+            fix={<>Create at least one agent under <Link to="/agents" className="text-aurora-1 hover:underline">Agents</Link> — its system prompt + voice become the live phone agent. For OpenAI-tier agents, ensure <Code value="OPENAI_API_KEY" /> is set as a Worker secret.</>}
           />
         </div>
       </Card>
