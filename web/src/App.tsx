@@ -9,6 +9,7 @@ import { Calls } from './pages/Calls';
 import { Login } from './pages/Login';
 import { Logs } from './pages/Logs';
 import { TestCall } from './pages/TestCall';
+import { TataSetup } from './pages/TataSetup';
 import { VoiceIntegrations } from './pages/VoiceIntegrations';
 import { Voiceovers } from './pages/Voiceovers';
 import { VoiceoverNew } from './pages/VoiceoverNew';
@@ -44,7 +45,10 @@ export function App() {
             </>
           )}
           {VOICE_INTEGRATIONS_ENABLED && (
-            <Route path="/integrations" element={<VoiceIntegrations />} />
+            <>
+              <Route path="/integrations" element={<VoiceIntegrations />} />
+              <Route path="/integrations/tata" element={<TataSetup />} />
+            </>
           )}
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />

@@ -1,5 +1,6 @@
 import {
   AlertCircle,
+  BookOpen,
   CheckCircle2,
   Copy,
   KeyRound,
@@ -11,6 +12,7 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -99,6 +101,25 @@ export function VoiceIntegrations() {
           enable what you need, leave the rest off.
         </p>
       </header>
+
+      <Card className="p-4 mb-6 flex items-center justify-between gap-4 bg-aurora-1/[0.04] border-aurora-1/15">
+        <div className="flex items-center gap-3">
+          <div className="h-10 w-10 rounded-xl bg-aurora-1/15 border border-aurora-1/20 flex items-center justify-center text-aurora-1">
+            <BookOpen className="h-5 w-5" />
+          </div>
+          <div>
+            <div className="text-[13px] font-display tracking-tight text-foreground/95">
+              First time? Read the Tata Teleservices setup guide.
+            </div>
+            <p className="text-[11px] text-muted-foreground/75 mt-0.5 leading-relaxed">
+              Step-by-step walkthrough — carrier portal + dashboard, ~15 minutes.
+            </p>
+          </div>
+        </div>
+        <Button asChild variant="outline">
+          <Link to="/integrations/tata">Open guide →</Link>
+        </Button>
+      </Card>
 
       <div className="grid gap-5 md:grid-cols-3 mb-6">
         <ModalityCard
