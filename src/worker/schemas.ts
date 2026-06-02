@@ -59,6 +59,7 @@ export const AgentSchema = z.object({
   language: z.string().default('en-US'),
   inboundLookup: InboundLookupSchema.optional().nullable(),
   endWebhook: EndWebhookSchema.optional().nullable(),
+  inboundDids: z.array(z.string().regex(/^\+?\d{6,15}$/, 'must be E.164 or local digits-only')).default([]),
 });
 
 export type AgentInput = z.infer<typeof AgentSchema>;

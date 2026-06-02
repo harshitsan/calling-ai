@@ -50,6 +50,7 @@ const schema = z.object({
     url: z.string().refine((v) => v === '' || /^https?:\/\//.test(v), 'must be a URL'),
     headersJson: z.string(),
   }),
+  inboundDidsRaw: z.string().default(''),
 });
 type FormValues = z.infer<typeof schema>;
 
@@ -65,6 +66,7 @@ const DEFAULTS: FormValues = {
   language: 'en-US',
   inboundLookup: { url: '', method: 'POST', headersJson: '', timeoutMs: 5000 },
   endWebhook: { url: '', headersJson: '' },
+  inboundDidsRaw: '',
 };
 
 const TABS = [
@@ -122,6 +124,7 @@ export function AgentForm() {
               headersJson: JSON.stringify(r.agent.endWebhook.headers ?? {}, null, 2),
             }
           : DEFAULTS.endWebhook,
+        inboundDidsRaw: Array.isArray(r.agent.inboundDids) ? r.agent.inboundDids.join(', ') : '',
       }),
     );
   }, [id, reset]);
@@ -142,6 +145,10 @@ export function AgentForm() {
       endWebhook: values.endWebhook.url
         ? { url: values.endWebhook.url, headers: parseHeaders(values.endWebhook.headersJson) }
         : null,
+      inboundDids: (values.inboundDidsRaw ?? '')
+        .split(/[,\n]/)
+        .map((s) => s.trim())
+        .filter((s) => /^\+?\d{6,15}$/.test(s)),
     };
     try {
       await api(editing ? `/api/agents/${id}` : '/api/agents', {
@@ -426,6 +433,29 @@ export function AgentForm() {
                   className="font-mono text-xs"
                   {...register('endWebhook.headersJson')}
                 />
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle>Inbound phone numbers (DIDs)</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <p className="text-[11px] text-muted-foreground/80 leading-relaxed">
+                  Calls arriving via the carrier stream (Tata, Twilio, …) whose{' '}
+                  <code className="text-foreground/85">to</code> field matches one of these
+                  numbers will be routed to <strong>this</strong> agent. Numbers can be E.164
+                  (<code className="text-foreground/85">+919800000000</code>) or carrier-local
+                  digits (<code className="text-foreground/85">9800000000</code>) — we compare
+                  digits-only.
+                </p>
+                <Input
+                  placeholder="911244637992, +14155551234"
+                  className="font-mono"
+                  {...register('inboundDidsRaw')}
+                />
+                <p className="text-[10px] text-muted-foreground/60 italic">
+                  Comma- or newline-separated. The carrier-side <code className="text-foreground/85">customParameters.agentId</code> still overrides this if set per-call.
+                </p>
               </CardContent>
             </Card>
           </div>

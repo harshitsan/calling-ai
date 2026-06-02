@@ -118,21 +118,14 @@ interface AgentConfig {
 const DEFAULT_SYSTEM_PROMPT =
   'You are a friendly voice assistant on a phone call. Speak in one or two short, natural sentences. Avoid markdown.';
 
-async function pickAgentForTenant(env: Env, tenantId: string): Promise<AgentConfig> {
-  const row = await env.DB.prepare(
-    `SELECT id, voice, system_prompt_template, llm_tier_policy
-     FROM agents WHERE tenant_id = ? ORDER BY updated_at DESC LIMIT 1`,
-  )
-    .bind(tenantId)
-    .first<{ id: string; voice: string; system_prompt_template: string; llm_tier_policy: string }>();
-  if (!row) {
-    return {
-      id: null,
-      voiceId: 'aura2en:asteria',
-      systemPrompt: DEFAULT_SYSTEM_PROMPT,
-      llmTier: 'workers_ai',
-    };
-  }
+interface AgentRoutingInputs {
+  explicitAgentId: string | null;   // from start.customParameters.agentId
+  toNumber: string | null;          // the DID that was dialed
+}
+
+function rowToAgentConfig(row: {
+  id: string; voice: string; system_prompt_template: string; llm_tier_policy: string;
+}): AgentConfig {
   let tier: 'workers_ai' | 'openai' = 'workers_ai';
   try {
     const p = JSON.parse(row.llm_tier_policy) as { tier?: string };
@@ -143,6 +136,69 @@ async function pickAgentForTenant(env: Env, tenantId: string): Promise<AgentConf
     voiceId: row.voice || 'aura2en:asteria',
     systemPrompt: row.system_prompt_template || DEFAULT_SYSTEM_PROMPT,
     llmTier: tier,
+  };
+}
+
+/**
+ * Three-tier routing precedence:
+ *   1. start.customParameters.agentId — explicit per-call override.
+ *      Set this in your carrier's Stream/Channel config when you want a
+ *      specific agent for a specific campaign.
+ *   2. Match start.to against agents.inbound_dids — "calls to this DID get
+ *      this agent".
+ *   3. Fall back to the most-recently-updated agent for the tenant.
+ *      Empty tenants get the built-in friendly assistant.
+ */
+async function pickAgentForCall(
+  env: Env,
+  tenantId: string,
+  inputs: AgentRoutingInputs,
+): Promise<AgentConfig> {
+  // 1. Explicit agentId from customParameters
+  if (inputs.explicitAgentId) {
+    const row = await env.DB.prepare(
+      `SELECT id, voice, system_prompt_template, llm_tier_policy
+       FROM agents WHERE id = ? AND tenant_id = ?`,
+    )
+      .bind(inputs.explicitAgentId, tenantId)
+      .first<{ id: string; voice: string; system_prompt_template: string; llm_tier_policy: string }>();
+    if (row) return rowToAgentConfig(row);
+    console.warn('[tata] explicit agentId', inputs.explicitAgentId, 'not found for tenant', tenantId);
+  }
+
+  // 2. Match DID
+  if (inputs.toNumber) {
+    const normalized = inputs.toNumber.replace(/[^\d]/g, ''); // strip + for LIKE match
+    const candidates = await env.DB.prepare(
+      `SELECT id, voice, system_prompt_template, llm_tier_policy, inbound_dids
+       FROM agents WHERE tenant_id = ? AND inbound_dids != '[]'`,
+    )
+      .bind(tenantId)
+      .all<{ id: string; voice: string; system_prompt_template: string; llm_tier_policy: string; inbound_dids: string }>();
+    for (const c of candidates.results) {
+      try {
+        const dids = JSON.parse(c.inbound_dids) as string[];
+        for (const did of dids) {
+          if (did.replace(/[^\d]/g, '') === normalized) return rowToAgentConfig(c);
+        }
+      } catch { /* skip bad json */ }
+    }
+  }
+
+  // 3. Tenant default
+  const row = await env.DB.prepare(
+    `SELECT id, voice, system_prompt_template, llm_tier_policy
+     FROM agents WHERE tenant_id = ? ORDER BY updated_at DESC LIMIT 1`,
+  )
+    .bind(tenantId)
+    .first<{ id: string; voice: string; system_prompt_template: string; llm_tier_policy: string }>();
+  if (row) return rowToAgentConfig(row);
+
+  return {
+    id: null,
+    voiceId: 'aura2en:asteria',
+    systemPrompt: DEFAULT_SYSTEM_PROMPT,
+    llmTier: 'workers_ai',
   };
 }
 
@@ -186,14 +242,19 @@ export async function handleTataStream(request: Request, env: Env): Promise<Resp
   if (!auth) return err(401, 'unknown API key');
   if (!auth.enabled) return err(403, 'streaming is disabled for this tenant');
 
-  const agent = await pickAgentForTenant(env, auth.tenantId);
-
   const pair = new WebSocketPair();
   const client = pair[0];
   const server = pair[1];
   server.accept();
 
   const ctx: SendCtx = { sequence: 0, streamSid: '' };
+  const env2 = env as unknown as { OPENAI_API_KEY?: string; GOOGLE_AI_API_KEY?: string };
+
+  // Agent + LLM + STT all get late-initialized at `start` time, because the
+  // routing decision needs the `to` field and customParameters.agentId.
+  let agent: AgentConfig | null = null;
+  let llm: LlmPort | null = null;
+  let stt: FluxStt | null = null;
 
   // --- Per-connection state --------------------------------------------
   const state = {
@@ -204,7 +265,7 @@ export async function handleTataStream(request: Request, env: Env): Promise<Resp
     to: null as string | null,
     startedAt: 0,
     mediaIn: 0,
-    history: [{ role: 'system', content: agent.systemPrompt }] as Message[],
+    history: [] as Message[],
     transcripts: [] as { role: 'user' | 'assistant'; text: string; t: number }[],
     isPlaying: false,
     turnAbort: null as AbortController | null,
@@ -212,41 +273,15 @@ export async function handleTataStream(request: Request, env: Env): Promise<Resp
     sttReady: false,
   };
 
-  // --- LLM ---
-  const env2 = env as unknown as { OPENAI_API_KEY?: string; GOOGLE_AI_API_KEY?: string };
-  let llm: LlmPort;
-  if (agent.llmTier === 'openai' && env2.OPENAI_API_KEY) {
-    llm = new OpenAiLlm(env2.OPENAI_API_KEY, 'gpt-4o-mini', {
-      onError: (msg, data) => console.warn('[tata-llm]', msg, data),
-    });
-  } else {
-    llm = new WorkersAiLlm(env.AI, {
-      onError: (msg, data) => console.warn('[tata-llm]', msg, data),
-    });
-  }
-
-  // --- STT ---
-  const stt = new FluxStt(
-    env.AI,
-    '16000',
-    (msg, data) => console.warn('[tata-stt]', msg, data),
-    0.55,
-    2500,
-  );
-  state.sttReady = true;
-
   // --- Agent turn driver -----------------------------------------------
   async function runAgentTurn(precommittedUserText?: string): Promise<void> {
-    if (state.closed) return;
+    if (state.closed || !agent || !llm) return;
     state.turnAbort?.abort();
     state.turnAbort = new AbortController();
     const { signal } = state.turnAbort;
     state.isPlaying = true;
 
     try {
-      // Collect the LLM stream into a single string. (Future iteration:
-      // chunk it through TextChunker and synthesize per-sentence for lower
-      // time-to-first-audio; for v1 of the bridge we wait for full reply.)
       let response = '';
       for await (const delta of llm.generate(state.history, { signal })) {
         if (signal.aborted) return;
@@ -283,8 +318,6 @@ export async function handleTataStream(request: Request, env: Env): Promise<Resp
     } catch (e) {
       console.error('[tata] turn failed', e);
     } finally {
-      // Mark unspoken precommit if we never got to TTS — keeps history honest
-      // if the user barged-in before any audio went out.
       if (precommittedUserText && state.history.length > 0) {
         const last = state.history[state.history.length - 1]!;
         if (last.role === 'user' && last.content !== precommittedUserText) {
@@ -295,32 +328,9 @@ export async function handleTataStream(request: Request, env: Env): Promise<Resp
     }
   }
 
-  // --- STT events ---
-  stt.onEvent((e: SttEvent) => {
-    if (state.closed) return;
-    if (e.type === 'partial') {
-      // Barge-in: caller spoke while we were playing → flush carrier-side
-      // buffer + abort the LLM/TTS we're sending.
-      if (state.isPlaying && e.text.trim().length > 0) {
-        sendEvent(server, ctx, { event: 'clear' });
-        state.turnAbort?.abort();
-        state.isPlaying = false;
-      }
-      return;
-    }
-    if (e.type === 'endOfTurn') {
-      const userText = e.text.trim();
-      if (!userText) return;
-      state.history.push({ role: 'user', content: userText });
-      state.transcripts.push({ role: 'user', text: userText, t: Date.now() });
-      console.log('[tata]', auth.tenantId, 'user:', userText.slice(0, 120));
-      void runAgentTurn(userText);
-    }
-  });
-
   // --- Incoming media → STT ---
   function pushAudioToStt(payloadB64: string) {
-    if (!state.sttReady || state.closed) return;
+    if (!state.sttReady || state.closed || !stt) return;
     try {
       const ulawBytes = base64ToBytes(payloadB64);
       const pcm8k = decodeMulaw(ulawBytes);
@@ -329,6 +339,72 @@ export async function handleTataStream(request: Request, env: Env): Promise<Resp
     } catch (e) {
       console.warn('[tata] audio decode failed', (e as Error).message);
     }
+  }
+
+  function initializeAgentForCall(m: StartEvent): void {
+    if (agent || !m.start) return;
+    // Routing inputs from Tata's start envelope.
+    const explicitAgentId =
+      (m.start.customParameters?.agentId as string | undefined) ?? null;
+    const toNumber = m.start.to ?? null;
+
+    // pickAgentForCall is async; resolve and then build the LLM + STT.
+    void pickAgentForCall(env, auth.tenantId, { explicitAgentId, toNumber }).then((picked) => {
+      if (state.closed) return;
+      agent = picked;
+      state.history.push({ role: 'system', content: picked.systemPrompt });
+
+      if (picked.llmTier === 'openai' && env2.OPENAI_API_KEY) {
+        llm = new OpenAiLlm(env2.OPENAI_API_KEY, 'gpt-4o-mini', {
+          onError: (msg, data) => console.warn('[tata-llm]', msg, data),
+        });
+      } else {
+        llm = new WorkersAiLlm(env.AI, {
+          onError: (msg, data) => console.warn('[tata-llm]', msg, data),
+        });
+      }
+
+      stt = new FluxStt(
+        env.AI,
+        '16000',
+        (msg, data) => console.warn('[tata-stt]', msg, data),
+        0.55,
+        2500,
+      );
+      stt.onEvent((e: SttEvent) => {
+        if (state.closed) return;
+        if (e.type === 'partial') {
+          if (state.isPlaying && e.text.trim().length > 0) {
+            sendEvent(server, ctx, { event: 'clear' });
+            state.turnAbort?.abort();
+            state.isPlaying = false;
+          }
+          return;
+        }
+        if (e.type === 'endOfTurn') {
+          const userText = e.text.trim();
+          if (!userText) return;
+          state.history.push({ role: 'user', content: userText });
+          state.transcripts.push({ role: 'user', text: userText, t: Date.now() });
+          console.log('[tata]', auth.tenantId, 'user:', userText.slice(0, 120));
+          void runAgentTurn(userText);
+        }
+      });
+      state.sttReady = true;
+      console.log('[tata]', auth.tenantId, 'agent picked:', picked.id ?? '(default)');
+
+      // Persist call row with the resolved agent_id now that we know it.
+      env.DB.prepare(
+        `UPDATE calls SET agent_id = ? WHERE id = ?`,
+      ).bind(picked.id, state.callDbId).run().catch(() => {});
+
+      // Kick off the greeting now — system prompt is in history, agent is ready.
+      state.history.push({
+        role: 'user',
+        content: '[Call just connected. Greet the caller briefly and ask how you can help.]',
+      });
+      void runAgentTurn();
+    }).catch((e) => console.error('[tata] agent init failed', e));
   }
 
   // --- Tata → us ---
@@ -358,30 +434,24 @@ export async function handleTataStream(request: Request, env: Env): Promise<Resp
           from: state.from,
           to: state.to,
           direction: m.start?.direction,
-          agent: agent.id,
+          customParameters: m.start?.customParameters,
         });
         env.DB.prepare(
           `INSERT INTO calls
             (id, tenant_id, agent_id, caller_ref, started_at, status, end_reason)
-           VALUES (?, ?, ?, ?, ?, 'active', NULL)`,
+           VALUES (?, ?, NULL, ?, ?, 'active', NULL)`,
         )
           .bind(
             state.callDbId,
             auth.tenantId,
-            agent.id,
             `${state.from ?? '?'}→${state.to ?? '?'}`,
             state.startedAt,
           )
           .run()
           .catch(() => { /* duplicate id on reconnect is fine */ });
-        // Drive the very first turn so the caller hears the agent.
-        // Add a synthetic user prompt so OpenAI's Responses API knows what to
-        // greet about; Llama 3.1 in-context works similarly.
-        state.history.push({
-          role: 'user',
-          content: '[Call just connected. Greet the caller briefly and ask how you can help.]',
-        });
-        void runAgentTurn();
+        // Late-init: agent is picked from start envelope, then STT/LLM
+        // come up, then we kick off the greeting turn.
+        initializeAgentForCall(m);
         break;
       }
 
@@ -426,7 +496,7 @@ export async function handleTataStream(request: Request, env: Env): Promise<Resp
     if (state.closed) return;
     state.closed = true;
     state.turnAbort?.abort();
-    try { stt.close(); } catch { /* ignore */ }
+    try { stt?.close(); } catch { /* ignore */ }
     if (!state.streamSid || state.startedAt === 0) return;
     const durationS = Math.round((Date.now() - state.startedAt) / 1000);
     // Persist transcript + close the call row in one batch.
