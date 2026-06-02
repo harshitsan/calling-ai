@@ -1,7 +1,7 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { Layout } from './components/Layout';
 import { getToken } from './lib/api';
-import { VOICEOVERS_ENABLED } from './lib/features';
+import { VOICEOVERS_ENABLED, VOICE_INTEGRATIONS_ENABLED } from './lib/features';
 import { AgentForm } from './pages/AgentForm';
 import { Agents } from './pages/Agents';
 import { CallDetail } from './pages/CallDetail';
@@ -9,6 +9,7 @@ import { Calls } from './pages/Calls';
 import { Login } from './pages/Login';
 import { Logs } from './pages/Logs';
 import { TestCall } from './pages/TestCall';
+import { VoiceIntegrations } from './pages/VoiceIntegrations';
 import { Voiceovers } from './pages/Voiceovers';
 import { VoiceoverNew } from './pages/VoiceoverNew';
 
@@ -41,6 +42,9 @@ export function App() {
               <Route path="/voiceovers" element={<Voiceovers />} />
               <Route path="/voiceovers/new" element={<VoiceoverNew />} />
             </>
+          )}
+          {VOICE_INTEGRATIONS_ENABLED && (
+            <Route path="/integrations" element={<VoiceIntegrations />} />
           )}
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />

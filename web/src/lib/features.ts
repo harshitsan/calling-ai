@@ -4,3 +4,4 @@
 // halves must be flipped together to fully disable a feature.
 
 export const VOICEOVERS_ENABLED = true;
+export const VOICE_INTEGRATIONS_ENABLED = true;
