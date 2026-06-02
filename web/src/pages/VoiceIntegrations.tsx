@@ -31,6 +31,8 @@ interface PstnCfg {
   accountId: string | null;
   authToken: string | null;        // redacted ••••XXXX or null
   phoneNumbers: string[];
+  endpointUrl: string | null;
+  extra: Record<string, unknown>;
 }
 interface SipCfg {
   enabled: boolean;
@@ -211,9 +213,10 @@ function StreamingEditor({ data, reload }: { data: StreamingCfg; reload: () => P
 
   useEffect(() => setEnabled(data.enabled), [data.enabled]);
 
-  const wsBase = typeof window !== 'undefined'
-    ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/call`
-    : 'wss://YOUR-DOMAIN/call';
+  const wsHost = typeof window !== 'undefined' ? window.location.host : 'YOUR-DOMAIN';
+  const wsProto = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsRaw = `${wsProto}://${wsHost}/call`;
+  const wsTata = `${wsProto}://${wsHost}/voice/stream/tata`;
 
   async function toggle(next: boolean) {
     setSaving(true);
@@ -261,19 +264,13 @@ function StreamingEditor({ data, reload }: { data: StreamingCfg; reload: () => P
 
       <div className="space-y-4">
         <div>
-          <Label>Streaming endpoint</Label>
-          <div className="mt-1.5 flex items-center gap-2">
-            <code className="flex-1 rounded-md bg-white/[0.04] border border-white/[0.07] px-3 py-2 text-[12px] text-foreground/90 font-mono">
-              {wsBase}
-            </code>
-            <button
-              type="button"
-              onClick={() => copy(wsBase)}
-              className="h-9 w-9 rounded-md border border-white/[0.08] bg-white/[0.04] hover:bg-white/[0.08] flex items-center justify-center"
-              aria-label="Copy endpoint"
-            >
-              <Copy className="h-3.5 w-3.5" />
-            </button>
+          <Label>Streaming endpoints</Label>
+          <p className="text-[11px] text-muted-foreground/65 mt-1 mb-2">
+            Two wire formats supported — pick whichever your PBX speaks.
+          </p>
+          <div className="space-y-2">
+            <EndpointRow label="Raw PCM (internal)" url={wsRaw} onCopy={() => copy(wsRaw)} note="16 kHz linear16, 60 ms frames, our JSON envelope." />
+            <EndpointRow label="Tata / Twilio Media Streams" url={wsTata} onCopy={() => copy(wsTata)} note="8 kHz μ-law base64, 20 ms frames, connected/start/media/stop events." />
           </div>
         </div>
 
@@ -332,9 +329,9 @@ function StreamingEditor({ data, reload }: { data: StreamingCfg; reload: () => P
         <details className="text-[12px] text-muted-foreground">
           <summary className="cursor-pointer hover:text-foreground/90">Wire-format details</summary>
           <div className="mt-2 space-y-1 leading-relaxed">
-            <p>• Connect with header <code className="text-foreground/85">Authorization: Bearer &lt;key&gt;</code> or query <code className="text-foreground/85">?key=&lt;key&gt;</code></p>
-            <p>• Send raw 16-bit linear PCM frames at 16 kHz mono, 60 ms per frame</p>
-            <p>• JSON control envelope for non-audio events (interrupt, hangup, etc.)</p>
+            <p>• Auth: <code className="text-foreground/85">Authorization: Bearer &lt;key&gt;</code>, <code className="text-foreground/85">X-Api-Key: &lt;key&gt;</code>, or <code className="text-foreground/85">?key=&lt;key&gt;</code> on either endpoint</p>
+            <p>• Raw PCM: send 16-bit linear PCM at 16 kHz mono, 60 ms per frame</p>
+            <p>• Tata format: send <code className="text-foreground/85">connected</code> → <code className="text-foreground/85">start</code> → <code className="text-foreground/85">media</code> events with base64 μ-law payload (160-byte chunks); we reply with <code className="text-foreground/85">media</code> / <code className="text-foreground/85">mark</code> / <code className="text-foreground/85">clear</code></p>
           </div>
         </details>
       </div>
@@ -345,12 +342,39 @@ function StreamingEditor({ data, reload }: { data: StreamingCfg; reload: () => P
 // ----- PSTN editor -----
 function PstnEditor({ data, reload }: { data: PstnCfg; reload: () => Promise<Integrations> }) {
   const [enabled, setEnabled] = useState(data.enabled);
-  const [provider, setProvider] = useState(data.provider ?? 'twilio');
+  const [provider, setProvider] = useState(data.provider ?? 'tata');
   const [accountId, setAccountId] = useState(data.accountId ?? '');
   const [authToken, setAuthToken] = useState(''); // empty = keep existing
   const [phonesRaw, setPhonesRaw] = useState((data.phoneNumbers ?? []).join(', '));
+  const [endpointUrl, setEndpointUrl] = useState(data.endpointUrl ?? '');
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
+
+  const [testTo, setTestTo] = useState('');
+  const [testCallerId, setTestCallerId] = useState('');
+  const [testAsync, setTestAsync] = useState(true);
+  const [calling, setCalling] = useState(false);
+  const [callResult, setCallResult] = useState<{ ok: boolean; status: number; response: unknown } | null>(null);
+  const [callError, setCallError] = useState<string | null>(null);
+
+  const providerDefaults: Record<string, { urlHint: string; accountLabel: string; tokenLabel: string }> = {
+    tata: {
+      urlHint: 'https://api.tatateleservices.com/v1/c2c (or whatever your account exposes)',
+      accountLabel: 'Account ID (optional for Tata)',
+      tokenLabel: 'API key (sent as api_key in the request body)',
+    },
+    twilio: {
+      urlHint: 'https://api.twilio.com/2010-04-01/Accounts/.../Calls.json',
+      accountLabel: 'Account SID (ACXXXX…)',
+      tokenLabel: 'Auth Token',
+    },
+    plivo: { urlHint: 'https://api.plivo.com/v1/Account/.../Call/', accountLabel: 'Auth ID (MAxxx…)', tokenLabel: 'Auth Token' },
+    vonage: { urlHint: 'https://api.nexmo.com/v1/calls', accountLabel: 'API key', tokenLabel: 'API secret' },
+    telnyx: { urlHint: 'https://api.telnyx.com/v2/calls', accountLabel: 'Account ID (optional)', tokenLabel: 'API key' },
+    acefone: { urlHint: 'https://api.acefone.in/v1/cc', accountLabel: 'Account ID', tokenLabel: 'API key' },
+    other: { urlHint: 'https://your-carrier.example.com/click-to-call', accountLabel: 'Account ID', tokenLabel: 'API key / secret' },
+  };
+  const defaults = providerDefaults[provider] ?? providerDefaults.other!;
 
   async function save() {
     setSaving(true);
@@ -358,16 +382,41 @@ function PstnEditor({ data, reload }: { data: PstnCfg; reload: () => Promise<Int
       const phoneNumbers = phonesRaw
         .split(/[,\n]/)
         .map((s) => s.trim())
-        .filter((s) => /^\+\d{6,15}$/.test(s));
+        .filter((s) => /^\+?\d{6,15}$/.test(s));
       await api('/api/voice-integrations/pstn', {
         method: 'PUT',
-        body: JSON.stringify({ enabled, provider, accountId, authToken, phoneNumbers }),
+        body: JSON.stringify({ enabled, provider, accountId, authToken, phoneNumbers, endpointUrl }),
       });
       setAuthToken('');
       setSavedAt(Date.now());
       await reload();
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function placeTestCall() {
+    if (!testTo.trim()) return;
+    setCalling(true);
+    setCallResult(null);
+    setCallError(null);
+    try {
+      const r = await api<{ ok: boolean; status: number; response: unknown }>(
+        '/api/voice-integrations/pstn/call',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            customerNumber: testTo.trim(),
+            callerId: testCallerId.trim() || undefined,
+            async: testAsync ? 1 : 0,
+          }),
+        },
+      );
+      setCallResult(r);
+    } catch (e) {
+      setCallError((e as Error).message);
+    } finally {
+      setCalling(false);
     }
   }
 
@@ -394,7 +443,7 @@ function PstnEditor({ data, reload }: { data: PstnCfg; reload: () => Promise<Int
           </Select>
         </div>
         <div>
-          <Label>Account ID / SID</Label>
+          <Label>{defaults.accountLabel}</Label>
           <Input
             value={accountId}
             onChange={(e) => setAccountId(e.target.value)}
@@ -409,7 +458,20 @@ function PstnEditor({ data, reload }: { data: PstnCfg; reload: () => Promise<Int
       </div>
 
       <div className="mb-5">
-        <Label>Auth token / API secret</Label>
+        <Label>Carrier endpoint URL</Label>
+        <Input
+          value={endpointUrl}
+          onChange={(e) => setEndpointUrl(e.target.value)}
+          placeholder={defaults.urlHint}
+          className="mt-1.5 font-mono text-[12px]"
+        />
+        <p className="text-[10px] text-muted-foreground/60 italic mt-1">
+          POST target for outbound click-to-call requests. Tata gives you this in your account portal.
+        </p>
+      </div>
+
+      <div className="mb-5">
+        <Label>{defaults.tokenLabel}</Label>
         <Input
           value={authToken}
           onChange={(e) => setAuthToken(e.target.value)}
@@ -423,19 +485,19 @@ function PstnEditor({ data, reload }: { data: PstnCfg; reload: () => Promise<Int
       </div>
 
       <div className="mb-5">
-        <Label>Phone numbers (E.164, comma-separated)</Label>
+        <Label>Phone numbers / DIDs (E.164, comma-separated)</Label>
         <Input
           value={phonesRaw}
           onChange={(e) => setPhonesRaw(e.target.value)}
-          placeholder="+14155551234, +442071234567"
+          placeholder="+14155551234, 911244637992"
           className="mt-1.5 font-mono text-[12px]"
         />
         <p className="text-[10px] text-muted-foreground/60 italic mt-1">
-          Numbers your tenant owns on this carrier — used for routing inbound calls to agents.
+          DIDs assigned to your account. The first is used as default caller_id when none is specified.
         </p>
       </div>
 
-      <div className="flex items-center justify-end gap-3 pt-2 border-t border-white/[0.05]">
+      <div className="flex items-center justify-end gap-3 pt-2 mb-6 border-t border-white/[0.05]">
         {savedAt && (
           <span className="text-[10px] uppercase tracking-[0.18em] text-emerald-400/80 mr-auto">
             Saved
@@ -445,7 +507,82 @@ function PstnEditor({ data, reload }: { data: PstnCfg; reload: () => Promise<Int
           {saving ? <><Loader2 className="h-4 w-4 animate-spin" /> Saving…</> : 'Save'}
         </Button>
       </div>
+
+      {/* Click-to-call test */}
+      <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
+        <div className="text-[10px] uppercase tracking-[0.22em] text-muted-foreground/80 mb-3">
+          Test click-to-call
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <Input
+            value={testTo}
+            onChange={(e) => setTestTo(e.target.value)}
+            placeholder="customer +14155551234"
+            className="font-mono text-[12px]"
+          />
+          <Input
+            value={testCallerId}
+            onChange={(e) => setTestCallerId(e.target.value)}
+            placeholder="caller_id (optional)"
+            className="font-mono text-[12px]"
+          />
+          <Button onClick={placeTestCall} disabled={calling || !testTo || !data.enabled}>
+            {calling ? <><Loader2 className="h-4 w-4 animate-spin" /> Calling…</> : 'Place call'}
+          </Button>
+        </div>
+        <label className="flex items-center gap-2 mt-2.5 text-[11px] text-muted-foreground cursor-pointer">
+          <input
+            type="checkbox"
+            checked={testAsync}
+            onChange={(e) => setTestAsync(e.target.checked)}
+            className="accent-aurora-1"
+          />
+          <span>async: 1 (return immediately, don't wait for connect)</span>
+        </label>
+        {callError && (
+          <p className="text-[11px] text-red-400 mt-2">{callError}</p>
+        )}
+        {callResult && (
+          <div className={cn(
+            'mt-3 rounded-md border p-3 text-[11px]',
+            callResult.ok ? 'border-emerald-500/25 bg-emerald-500/8' : 'border-red-500/25 bg-red-500/8',
+          )}>
+            <div className="flex items-center justify-between mb-1.5">
+              <span className={callResult.ok ? 'text-emerald-400' : 'text-red-400'}>
+                HTTP {callResult.status}
+              </span>
+            </div>
+            <pre className="overflow-x-auto text-foreground/80 font-mono text-[10px] leading-relaxed">
+              {JSON.stringify(callResult.response, null, 2)}
+            </pre>
+          </div>
+        )}
+      </div>
     </Card>
+  );
+}
+
+function EndpointRow({ label, url, onCopy, note }: { label: string; url: string; onCopy: () => void; note: string }) {
+  return (
+    <div>
+      <div className="flex items-center gap-2">
+        <div className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground/65 min-w-[160px]">
+          {label}
+        </div>
+        <code className="flex-1 rounded-md bg-white/[0.04] border border-white/[0.07] px-3 py-1.5 text-[11px] text-foreground/90 font-mono truncate">
+          {url}
+        </code>
+        <button
+          type="button"
+          onClick={onCopy}
+          className="h-8 w-8 rounded-md border border-white/[0.08] bg-white/[0.04] hover:bg-white/[0.08] flex items-center justify-center"
+          aria-label="Copy endpoint"
+        >
+          <Copy className="h-3 w-3" />
+        </button>
+      </div>
+      <p className="text-[10px] text-muted-foreground/55 italic mt-1 ml-[168px]">{note}</p>
+    </div>
   );
 }
 

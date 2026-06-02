@@ -6,6 +6,7 @@ import { LogHub } from './log-hub';
 import { MemoryStore } from './memory-store';
 import { VOICEOVERS_ENABLED, handleVoiceoverApi } from './voiceovers';
 import { VOICE_INTEGRATIONS_ENABLED, handleVoiceIntegrationsApi } from './voice-integrations';
+import { handleTataStream } from './voice-stream-tata';
 
 export { CallSession, LogHub, MemoryStore };
 
@@ -65,6 +66,11 @@ export default {
         for (const [k, v] of Object.entries(CORS)) headers.set(k, v);
         return new Response(res.body, { status: res.status, headers });
       }
+    }
+
+    // Carrier streaming endpoint — Tata/Twilio Media Streams compatible.
+    if (VOICE_INTEGRATIONS_ENABLED && url.pathname === '/voice/stream/tata') {
+      return handleTataStream(request, env);
     }
 
     if (url.pathname === '/call') {

@@ -26,6 +26,8 @@ interface RowAll {
   pstn_account_id: string | null;
   pstn_auth_token: string | null;
   pstn_phone_numbers: string;
+  pstn_endpoint_url: string | null;
+  pstn_extra: string;
   sip_enabled: number;
   sip_uri: string | null;
   sip_auth_method: string | null;
@@ -56,6 +58,8 @@ function rowToJson(r: RowAll): Record<string, unknown> {
       accountId: r.pstn_account_id,
       authToken: redactTail(r.pstn_auth_token),
       phoneNumbers: safeParseJsonArray(r.pstn_phone_numbers),
+      endpointUrl: r.pstn_endpoint_url,
+      extra: safeParseJson(r.pstn_extra),
     },
     sip: {
       enabled: !!r.sip_enabled,
@@ -75,6 +79,15 @@ function safeParseJsonArray(s: string): string[] {
     return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [];
   } catch {
     return [];
+  }
+}
+
+function safeParseJson(s: string): Record<string, unknown> {
+  try {
+    const v = JSON.parse(s);
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+  } catch {
+    return {};
   }
 }
 
@@ -98,6 +111,14 @@ interface UpdatePstn {
   accountId?: unknown;
   authToken?: unknown;
   phoneNumbers?: unknown;
+  endpointUrl?: unknown;
+  extra?: unknown;
+}
+
+interface ClickToCallBody {
+  customerNumber?: unknown;
+  callerId?: unknown;
+  async?: unknown;
 }
 interface UpdateSip {
   enabled?: unknown;
@@ -177,17 +198,83 @@ export async function handleVoiceIntegrationsApi(
         ? body.authToken
         : cur.pstn_auth_token;
     const numbers = Array.isArray(body.phoneNumbers)
-      ? body.phoneNumbers.filter((n): n is string => typeof n === 'string' && /^\+\d{6,15}$/.test(n.trim())).map((n) => n.trim())
+      ? body.phoneNumbers.filter((n): n is string => typeof n === 'string' && /^\+?\d{6,15}$/.test(n.trim())).map((n) => n.trim())
       : safeParseJsonArray(cur.pstn_phone_numbers);
+    const endpointUrl =
+      typeof body.endpointUrl === 'string'
+        ? (body.endpointUrl.trim() || null)
+        : cur.pstn_endpoint_url;
+    const extra =
+      body.extra && typeof body.extra === 'object' && !Array.isArray(body.extra)
+        ? JSON.stringify(body.extra)
+        : cur.pstn_extra;
     await env.DB.prepare(
       `UPDATE voice_integrations
        SET pstn_enabled = ?, pstn_provider = ?, pstn_account_id = ?, pstn_auth_token = ?,
-           pstn_phone_numbers = ?, updated_at = ?
+           pstn_phone_numbers = ?, pstn_endpoint_url = ?, pstn_extra = ?, updated_at = ?
        WHERE tenant_id = ?`,
-    ).bind(enabled, provider, accountId, authToken, JSON.stringify(numbers), now(), tenantId).run();
+    ).bind(enabled, provider, accountId, authToken, JSON.stringify(numbers), endpointUrl, extra, now(), tenantId).run();
     const row = (await env.DB.prepare('SELECT * FROM voice_integrations WHERE tenant_id = ?')
       .bind(tenantId).first<RowAll>())!;
     return json({ integrations: rowToJson(row) });
+  }
+
+  // POST /api/voice-integrations/pstn/call — proxy a click-to-call request to
+  // the tenant's configured carrier endpoint.
+  //
+  // Body shape mirrors Tata's spec:
+  //   { customerNumber, callerId?, async? }
+  // We attach api_key from the stored credentials. Provider-specific request
+  // shape (Tata uses snake_case JSON body) is normalized below.
+  if (path === '/api/voice-integrations/pstn/call' && method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as ClickToCallBody;
+    const customerNumber = typeof body.customerNumber === 'string' ? body.customerNumber.trim() : '';
+    const callerId = typeof body.callerId === 'string' ? body.callerId.trim() : '';
+    const async = body.async === 1 || body.async === true ? 1 : 0;
+    if (!customerNumber) return err(400, 'customerNumber is required');
+
+    const cfg = await ensureRow(env, tenantId);
+    if (!cfg.pstn_enabled) return err(409, 'PSTN integration is not enabled for this tenant');
+    if (!cfg.pstn_endpoint_url) return err(409, 'carrier endpoint URL is not configured');
+    if (!cfg.pstn_auth_token) return err(409, 'carrier API key is not configured');
+
+    let payload: Record<string, unknown>;
+    if (cfg.pstn_provider === 'tata') {
+      payload = {
+        api_key: cfg.pstn_auth_token,
+        customer_number: customerNumber,
+        ...(callerId ? { caller_id: callerId } : {}),
+        ...(async ? { async: 1 } : {}),
+      };
+    } else {
+      // Generic providers — pass through the canonical names; tenants
+      // configure the URL to match.
+      payload = {
+        api_key: cfg.pstn_auth_token,
+        customer_number: customerNumber,
+        ...(callerId ? { caller_id: callerId } : {}),
+        ...(async ? { async: 1 } : {}),
+      };
+    }
+
+    try {
+      const res = await fetch(cfg.pstn_endpoint_url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const text = await res.text();
+      let parsed: unknown = text;
+      try { parsed = JSON.parse(text); } catch { /* leave as text */ }
+      return json({
+        ok: res.ok,
+        status: res.status,
+        carrier: cfg.pstn_provider,
+        response: parsed,
+      }, { status: res.ok ? 200 : 502 });
+    } catch (e) {
+      return err(502, `carrier request failed: ${(e as Error).message.slice(0, 200)}`);
+    }
   }
 
   // PUT /api/voice-integrations/sip — update SIP config
