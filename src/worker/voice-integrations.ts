@@ -242,8 +242,14 @@ export async function handleVoiceIntegrationsApi(
     const destinationNumber = customerNumber.replace(/^\+/, '');
     const agentNumber = callerId.replace(/^\+/, '');
 
+    // Treat any tatateleservices.com endpoint as Tata even if provider
+    // dropdown wasn't explicitly saved — the URL is unambiguous.
+    const isTata =
+      cfg.pstn_provider === 'tata' ||
+      /tatateleservices\.com|smartflo/i.test(cfg.pstn_endpoint_url);
+
     let fetchInit: RequestInit;
-    if (cfg.pstn_provider === 'tata') {
+    if (isTata) {
       // Tata Smartflo Click-to-Call — verified shape:
       //   POST https://api-smartflo.tatateleservices.com/v1/click_to_call
       //   Authorization: Bearer <JWT>
