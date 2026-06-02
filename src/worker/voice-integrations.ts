@@ -250,22 +250,38 @@ export async function handleVoiceIntegrationsApi(
 
     let fetchInit: RequestInit;
     if (isTata) {
-      // Tata Smartflo Click-to-Call — verified shape:
+      // Tata Smartflo Click-to-Call — per official docs at
+      //   https://docs.smartflo.tatatelebusiness.com/docs/click-to-call
+      //
       //   POST https://api-smartflo.tatateleservices.com/v1/click_to_call
-      //   Authorization: Bearer <JWT>
-      //   Content-Type: application/x-www-form-urlencoded
-      //   agent_number=<DID>&destination_number=<customer>&async=1
-      const form = new URLSearchParams();
-      if (agentNumber) form.set('agent_number', agentNumber);
-      form.set('destination_number', destinationNumber);
-      if (async) form.set('async', '1');
+      //   Authorization: Bearer <JWT from /token/generate>
+      //   Content-Type: application/json
+      //   {
+      //     "agent_number":      "<DID>",           // required
+      //     "destination_number":"<customer>",      // required
+      //     "caller_id":         "<DID>",           // required
+      //     "async":             1                  // required
+      //   }
+      //
+      // Smartflo treats agent_number as "the agent endpoint to ring" — for
+      // bot/AI termination this is the same DID we use as caller_id.
+      if (!agentNumber) {
+        return err(400, 'callerId (DID) is required for Tata click-to-call — pass it explicitly or set a default DID under PSTN config');
+      }
+      const body = {
+        agent_number: agentNumber,
+        destination_number: destinationNumber,
+        caller_id: agentNumber,
+        async: async ? 1 : 0,
+      };
       fetchInit = {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${cfg.pstn_auth_token}`,
-          'content-type': 'application/x-www-form-urlencoded',
+          'accept': 'application/json',
+          'content-type': 'application/json',
         },
-        body: form.toString(),
+        body: JSON.stringify(body),
       };
     } else {
       // Generic providers — JSON body with api_key + Bearer header.

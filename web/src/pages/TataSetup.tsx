@@ -103,10 +103,25 @@ export function TataSetup() {
   -H "Authorization: Bearer YOUR_DASHBOARD_JWT" \\
   -H "Content-Type: application/json" \\
   -d '{
-    "customerNumber": "919800000000",
-    "callerId": "911244637992",
+    "customerNumber": "+918295084311",
+    "callerId": "918069879788",
     "async": 1
-  }'`;
+  }'
+
+# Behind the scenes we POST to Tata as documented at
+# https://docs.smartflo.tatatelebusiness.com/docs/click-to-call :
+#
+# POST https://api-smartflo.tatateleservices.com/v1/click_to_call
+# Authorization: Bearer <Smartflo JWT from /token/generate>
+# Content-Type: application/json
+# {
+#   "agent_number":      "<DID>",       // required
+#   "destination_number":"<customer>",  // required
+#   "caller_id":         "<DID>",       // required
+#   "async":             1              // required
+# }
+#
+# Tata responds with:  { "success": true, "ref_id": "<uuid>" }`;
 
   const wsClientExample = `// Tata-side configuration in the carrier portal — typically a URL field
 // plus a custom Authorization header.
