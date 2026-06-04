@@ -52,6 +52,7 @@ interface Integrations {
 }
 
 const PSTN_PROVIDERS = [
+  { id: 'tata', label: 'Tata Teleservices (Smartflo)' },
   { id: 'twilio', label: 'Twilio' },
   { id: 'vonage', label: 'Vonage' },
   { id: 'plivo', label: 'Plivo' },

@@ -346,8 +346,17 @@ export async function handleTataStream(request: Request, env: Env): Promise<Resp
     if (agent || !m.start) return;
     // Routing inputs from Tata's start envelope. Our DID on this call is
     // `to` when someone is calling us, `from` when we're calling them out.
-    const explicitAgentId =
-      (m.start.customParameters?.agentId as string | undefined) ?? null;
+    const params = m.start.customParameters ?? {};
+    // Tata's `custom_identifier` lands here as `customParameters.custom_identifier`.
+    // We stamp it with JSON { agentId } from the click-to-call proxy so the
+    // outbound stream routes back to the originating agent.
+    let explicitAgentId: string | null = (params.agentId as string | undefined) ?? null;
+    if (!explicitAgentId && typeof params.custom_identifier === 'string') {
+      try {
+        const parsed = JSON.parse(params.custom_identifier) as { agentId?: string };
+        if (parsed?.agentId) explicitAgentId = parsed.agentId;
+      } catch { /* not JSON — ignore */ }
+    }
     const direction = m.start.direction;
     const ourDid =
       direction === 'outbound' ? (m.start.from ?? null) : (m.start.to ?? null);

@@ -119,6 +119,59 @@ interface ClickToCallBody {
   customerNumber?: unknown;
   callerId?: unknown;
   async?: unknown;
+  agentId?: unknown;
+  callTimeoutSeconds?: unknown;
+}
+
+/**
+ * Resolve which agent + DID drives this outbound call.
+ *
+ * Inputs (precedence top → bottom):
+ *   1. explicit callerId   — caller knows exactly which DID to dial from
+ *   2. agentId             — look up that agent's first inbound_did
+ *   3. fallback            — the tenant's first configured PSTN DID
+ *
+ * Returns agent + did separately so the customParameters can carry the
+ * resolved agentId back to the streaming endpoint for routing-on-receive.
+ */
+async function resolveOutboundRoute(
+  env: Env,
+  tenantId: string,
+  body: ClickToCallBody,
+  configDids: string[],
+): Promise<
+  | { ok: true; did: string; agentId: string | null }
+  | { ok: false; error: string }
+> {
+  const explicitCallerId = typeof body.callerId === 'string' ? body.callerId.trim() : '';
+  const explicitAgentId = typeof body.agentId === 'string' ? body.agentId.trim() : '';
+
+  // Look up the agent (validates it belongs to this tenant + has DIDs).
+  let agentId: string | null = null;
+  let agentDid: string | null = null;
+  if (explicitAgentId) {
+    const row = await env.DB.prepare(
+      'SELECT id, inbound_dids FROM agents WHERE id = ? AND tenant_id = ?',
+    )
+      .bind(explicitAgentId, tenantId)
+      .first<{ id: string; inbound_dids: string }>();
+    if (!row) return { ok: false, error: `agent ${explicitAgentId} not found for tenant` };
+    agentId = row.id;
+    try {
+      const dids = JSON.parse(row.inbound_dids ?? '[]') as string[];
+      if (Array.isArray(dids) && dids[0]) agentDid = dids[0]!.trim();
+    } catch { /* keep null */ }
+  }
+
+  // Pick the DID we'll dial from. Explicit > agent's first DID > tenant fallback.
+  const did = explicitCallerId || agentDid || configDids[0] || '';
+  if (!did) {
+    return {
+      ok: false,
+      error: 'no caller_id available — pass callerId, or set an agent with inbound_dids, or add a phone number to PSTN config',
+    };
+  }
+  return { ok: true, did, agentId };
 }
 interface UpdateSip {
   enabled?: unknown;
@@ -129,7 +182,7 @@ interface UpdateSip {
   digestPass?: unknown;
 }
 
-const PSTN_PROVIDERS = new Set(['twilio', 'vonage', 'plivo', 'telnyx', 'acefone', 'other']);
+const PSTN_PROVIDERS = new Set(['tata', 'twilio', 'vonage', 'plivo', 'telnyx', 'acefone', 'other']);
 const SIP_AUTH_METHODS = new Set(['ip_allowlist', 'digest']);
 
 export async function handleVoiceIntegrationsApi(
@@ -229,14 +282,26 @@ export async function handleVoiceIntegrationsApi(
   if (path === '/api/voice-integrations/pstn/call' && method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as ClickToCallBody;
     const customerNumber = typeof body.customerNumber === 'string' ? body.customerNumber.trim() : '';
-    const callerId = typeof body.callerId === 'string' ? body.callerId.trim() : '';
     const async = body.async === 1 || body.async === true ? 1 : 0;
+    const callTimeout =
+      typeof body.callTimeoutSeconds === 'number' && body.callTimeoutSeconds > 0
+        ? Math.min(7200, Math.floor(body.callTimeoutSeconds))
+        : 0;
     if (!customerNumber) return err(400, 'customerNumber is required');
 
     const cfg = await ensureRow(env, tenantId);
     if (!cfg.pstn_enabled) return err(409, 'PSTN integration is not enabled for this tenant');
     if (!cfg.pstn_endpoint_url) return err(409, 'carrier endpoint URL is not configured');
     if (!cfg.pstn_auth_token) return err(409, 'carrier API key is not configured');
+
+    const route = await resolveOutboundRoute(
+      env,
+      tenantId,
+      body,
+      safeParseJsonArray(cfg.pstn_phone_numbers),
+    );
+    if (!route.ok) return err(400, route.error);
+    const callerId = route.did;
 
     // Bare digits — Tata rejects E.164 + prefix in the call form.
     const destinationNumber = customerNumber.replace(/^\+/, '');
@@ -268,11 +333,20 @@ export async function handleVoiceIntegrationsApi(
       if (!agentNumber) {
         return err(400, 'callerId (DID) is required for Tata click-to-call — pass it explicitly or set a default DID under PSTN config');
       }
-      const body = {
+      // custom_identifier flows back to us in Tata's webhook + (per docs)
+      // can also reach the streaming endpoint as a customParameter. We use
+      // it to carry the resolved agentId so the inbound media stream routes
+      // back to the same agent that initiated the outbound call.
+      const customIdentifier = route.agentId
+        ? JSON.stringify({ agentId: route.agentId })
+        : '';
+      const body: Record<string, unknown> = {
         agent_number: agentNumber,
         destination_number: destinationNumber,
         caller_id: agentNumber,
         async: async ? 1 : 0,
+        ...(callTimeout > 0 ? { call_timeout: callTimeout } : {}),
+        ...(customIdentifier ? { custom_identifier: customIdentifier } : {}),
       };
       fetchInit = {
         method: 'POST',
