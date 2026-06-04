@@ -82,6 +82,28 @@ function safeParseJsonArray(s: string): string[] {
   }
 }
 
+/** POST to a carrier URL, wrap whatever they return into our standard envelope. */
+async function fetchAndRespond(
+  url: string,
+  init: RequestInit,
+  carrier: string | null,
+): Promise<Response> {
+  try {
+    const res = await fetch(url, init);
+    const text = await res.text();
+    let parsed: unknown = text;
+    try { parsed = JSON.parse(text); } catch { /* leave as text */ }
+    return json({
+      ok: res.ok,
+      status: res.status,
+      carrier,
+      response: parsed,
+    }, { status: res.ok ? 200 : 502 });
+  } catch (e) {
+    return err(502, `carrier request failed: ${(e as Error).message.slice(0, 200)}`);
+  }
+}
+
 function safeParseJson(s: string): Record<string, unknown> {
   try {
     const v = JSON.parse(s);
@@ -324,37 +346,31 @@ export async function handleVoiceIntegrationsApi(
 
     let fetchInit: RequestInit;
     if (isTata) {
-      // Tata Smartflo Click-to-Call — per official docs at
-      //   https://docs.smartflo.tatatelebusiness.com/docs/click-to-call
+      // Tata Smartflo has TWO click-to-call flows, distinguished by token shape:
       //
-      //   POST https://api-smartflo.tatateleservices.com/v1/click_to_call
-      //   Authorization: Bearer <JWT from /token/generate>
-      //   Content-Type: application/json
-      //   {
-      //     "agent_number":      "<DID>",           // required
-      //     "destination_number":"<customer>",      // required
-      //     "caller_id":         "<DID>",           // required
-      //     "async":             1                  // required
-      //   }
+      //  (a) JWT flow — token is `eyJ…`. Routes to a Smartflo AGENT (which
+      //      must forward to a phone). Useful for human agents.
+      //      POST /v1/click_to_call
+      //      Authorization: Bearer <jwt>
+      //      Body: { agent_number, destination_number, caller_id, async }
       //
-      // Smartflo treats agent_number as "the agent endpoint to ring" — for
-      // bot/AI termination this is the same DID we use as caller_id.
+      //  (b) API-key flow — token is a UUID like `022f24e8-…`. The api_key
+      //      was created in Tata's portal with a *bound destination*, so the
+      //      call routes to that destination (incl. Voice Streaming →
+      //      magentic-calling for AI bots) WITHOUT going through an agent.
+      //      POST /v1/click_to_call_support
+      //      No Authorization header.
+      //      Body: { api_key, customer_number, caller_id, async }
+      //
+      // We auto-detect by token shape.
+      const token = cfg.pstn_auth_token!;
+      const looksLikeJwt = /^eyJ[a-zA-Z0-9_-]+\./.test(token);
+      const looksLikeUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(token);
+
       if (!agentNumber) {
         return err(400, 'callerId (DID) is required for Tata click-to-call — pass it explicitly or set a default DID under PSTN config');
       }
-      // Tata's docs say `agent_number` is "ID of the Smartflo agent who will
-      // receive the call" — i.e. their internal agent identifier, NOT a phone
-      // number. Use the per-agent carrier_agent_id when set; without it, the
-      // call queues but Tata can't match an agent ("missed" / 0:00 duration).
-      const carrierAgent = route.carrierAgentId;
-      if (!carrierAgent) {
-        return err(400,
-          'Tata requires a Smartflo agent ID (the carrier_agent_id), not just a DID. ' +
-          'Set it on the agent under /agents → Integrations → "Carrier agent ID", ' +
-          'or pass `carrierAgentId` in this request body. ' +
-          'Find the value in your Tata Smartflo portal under Users / Agents.',
-        );
-      }
+
       // custom_identifier flows back to us in Tata's webhook + (per docs)
       // can also reach the streaming endpoint as a customParameter. We use
       // it to carry the resolved agentId so the inbound media stream routes
@@ -362,6 +378,43 @@ export async function handleVoiceIntegrationsApi(
       const customIdentifier = route.agentId
         ? JSON.stringify({ agentId: route.agentId })
         : '';
+
+      if (looksLikeUuid && !looksLikeJwt) {
+        // API-key flow — destination is pre-bound on the api_key.
+        const body: Record<string, unknown> = {
+          api_key: token,
+          customer_number: destinationNumber,
+          caller_id: agentNumber,
+          async: async ? 1 : 0,
+          ...(callTimeout > 0 ? { call_timeout: callTimeout } : {}),
+          ...(customIdentifier ? { custom_identifier: customIdentifier } : {}),
+        };
+        // Default URL is /v1/click_to_call_support — but honor whatever the
+        // tenant configured (some accounts have a different base URL).
+        let url = cfg.pstn_endpoint_url!;
+        if (!/click_to_call_support|c2c/i.test(url)) {
+          url = url.replace(/\/v1\/click_to_call\/?$/, '/v1/click_to_call_support');
+        }
+        fetchInit = {
+          method: 'POST',
+          headers: { 'accept': 'application/json', 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        };
+        // Swap to support URL when needed (since cfg.pstn_endpoint_url is also
+        // used for the JWT flow). Tracked separately so we don't mutate cfg.
+        return fetchAndRespond(url, fetchInit, cfg.pstn_provider);
+      }
+
+      // JWT flow — needs the Smartflo agent id (carrier_agent_id).
+      const carrierAgent = route.carrierAgentId;
+      if (!carrierAgent) {
+        return err(400,
+          'Tata JWT-flow requires a Smartflo agent ID (carrierAgentId). ' +
+          'Either set it on the agent under /agents → Integrations → "Carrier agent ID", ' +
+          'or switch to the Click-to-Call Support API token flow ' +
+          '(generate a UUID-style api_key in Tata\'s portal that\'s bound to your Voice Streaming destination — no agent middleman needed).',
+        );
+      }
       const body: Record<string, unknown> = {
         agent_number: carrierAgent,
         destination_number: destinationNumber,
@@ -373,7 +426,7 @@ export async function handleVoiceIntegrationsApi(
       fetchInit = {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${cfg.pstn_auth_token}`,
+          'Authorization': `Bearer ${token}`,
           'accept': 'application/json',
           'content-type': 'application/json',
         },
@@ -400,20 +453,7 @@ export async function handleVoiceIntegrationsApi(
       };
     }
 
-    try {
-      const res = await fetch(cfg.pstn_endpoint_url, fetchInit);
-      const text = await res.text();
-      let parsed: unknown = text;
-      try { parsed = JSON.parse(text); } catch { /* leave as text */ }
-      return json({
-        ok: res.ok,
-        status: res.status,
-        carrier: cfg.pstn_provider,
-        response: parsed,
-      }, { status: res.ok ? 200 : 502 });
-    } catch (e) {
-      return err(502, `carrier request failed: ${(e as Error).message.slice(0, 200)}`);
-    }
+    return fetchAndRespond(cfg.pstn_endpoint_url!, fetchInit, cfg.pstn_provider);
   }
 
   // PUT /api/voice-integrations/sip — update SIP config
