@@ -51,6 +51,7 @@ const schema = z.object({
     headersJson: z.string(),
   }),
   inboundDidsRaw: z.string().default(''),
+  carrierAgentId: z.string().default(''),
 });
 type FormValues = z.infer<typeof schema>;
 
@@ -67,6 +68,7 @@ const DEFAULTS: FormValues = {
   inboundLookup: { url: '', method: 'POST', headersJson: '', timeoutMs: 5000 },
   endWebhook: { url: '', headersJson: '' },
   inboundDidsRaw: '',
+  carrierAgentId: '',
 };
 
 const TABS = [
@@ -125,6 +127,7 @@ export function AgentForm() {
             }
           : DEFAULTS.endWebhook,
         inboundDidsRaw: Array.isArray(r.agent.inboundDids) ? r.agent.inboundDids.join(', ') : '',
+        carrierAgentId: r.agent.carrierAgentId ?? '',
       }),
     );
   }, [id, reset]);
@@ -149,6 +152,7 @@ export function AgentForm() {
         .split(/[,\n]/)
         .map((s) => s.trim())
         .filter((s) => /^\+?\d{6,15}$/.test(s)),
+      carrierAgentId: values.carrierAgentId?.trim() || null,
     };
     try {
       await api(editing ? `/api/agents/${id}` : '/api/agents', {
@@ -455,6 +459,28 @@ export function AgentForm() {
                 <p className="text-[10px] text-muted-foreground/60 italic">
                   E.164 (<code className="text-foreground/85">+919800000000</code>) or local digits-only — we compare digits.
                   Carrier-side <code className="text-foreground/85">customParameters.agentId</code> still overrides this per-call.
+                </p>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle>Carrier agent ID (outbound)</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <p className="text-[11px] text-muted-foreground/80 leading-relaxed">
+                  When we place outbound calls via Tata's Click-to-Call API, the carrier needs the
+                  Smartflo <strong>agent identifier</strong> — NOT a phone number. Find it in your
+                  Tata portal under <strong>Users</strong> / <strong>Agents</strong> — the agent
+                  configured with the Voice Streaming destination (e.g. "magentic-calling").
+                </p>
+                <Input
+                  placeholder="e.g. 12345 or agent_xyz"
+                  className="font-mono"
+                  {...register('carrierAgentId')}
+                />
+                <p className="text-[10px] text-muted-foreground/60 italic">
+                  Without this, Tata accepts the API call but logs the call as <strong>"Missed"</strong>{' '}
+                  with no agent involved. Only needed for outbound; inbound calls don't use it.
                 </p>
               </CardContent>
             </Card>

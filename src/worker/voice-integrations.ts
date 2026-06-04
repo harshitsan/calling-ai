@@ -121,6 +121,7 @@ interface ClickToCallBody {
   async?: unknown;
   agentId?: unknown;
   callTimeoutSeconds?: unknown;
+  carrierAgentId?: unknown;
 }
 
 /**
@@ -140,23 +141,27 @@ async function resolveOutboundRoute(
   body: ClickToCallBody,
   configDids: string[],
 ): Promise<
-  | { ok: true; did: string; agentId: string | null }
+  | { ok: true; did: string; agentId: string | null; carrierAgentId: string | null }
   | { ok: false; error: string }
 > {
   const explicitCallerId = typeof body.callerId === 'string' ? body.callerId.trim() : '';
   const explicitAgentId = typeof body.agentId === 'string' ? body.agentId.trim() : '';
+  const explicitCarrierAgent =
+    typeof body.carrierAgentId === 'string' ? body.carrierAgentId.trim() : '';
 
   // Look up the agent (validates it belongs to this tenant + has DIDs).
   let agentId: string | null = null;
   let agentDid: string | null = null;
+  let agentCarrierId: string | null = null;
   if (explicitAgentId) {
     const row = await env.DB.prepare(
-      'SELECT id, inbound_dids FROM agents WHERE id = ? AND tenant_id = ?',
+      'SELECT id, inbound_dids, carrier_agent_id FROM agents WHERE id = ? AND tenant_id = ?',
     )
       .bind(explicitAgentId, tenantId)
-      .first<{ id: string; inbound_dids: string }>();
+      .first<{ id: string; inbound_dids: string; carrier_agent_id: string | null }>();
     if (!row) return { ok: false, error: `agent ${explicitAgentId} not found for tenant` };
     agentId = row.id;
+    agentCarrierId = row.carrier_agent_id;
     try {
       const dids = JSON.parse(row.inbound_dids ?? '[]') as string[];
       if (Array.isArray(dids) && dids[0]) agentDid = dids[0]!.trim();
@@ -171,7 +176,11 @@ async function resolveOutboundRoute(
       error: 'no caller_id available — pass callerId, or set an agent with inbound_dids, or add a phone number to PSTN config',
     };
   }
-  return { ok: true, did, agentId };
+
+  // Carrier agent ID — explicit > agent's stored value > null (proxy will then
+  // surface a useful error to the caller).
+  const carrierAgentId = explicitCarrierAgent || agentCarrierId || null;
+  return { ok: true, did, agentId, carrierAgentId };
 }
 interface UpdateSip {
   enabled?: unknown;
@@ -333,6 +342,19 @@ export async function handleVoiceIntegrationsApi(
       if (!agentNumber) {
         return err(400, 'callerId (DID) is required for Tata click-to-call — pass it explicitly or set a default DID under PSTN config');
       }
+      // Tata's docs say `agent_number` is "ID of the Smartflo agent who will
+      // receive the call" — i.e. their internal agent identifier, NOT a phone
+      // number. Use the per-agent carrier_agent_id when set; without it, the
+      // call queues but Tata can't match an agent ("missed" / 0:00 duration).
+      const carrierAgent = route.carrierAgentId;
+      if (!carrierAgent) {
+        return err(400,
+          'Tata requires a Smartflo agent ID (the carrier_agent_id), not just a DID. ' +
+          'Set it on the agent under /agents → Integrations → "Carrier agent ID", ' +
+          'or pass `carrierAgentId` in this request body. ' +
+          'Find the value in your Tata Smartflo portal under Users / Agents.',
+        );
+      }
       // custom_identifier flows back to us in Tata's webhook + (per docs)
       // can also reach the streaming endpoint as a customParameter. We use
       // it to carry the resolved agentId so the inbound media stream routes
@@ -341,7 +363,7 @@ export async function handleVoiceIntegrationsApi(
         ? JSON.stringify({ agentId: route.agentId })
         : '';
       const body: Record<string, unknown> = {
-        agent_number: agentNumber,
+        agent_number: carrierAgent,
         destination_number: destinationNumber,
         caller_id: agentNumber,
         async: async ? 1 : 0,

@@ -46,6 +46,7 @@ interface AgentRow {
   inbound_lookup: string | null;
   end_webhook: string | null;
   inbound_dids: string;
+  carrier_agent_id: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -68,6 +69,7 @@ function agentToJson(r: AgentRow) {
     inboundLookup: r.inbound_lookup ? JSON.parse(r.inbound_lookup) : undefined,
     endWebhook: r.end_webhook ? JSON.parse(r.end_webhook) : undefined,
     inboundDids: dids,
+    carrierAgentId: r.carrier_agent_id ?? undefined,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -152,8 +154,8 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     const id = uuid();
     const ts = now();
     await env.DB.prepare(
-      `INSERT INTO agents (id, tenant_id, name, avatar, voice, role, system_prompt_template, variables_schema, tools, llm_tier_policy, endpointing_ms, language, inbound_lookup, end_webhook, inbound_dids, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, tenant_id, name, avatar, voice, role, system_prompt_template, variables_schema, tools, llm_tier_policy, endpointing_ms, language, inbound_lookup, end_webhook, inbound_dids, carrier_agent_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         id, auth.tenantId, a.name, a.avatar ?? null, a.voice, a.role ?? null,
@@ -162,6 +164,7 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
         a.inboundLookup ? JSON.stringify(a.inboundLookup) : null,
         a.endWebhook ? JSON.stringify(a.endWebhook) : null,
         JSON.stringify(a.inboundDids ?? []),
+        a.carrierAgentId?.trim() || null,
         ts, ts,
       )
       .run();
@@ -184,7 +187,7 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
       if (!parsed.success) return err(400, parsed.error.issues[0]?.message ?? 'invalid agent');
       const a = parsed.data;
       await env.DB.prepare(
-        `UPDATE agents SET name=?, avatar=?, voice=?, role=?, system_prompt_template=?, variables_schema=?, tools=?, llm_tier_policy=?, endpointing_ms=?, language=?, inbound_lookup=?, end_webhook=?, inbound_dids=?, updated_at=?
+        `UPDATE agents SET name=?, avatar=?, voice=?, role=?, system_prompt_template=?, variables_schema=?, tools=?, llm_tier_policy=?, endpointing_ms=?, language=?, inbound_lookup=?, end_webhook=?, inbound_dids=?, carrier_agent_id=?, updated_at=?
          WHERE id=? AND tenant_id=?`,
       )
         .bind(
@@ -194,6 +197,7 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
           a.inboundLookup ? JSON.stringify(a.inboundLookup) : null,
           a.endWebhook ? JSON.stringify(a.endWebhook) : null,
           JSON.stringify(a.inboundDids ?? []),
+          a.carrierAgentId?.trim() || null,
           now(), agentId, auth.tenantId,
         )
         .run();

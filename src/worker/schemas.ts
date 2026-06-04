@@ -60,6 +60,7 @@ export const AgentSchema = z.object({
   inboundLookup: InboundLookupSchema.optional().nullable(),
   endWebhook: EndWebhookSchema.optional().nullable(),
   inboundDids: z.array(z.string().regex(/^\+?\d{6,15}$/, 'must be E.164 or local digits-only')).default([]),
+  carrierAgentId: z.string().max(120).optional().nullable(),
 });
 
 export type AgentInput = z.infer<typeof AgentSchema>;
