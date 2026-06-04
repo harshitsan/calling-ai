@@ -362,6 +362,14 @@ function StreamingEditor({ data, reload }: { data: StreamingCfg; reload: () => P
 }
 
 // ----- PSTN editor -----
+interface AgentOption {
+  id: string;
+  name: string;
+  voice: string;
+  carrierAgentId?: string;
+  inboundDids?: string[];
+}
+
 function PstnEditor({ data, reload }: { data: PstnCfg; reload: () => Promise<Integrations> }) {
   const [enabled, setEnabled] = useState(data.enabled);
   const [provider, setProvider] = useState(data.provider ?? 'tata');
@@ -378,6 +386,21 @@ function PstnEditor({ data, reload }: { data: PstnCfg; reload: () => Promise<Int
   const [calling, setCalling] = useState(false);
   const [callResult, setCallResult] = useState<{ ok: boolean; status: number; response: unknown } | null>(null);
   const [callError, setCallError] = useState<string | null>(null);
+  const [agents, setAgents] = useState<AgentOption[]>([]);
+  const [selectedAgentId, setSelectedAgentId] = useState<string>('');
+
+  useEffect(() => {
+    api<{ agents: AgentOption[] }>('/api/agents')
+      .then((r) => {
+        setAgents(r.agents);
+        const withCarrier = r.agents.find((a) => a.carrierAgentId);
+        if (withCarrier) setSelectedAgentId(withCarrier.id);
+        else if (r.agents[0]) setSelectedAgentId(r.agents[0].id);
+      })
+      .catch(() => {});
+  }, []);
+
+  const pickedAgent = agents.find((a) => a.id === selectedAgentId);
 
   const providerDefaults: Record<string, { urlHint: string; accountLabel: string; tokenLabel: string }> = {
     tata: {
@@ -429,6 +452,7 @@ function PstnEditor({ data, reload }: { data: PstnCfg; reload: () => Promise<Int
           method: 'POST',
           body: JSON.stringify({
             customerNumber: testTo.trim(),
+            agentId: selectedAgentId || undefined,
             callerId: testCallerId.trim() || undefined,
             async: testAsync ? 1 : 0,
           }),
@@ -534,6 +558,25 @@ function PstnEditor({ data, reload }: { data: PstnCfg; reload: () => Promise<Int
       <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
         <div className="text-[10px] uppercase tracking-[0.22em] text-muted-foreground/80 mb-3">
           Test click-to-call
+        </div>
+        <div className="mb-3">
+          <Label className="text-[10px] uppercase tracking-[0.18em] mb-1.5 block">Agent</Label>
+          <Select
+            value={selectedAgentId}
+            onChange={(e) => setSelectedAgentId(e.target.value)}
+          >
+            <option value="">— no agent (use defaults) —</option>
+            {agents.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.name}{a.carrierAgentId ? ` · carrier:${a.carrierAgentId}` : ' · no carrier id'}
+              </option>
+            ))}
+          </Select>
+          {pickedAgent && !pickedAgent.carrierAgentId && (
+            <p className="mt-1.5 text-[11px] text-amber-400/85">
+              ⚠ {pickedAgent.name} has no Carrier agent ID — call will queue but no Smartflo agent will pick up. Set one under /agents → Integrations.
+            </p>
+          )}
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <Input
