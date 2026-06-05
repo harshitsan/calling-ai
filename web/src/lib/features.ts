@@ -5,3 +5,4 @@
 
 export const VOICEOVERS_ENABLED = true;
 export const VOICE_INTEGRATIONS_ENABLED = true;
+export const NOTETAKER_ENABLED = true;

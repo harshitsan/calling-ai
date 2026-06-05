@@ -1,13 +1,16 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { Layout } from './components/Layout';
 import { getToken } from './lib/api';
-import { VOICEOVERS_ENABLED, VOICE_INTEGRATIONS_ENABLED } from './lib/features';
+import { NOTETAKER_ENABLED, VOICEOVERS_ENABLED, VOICE_INTEGRATIONS_ENABLED } from './lib/features';
 import { AgentForm } from './pages/AgentForm';
 import { Agents } from './pages/Agents';
 import { CallDetail } from './pages/CallDetail';
 import { Calls } from './pages/Calls';
 import { Login } from './pages/Login';
 import { Logs } from './pages/Logs';
+import { Notetaker } from './pages/Notetaker';
+import { NotetakerDetail } from './pages/NotetakerDetail';
+import { NotetakerNew } from './pages/NotetakerNew';
 import { TestCall } from './pages/TestCall';
 import { TataSetup } from './pages/TataSetup';
 import { VoiceIntegrations } from './pages/VoiceIntegrations';
@@ -48,6 +51,13 @@ export function App() {
             <>
               <Route path="/integrations" element={<VoiceIntegrations />} />
               <Route path="/integrations/tata" element={<TataSetup />} />
+            </>
+          )}
+          {NOTETAKER_ENABLED && (
+            <>
+              <Route path="/notetaker" element={<Notetaker />} />
+              <Route path="/notetaker/new" element={<NotetakerNew />} />
+              <Route path="/notetaker/:id" element={<NotetakerDetail />} />
             </>
           )}
         </Route>

@@ -1,12 +1,13 @@
-import { Bot, LogOut, Mic, Phone, PhoneCall, Radio, ScrollText } from 'lucide-react';
+import { Bot, FileText, LogOut, Mic, Phone, PhoneCall, Radio, ScrollText } from 'lucide-react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { clearToken } from '@/lib/api';
-import { VOICEOVERS_ENABLED, VOICE_INTEGRATIONS_ENABLED } from '@/lib/features';
+import { NOTETAKER_ENABLED, VOICEOVERS_ENABLED, VOICE_INTEGRATIONS_ENABLED } from '@/lib/features';
 import { cn } from '@/lib/utils';
 
 const nav = [
   { to: '/agents', label: 'Agents', icon: Bot },
   ...(VOICEOVERS_ENABLED ? [{ to: '/voiceovers', label: 'Voiceovers', icon: Mic }] : []),
+  ...(NOTETAKER_ENABLED ? [{ to: '/notetaker', label: 'Notetaker', icon: FileText }] : []),
   ...(VOICE_INTEGRATIONS_ENABLED
     ? [{ to: '/integrations', label: 'Voice Integrations', icon: Radio }]
     : []),

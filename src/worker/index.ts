@@ -7,6 +7,7 @@ import { MemoryStore } from './memory-store';
 import { VOICEOVERS_ENABLED, handleVoiceoverApi } from './voiceovers';
 import { VOICE_INTEGRATIONS_ENABLED, handleVoiceIntegrationsApi } from './voice-integrations';
 import { handleTataStream } from './voice-stream-tata';
+import { NOTETAKER_ENABLED, handleNotetakerApi } from './notetaker';
 
 export { CallSession, LogHub, MemoryStore };
 
@@ -19,7 +20,7 @@ const CORS = {
 };
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (request.method === 'OPTIONS') {
@@ -44,6 +45,24 @@ export default {
     if (VOICE_INTEGRATIONS_ENABLED && url.pathname.startsWith('/api/voice-integrations')) {
       const auth = await authenticate(request, env);
       const res = await handleVoiceIntegrationsApi(request, env, auth);
+      if (res) {
+        const headers = new Headers(res.headers);
+        for (const [k, v] of Object.entries(CORS)) headers.set(k, v);
+        return new Response(res.body, { status: res.status, headers });
+      }
+    }
+
+    // Notetaker (isolated module — flip NOTETAKER_ENABLED in src/worker/notetaker.ts to disable).
+    if (NOTETAKER_ENABLED && url.pathname.startsWith('/api/notetaker')) {
+      const auth = await authenticate(request, env);
+      let resolvedAuth = auth;
+      // <audio src> can't send headers — accept `?_t=<jwt>` on audio sub-path.
+      if (!resolvedAuth && /^\/api\/notetaker\/[a-f0-9-]+\/audio$/.test(url.pathname) && request.method === 'GET') {
+        const secret = (env as unknown as { JWT_SECRET?: string }).JWT_SECRET ?? 'dev-insecure-secret-change-me';
+        const claims = await verifyJwt(url.searchParams.get('_t') ?? '', secret);
+        if (claims) resolvedAuth = { tenantId: claims.tid, userId: claims.sub };
+      }
+      const res = await handleNotetakerApi(request, env, ctx, resolvedAuth);
       if (res) {
         const headers = new Headers(res.headers);
         for (const [k, v] of Object.entries(CORS)) headers.set(k, v);
