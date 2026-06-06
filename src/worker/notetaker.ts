@@ -150,12 +150,31 @@ interface WhisperResult {
 }
 
 async function transcribeWhisper(ai: Ai, bytes: Uint8Array): Promise<WhisperResult> {
-  // Workers AI Whisper expects audio as an array of byte values.
-  const res = await ai.run(
-    '@cf/openai/whisper-large-v3-turbo' as never,
-    { audio: [...bytes] } as never,
-  );
-  return res as unknown as WhisperResult;
+  // whisper-large-v3-turbo accepts /audio as binary (Uint8Array) per Workers AI
+  // schema. Spreading a large Uint8Array into a JSON number[] tripped the
+  // binding's type validator with "Type mismatch... 'string' not in array,
+  // binary" — so we pass the Uint8Array directly.
+  try {
+    const res = await ai.run(
+      '@cf/openai/whisper-large-v3-turbo' as never,
+      { audio: bytes } as never,
+    );
+    return res as unknown as WhisperResult;
+  } catch (e) {
+    // Fallback: some accounts only have @cf/openai/whisper (legacy) which
+    // wants a proper number[]. Use Array.from rather than spread to avoid the
+    // same large-array bug.
+    const msg = (e as Error).message;
+    if (/5006|Type mismatch|whisper-large/.test(msg)) {
+      const arr = Array.from(bytes);
+      const res = await ai.run(
+        '@cf/openai/whisper' as never,
+        { audio: arr } as never,
+      );
+      return res as unknown as WhisperResult;
+    }
+    throw e;
+  }
 }
 
 async function generateNotes(env: Env, transcript: string): Promise<NotesShape> {
