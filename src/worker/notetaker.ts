@@ -18,6 +18,7 @@
 //   5. status='ready'
 
 import { OpenAiLlm, WorkersAiLlm } from './adapters';
+import { bytesToBase64 } from './codecs';
 import type { LlmPort } from '../engine/ports';
 import type { Message } from '../engine/types';
 import { err, json, now, uuid } from './util';
@@ -162,6 +163,7 @@ interface WhisperResult {
 
 const WORKERS_AI_SIZE_CUTOFF = 7 * 1024 * 1024; // ~7 MB — Workers AI 3006 cap
 const OPENAI_WHISPER_LIMIT = 25 * 1024 * 1024;
+const GEMINI_INLINE_LIMIT = 20 * 1024 * 1024;   // base64-inline ceiling for Gemini
 
 interface OpenAiWhisperResponse {
   text?: string;
@@ -237,6 +239,139 @@ async function transcribeViaDeepgram(
   };
 }
 
+interface GeminiUtterance { speaker: number; start: number; end: number; text: string }
+interface GeminiTranscriptionPayload {
+  transcript?: string;
+  language?: string;
+  durationSeconds?: number;
+  utterances?: GeminiUtterance[];
+}
+
+/** Map Gemini's MIME quirks back to something its API accepts. */
+function normalizeMimeForGemini(mime: string): string {
+  const m = mime.toLowerCase();
+  if (m === 'audio/mpeg' || m === 'audio/mp3') return 'audio/mp3';
+  if (m === 'audio/x-wav' || m === 'audio/wave') return 'audio/wav';
+  if (m === 'audio/mp4' || m === 'audio/x-m4a') return 'audio/aac';
+  if (m === 'application/octet-stream') return 'audio/mp3'; // best guess
+  return m;
+}
+
+/**
+ * Gemini 2.5 Flash multimodal transcription with diarization.
+ *
+ * We pass the audio inline (base64) and a structured-output schema that asks
+ * for speaker-tagged utterances with timestamps. Then we expand each utterance
+ * into word-level entries (proportional timestamps) so the existing detail-
+ * page transcript renderer Just Works.
+ *
+ * Quality trade-off vs Deepgram: Gemini is reasoning about voice differences
+ * via its general multimodal stack rather than a tuned diarization model.
+ * Two distinct speakers usually separate cleanly; three+ voices on noisy
+ * audio gets shakier. Cost: ~$0.001 per ~30 sec of audio at gemini-2.5-flash.
+ */
+async function transcribeViaGemini(
+  apiKey: string,
+  bytes: Uint8Array,
+  mime: string,
+): Promise<WhisperResult> {
+  const audioMime = normalizeMimeForGemini(mime);
+  const body = {
+    contents: [
+      {
+        parts: [
+          {
+            text:
+              "Transcribe this audio recording. Identify each distinct speaker and tag every utterance with a speaker number (0, 1, 2, ...) in order of first appearance. Estimate start/end timestamps in seconds. If you can't separate speakers, return everything as speaker 0.",
+          },
+          {
+            inline_data: { mime_type: audioMime, data: bytesToBase64(bytes) },
+          },
+        ],
+      },
+    ],
+    generationConfig: {
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'object',
+        properties: {
+          transcript: { type: 'string' },
+          language: { type: 'string' },
+          durationSeconds: { type: 'number' },
+          utterances: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                speaker: { type: 'integer' },
+                start: { type: 'number' },
+                end: { type: 'number' },
+                text: { type: 'string' },
+              },
+              required: ['speaker', 'start', 'end', 'text'],
+            },
+          },
+        },
+        required: ['transcript', 'utterances'],
+      },
+      temperature: 0,
+      maxOutputTokens: 16384,
+    },
+  };
+
+  // Try modern models in order; fall back if one is unavailable.
+  const models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+  let lastErr = '';
+  for (const model of models) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (res.status === 404) { lastErr = `${model}: 404`; continue; }
+    if (!res.ok) {
+      throw new Error(`Gemini ${model} ${res.status}: ${(await res.text().catch(() => '')).slice(0, 300)}`);
+    }
+    const json = (await res.json()) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const raw = json.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+    if (!raw) throw new Error('Gemini returned empty body');
+    let parsed: GeminiTranscriptionPayload;
+    try { parsed = JSON.parse(raw) as GeminiTranscriptionPayload; }
+    catch { throw new Error(`Gemini JSON parse failed: ${raw.slice(0, 200)}`); }
+
+    const utterances = parsed.utterances ?? [];
+    // Convert utterances → word-level entries so the existing UI renders.
+    const words: { word: string; start: number; end: number; speaker?: number }[] = [];
+    for (const u of utterances) {
+      const tokens = (u.text ?? '').split(/\s+/).filter(Boolean);
+      if (tokens.length === 0) continue;
+      const dur = Math.max(0, (u.end ?? u.start) - u.start);
+      const per = dur > 0 ? dur / tokens.length : 0;
+      for (let i = 0; i < tokens.length; i++) {
+        words.push({
+          word: tokens[i]!,
+          start: u.start + i * per,
+          end: u.start + (i + 1) * per,
+          speaker: typeof u.speaker === 'number' ? u.speaker : 0,
+        });
+      }
+    }
+    const transcript = parsed.transcript || utterances.map((u) => u.text).join(' ');
+    return {
+      text: transcript,
+      words,
+      transcription_info: {
+        language: parsed.language,
+        duration: parsed.durationSeconds,
+      },
+    };
+  }
+  throw new Error(`Gemini: no usable model (${lastErr})`);
+}
+
 async function transcribeViaOpenAi(
   apiKey: string,
   bytes: Uint8Array,
@@ -268,20 +403,26 @@ async function transcribeViaOpenAi(
 }
 
 /**
- * Tiered transcription router. Deepgram is preferred when configured because
- * it's cheaper ($0.0043 vs $0.006/min), faster, has no file-size cap, and is
- * the same provider as our Aura TTS + Flux live STT. Whisper paths exist as
- * fallbacks for tenants who haven't BYOK'd a Deepgram key.
+ * Tiered transcription router.
  *
- *   1. Any size, DEEPGRAM_API_KEY set → direct Deepgram Nova-3 (preferred)
- *   2. <7 MB, no Deepgram → Workers AI Whisper-large-v3-turbo (free)
- *   3. <25 MB, no Deepgram → OpenAI Whisper API (BYOK OPENAI_API_KEY)
- *   4. Otherwise → clear error suggesting which key to add.
+ *   1. DEEPGRAM_API_KEY set                  → Deepgram Nova-3 direct (best
+ *                                              diarization, any size, $0.0043/min)
+ *   2. GOOGLE_AI_API_KEY set + ≤20 MB        → Gemini multimodal (good diarization,
+ *                                              uses existing Google key)
+ *   3. <7 MB, no diarization key             → Workers AI Whisper turbo (free, no
+ *                                              speaker labels)
+ *   4. <25 MB + OPENAI_API_KEY               → OpenAI whisper-1 (no speaker labels)
+ *   5. Otherwise                             → clear error.
  */
 async function transcribeWhisper(env: Env, bytes: Uint8Array, mime: string): Promise<WhisperResult> {
-  const env2 = env as unknown as { OPENAI_API_KEY?: string; DEEPGRAM_API_KEY?: string };
+  const env2 = env as unknown as {
+    OPENAI_API_KEY?: string;
+    DEEPGRAM_API_KEY?: string;
+    GOOGLE_AI_API_KEY?: string;
+  };
   const sizeMb = bytes.length / 1024 / 1024;
   const tooBigForWorkersAi = bytes.length > WORKERS_AI_SIZE_CUTOFF;
+  const tooBigForGemini = bytes.length > GEMINI_INLINE_LIMIT;
   const tooBigForOpenAi = bytes.length > OPENAI_WHISPER_LIMIT;
 
   // Tier 1: Deepgram direct — preferred whenever the key is set.
@@ -289,7 +430,17 @@ async function transcribeWhisper(env: Env, bytes: Uint8Array, mime: string): Pro
     return transcribeViaDeepgram(env2.DEEPGRAM_API_KEY, bytes, mime);
   }
 
-  // Tier 2: Small file → Workers AI Whisper (free).
+  // Tier 2: Gemini multimodal — uses existing GOOGLE_AI_API_KEY, returns
+  // speaker labels. Only path with diarization when Deepgram isn't set.
+  if (env2.GOOGLE_AI_API_KEY && !tooBigForGemini) {
+    try {
+      return await transcribeViaGemini(env2.GOOGLE_AI_API_KEY, bytes, mime);
+    } catch (e) {
+      console.warn('[notetaker] Gemini failed, falling through:', (e as Error).message);
+    }
+  }
+
+  // Tier 3: Small file → Workers AI Whisper (free, no diarization).
   if (!tooBigForWorkersAi) {
     try {
       const res = await env.AI.run(
@@ -300,11 +451,11 @@ async function transcribeWhisper(env: Env, bytes: Uint8Array, mime: string): Pro
     } catch (e) {
       const msg = (e as Error).message;
       if (!/3006|too large|5006|Type mismatch/.test(msg)) throw e;
-      console.warn('[notetaker] Workers AI Whisper rejected — falling through to OpenAI');
+      console.warn('[notetaker] Workers AI Whisper rejected — falling through');
     }
   }
 
-  // Tier 3: Medium file → OpenAI Whisper.
+  // Tier 4: Medium file → OpenAI Whisper.
   if (!tooBigForOpenAi && env2.OPENAI_API_KEY) {
     return transcribeViaOpenAi(env2.OPENAI_API_KEY, bytes, mime);
   }
@@ -319,7 +470,8 @@ async function transcribeWhisper(env: Env, bytes: Uint8Array, mime: string): Pro
   }
   throw new Error(
     'audio too large for Workers AI and no BYOK transcription key configured. ' +
-    'Set DEEPGRAM_API_KEY (any size, recommended) or OPENAI_API_KEY (≤25 MB).',
+    'Set DEEPGRAM_API_KEY (recommended) or GOOGLE_AI_API_KEY (diarization, ≤20 MB) ' +
+    'or OPENAI_API_KEY (≤25 MB, no diarization).',
   );
 }
 
