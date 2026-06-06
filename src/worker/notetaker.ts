@@ -149,32 +149,80 @@ interface WhisperResult {
   transcription_info?: { language?: string; duration?: number };
 }
 
-async function transcribeWhisper(ai: Ai, bytes: Uint8Array): Promise<WhisperResult> {
-  // whisper-large-v3-turbo accepts /audio as binary (Uint8Array) per Workers AI
-  // schema. Spreading a large Uint8Array into a JSON number[] tripped the
-  // binding's type validator with "Type mismatch... 'string' not in array,
-  // binary" — so we pass the Uint8Array directly.
-  try {
-    const res = await ai.run(
-      '@cf/openai/whisper-large-v3-turbo' as never,
-      { audio: bytes } as never,
-    );
-    return res as unknown as WhisperResult;
-  } catch (e) {
-    // Fallback: some accounts only have @cf/openai/whisper (legacy) which
-    // wants a proper number[]. Use Array.from rather than spread to avoid the
-    // same large-array bug.
-    const msg = (e as Error).message;
-    if (/5006|Type mismatch|whisper-large/.test(msg)) {
-      const arr = Array.from(bytes);
-      const res = await ai.run(
-        '@cf/openai/whisper' as never,
-        { audio: arr } as never,
+const WORKERS_AI_SIZE_CUTOFF = 7 * 1024 * 1024; // ~7 MB — Workers AI 3006 cap
+const OPENAI_WHISPER_LIMIT = 25 * 1024 * 1024;
+
+interface OpenAiWhisperResponse {
+  text?: string;
+  language?: string;
+  duration?: number;
+  words?: { word: string; start: number; end: number }[];
+}
+
+async function transcribeViaOpenAi(
+  apiKey: string,
+  bytes: Uint8Array,
+  mime: string,
+): Promise<WhisperResult> {
+  const form = new FormData();
+  // Wrap the bytes in a Blob — fetch will multipart-encode it correctly.
+  const blob = new Blob([bytes], { type: mime || 'audio/mpeg' });
+  form.append('file', blob, `audio.${mime.includes('wav') ? 'wav' : mime.includes('m4a') || mime.includes('mp4') ? 'm4a' : 'mp3'}`);
+  form.append('model', 'whisper-1');
+  form.append('response_format', 'verbose_json');
+  form.append('timestamp_granularities[]', 'word');
+
+  const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${apiKey}` },
+    body: form,
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`OpenAI Whisper ${res.status}: ${errText.slice(0, 300)}`);
+  }
+  const json = (await res.json()) as OpenAiWhisperResponse;
+  return {
+    text: json.text,
+    words: json.words ?? [],
+    transcription_info: { language: json.language, duration: json.duration },
+  };
+}
+
+async function transcribeWhisper(env: Env, bytes: Uint8Array, mime: string): Promise<WhisperResult> {
+  const env2 = env as unknown as { OPENAI_API_KEY?: string };
+  const tooBigForWorkersAi = bytes.length > WORKERS_AI_SIZE_CUTOFF;
+
+  // For small files, try Workers AI first — it's free + fast.
+  if (!tooBigForWorkersAi) {
+    try {
+      const res = await env.AI.run(
+        '@cf/openai/whisper-large-v3-turbo' as never,
+        { audio: bytes } as never,
       );
       return res as unknown as WhisperResult;
+    } catch (e) {
+      const msg = (e as Error).message;
+      // Only fall through on size/type errors. Re-throw anything else.
+      if (!/3006|too large|5006|Type mismatch/.test(msg)) throw e;
+      console.warn('[notetaker] Workers AI Whisper rejected — falling back to OpenAI');
     }
-    throw e;
   }
+
+  // OpenAI Whisper fallback — covers up to 25 MB.
+  if (bytes.length > OPENAI_WHISPER_LIMIT) {
+    throw new Error(
+      `audio exceeds 25 MB OpenAI Whisper limit (got ${(bytes.length / 1024 / 1024).toFixed(1)} MB). ` +
+      `Compress to ~64 kbps mono or split the file. Future: we'll add automatic chunking.`,
+    );
+  }
+  if (!env2.OPENAI_API_KEY) {
+    throw new Error(
+      'audio too large for Workers AI and OPENAI_API_KEY not configured. ' +
+      'Set the OpenAI key as a Worker secret to enable large-file transcription.',
+    );
+  }
+  return transcribeViaOpenAi(env2.OPENAI_API_KEY, bytes, mime);
 }
 
 async function generateNotes(env: Env, transcript: string): Promise<NotesShape> {
@@ -223,7 +271,7 @@ async function processJob(env: Env, jobId: string, tenantId: string): Promise<vo
     const buf = await obj.arrayBuffer();
     const audio = new Uint8Array(buf);
 
-    const whisper = await transcribeWhisper(env.AI, audio);
+    const whisper = await transcribeWhisper(env, audio, row.mime_type);
     const transcript = (whisper.text ?? '').trim();
     if (!transcript) { await fail('transcription returned empty text'); return; }
 
