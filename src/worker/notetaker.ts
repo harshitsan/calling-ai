@@ -99,6 +99,10 @@ function extFromMime(mime: string): string {
 
 const NOTES_PROMPT = `You extract structured meeting notes from transcripts.
 
+The transcript MAY contain speaker labels like [Speaker 0], [Speaker 1], etc.
+Use those + content cues (e.g. someone introducing themselves as "Alex") to
+map speaker numbers to names where possible.
+
 Return ONLY a single JSON object with these exact keys:
 {
   "summary": "2-3 sentences of what this call/meeting was about",
@@ -106,13 +110,13 @@ Return ONLY a single JSON object with these exact keys:
   "keyTopics": ["topic #1", "..."],
   "sentiment": "positive" | "neutral" | "negative" | "mixed",
   "decisions": ["decision reached on..."],
-  "speakers": ["distinct named participants if identifiable"]
+  "speakers": ["Alex (Speaker 0)", "Mira (Speaker 1)"]
 }
 
 - If a list has no items, return [].
 - Do NOT include markdown, prose, or commentary outside the JSON.
-- Speakers come from the content (e.g. "Alex said…", "Mira mentioned…").
-  If you can't identify speakers, return [].`;
+- For speakers: pair each name with its speaker number when identifiable;
+  if only the number is known, return e.g. "Speaker 0" without a name.`;
 
 function safeParseNotes(raw: string): NotesShape {
   const empty: NotesShape = {
@@ -145,7 +149,7 @@ interface WhisperResult {
   text?: string;
   vtt?: string;
   word_count?: number;
-  words?: { word: string; start: number; end: number }[];
+  words?: { word: string; start: number; end: number; speaker?: number }[];
   transcription_info?: { language?: string; duration?: number };
 }
 
@@ -164,7 +168,14 @@ interface DeepgramResponse {
     channels?: Array<{
       alternatives?: Array<{
         transcript?: string;
-        words?: Array<{ word: string; start: number; end: number; punctuated_word?: string }>;
+        words?: Array<{
+          word: string;
+          start: number;
+          end: number;
+          punctuated_word?: string;
+          speaker?: number;
+          speaker_confidence?: number;
+        }>;
       }>;
     }>;
   };
@@ -187,8 +198,9 @@ async function transcribeViaDeepgram(
     model: 'nova-3',
     smart_format: 'true',
     punctuate: 'true',
-    diarize: 'false',
+    diarize: 'true',           // speaker labels per word
     detect_language: 'true',
+    paragraphs: 'true',
   });
   const res = await fetch(`https://api.deepgram.com/v1/listen?${params}`, {
     method: 'POST',
@@ -209,6 +221,7 @@ async function transcribeViaDeepgram(
     word: w.punctuated_word ?? w.word,
     start: w.start,
     end: w.end,
+    speaker: typeof w.speaker === 'number' ? w.speaker : undefined,
   }));
   return {
     text: transcript,
@@ -303,7 +316,43 @@ async function transcribeWhisper(env: Env, bytes: Uint8Array, mime: string): Pro
   );
 }
 
-async function generateNotes(env: Env, transcript: string): Promise<NotesShape> {
+/**
+ * Format the words array as a speaker-labeled transcript:
+ *   [Speaker 0] Hello, this is Alex.
+ *   [Speaker 1] Hi Alex, I'm Mira.
+ *
+ * Falls back to plain text if no speaker info present.
+ */
+function renderSpeakerTranscript(
+  text: string,
+  words: { word: string; start: number; end: number; speaker?: number }[],
+): string {
+  const hasSpeakers = words.some((w) => typeof w.speaker === 'number');
+  if (!hasSpeakers) return text;
+  const lines: string[] = [];
+  let currentSpeaker = -1;
+  let buf: string[] = [];
+  const flush = () => {
+    if (buf.length > 0) lines.push(`[Speaker ${currentSpeaker}] ${buf.join(' ')}`);
+    buf = [];
+  };
+  for (const w of words) {
+    const sp = w.speaker ?? -1;
+    if (sp !== currentSpeaker) {
+      flush();
+      currentSpeaker = sp;
+    }
+    buf.push(w.word);
+  }
+  flush();
+  return lines.join('\n');
+}
+
+async function generateNotes(
+  env: Env,
+  transcript: string,
+  words: { word: string; start: number; end: number; speaker?: number }[],
+): Promise<NotesShape> {
   const env2 = env as unknown as { OPENAI_API_KEY?: string };
   let llm: LlmPort;
   if (env2.OPENAI_API_KEY) {
@@ -313,9 +362,11 @@ async function generateNotes(env: Env, transcript: string): Promise<NotesShape> 
   } else {
     llm = new WorkersAiLlm(env.AI, { onError: (m, d) => console.warn('[notetaker-llm]', m, d) });
   }
+  // Send the speaker-labeled transcript so the LLM can map speakers → names.
+  const labeledTranscript = renderSpeakerTranscript(transcript, words);
   const messages: Message[] = [
     { role: 'system', content: NOTES_PROMPT },
-    { role: 'user', content: `Transcript:\n\n${transcript.slice(0, 24_000)}` }, // safety cap for LLM context
+    { role: 'user', content: `Transcript:\n\n${labeledTranscript.slice(0, 24_000)}` },
   ];
   let out = '';
   for await (const d of llm.generate(messages)) {
@@ -367,7 +418,7 @@ async function processJob(env: Env, jobId: string, tenantId: string): Promise<vo
       transcript.length, transcribedAt, jobId,
     ).run();
 
-    const notes = await generateNotes(env, transcript);
+    const notes = await generateNotes(env, transcript, words);
 
     await env.DB.prepare(
       `UPDATE notetaker_jobs

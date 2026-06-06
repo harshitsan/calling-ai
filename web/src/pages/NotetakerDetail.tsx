@@ -16,7 +16,19 @@ import { Card } from '@/components/ui/card';
 import { api, getToken } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
-interface Word { word: string; start: number; end: number }
+interface Word { word: string; start: number; end: number; speaker?: number }
+
+// Aurora-tinted speaker palette — same dot color stays with a speaker
+// throughout the transcript so the eye can follow them.
+const SPEAKER_PALETTE = [
+  { bg: 'bg-aurora-1/15', text: 'text-aurora-1', border: 'border-aurora-1/30' },
+  { bg: 'bg-aurora-2/15', text: 'text-aurora-2', border: 'border-aurora-2/30' },
+  { bg: 'bg-emerald-400/15', text: 'text-emerald-400', border: 'border-emerald-400/30' },
+  { bg: 'bg-amber-400/15', text: 'text-amber-400', border: 'border-amber-400/30' },
+  { bg: 'bg-sky-400/15', text: 'text-sky-400', border: 'border-sky-400/30' },
+  { bg: 'bg-rose-400/15', text: 'text-rose-400', border: 'border-rose-400/30' },
+];
+function speakerStyle(n: number) { return SPEAKER_PALETTE[n % SPEAKER_PALETTE.length]!; }
 interface Notes {
   summary: string;
   actionItems: string[];
@@ -260,44 +272,96 @@ function NotesList({ title, items, icon }: { title: string; items: string[]; ico
   );
 }
 
-interface TranscriptLine { start: number; text: string }
-function groupIntoLines(words: Word[], maxSilenceSec = 1.5, maxWords = 24): TranscriptLine[] {
+interface TranscriptLine { start: number; text: string; speaker?: number }
+/**
+ * Group words into lines. Always break on speaker change; otherwise break on
+ * long silence, sentence end, or max length. This keeps each line attributable
+ * to a single speaker for clean rendering.
+ */
+function groupIntoLines(words: Word[], maxSilenceSec = 1.5, maxWords = 28): TranscriptLine[] {
   const lines: TranscriptLine[] = [];
   let current: Word[] = [];
+  let currentSpeaker: number | undefined = undefined;
+  const flush = () => {
+    if (current.length === 0) return;
+    lines.push({
+      start: current[0]!.start,
+      text: current.map((c) => c.word).join(' ').replace(/\s+([,.!?])/g, '$1'),
+      speaker: currentSpeaker,
+    });
+    current = [];
+  };
   for (let i = 0; i < words.length; i++) {
     const w = words[i]!;
     const prev = current[current.length - 1];
-    const breakOn = !prev
-      ? false
-      : (w.start - prev.end > maxSilenceSec) || current.length >= maxWords
-        || /[.!?]$/.test(prev.word);
-    if (breakOn && current.length > 0) {
-      lines.push({ start: current[0]!.start, text: current.map((c) => c.word).join(' ').replace(/\s+([,.!?])/g, '$1') });
-      current = [];
+    const speakerChanged = current.length > 0 && w.speaker !== currentSpeaker;
+    const longGap = prev && (w.start - prev.end > maxSilenceSec);
+    const tooLong = current.length >= maxWords;
+    const sentenceEnd = prev && /[.!?]$/.test(prev.word);
+    if (speakerChanged || (current.length > 0 && (longGap || tooLong || sentenceEnd))) {
+      flush();
     }
+    if (current.length === 0) currentSpeaker = w.speaker;
     current.push(w);
   }
-  if (current.length > 0) {
-    lines.push({ start: current[0]!.start, text: current.map((c) => c.word).join(' ').replace(/\s+([,.!?])/g, '$1') });
-  }
+  flush();
   return lines;
 }
 
 function TimestampedTranscript({ words }: { words: Word[] }) {
   const lines = useMemo(() => groupIntoLines(words), [words]);
+  const hasSpeakers = useMemo(() => words.some((w) => typeof w.speaker === 'number'), [words]);
+  const distinctSpeakers = useMemo(() => {
+    const s = new Set<number>();
+    for (const l of lines) if (typeof l.speaker === 'number') s.add(l.speaker);
+    return Array.from(s).sort((a, b) => a - b);
+  }, [lines]);
+
   return (
-    <div className="space-y-2.5 max-h-[480px] overflow-y-auto pr-2">
-      {lines.map((l, i) => (
-        <div key={i} className="flex gap-3 group">
-          <span className={cn(
-            'shrink-0 font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground/55',
-            'group-hover:text-aurora-1 transition-colors min-w-[44px] text-right pt-0.5',
-          )}>
-            {fmtTimestamp(l.start)}
+    <div>
+      {hasSpeakers && distinctSpeakers.length > 0 && (
+        <div className="flex items-center gap-2 mb-3 flex-wrap">
+          <span className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground/65">
+            {distinctSpeakers.length} {distinctSpeakers.length === 1 ? 'speaker' : 'speakers'} detected
           </span>
-          <p className="text-[13px] text-foreground/90 leading-relaxed font-serif">{l.text}</p>
+          {distinctSpeakers.map((n) => {
+            const s = speakerStyle(n);
+            return (
+              <Badge key={n} className={cn('border', s.bg, s.text, s.border)}>
+                Speaker {n}
+              </Badge>
+            );
+          })}
         </div>
-      ))}
+      )}
+
+      <div className="space-y-2.5 max-h-[520px] overflow-y-auto pr-2">
+        {lines.map((l, i) => {
+          const sp = l.speaker;
+          const s = typeof sp === 'number' ? speakerStyle(sp) : null;
+          return (
+            <div key={i} className="flex gap-3 group">
+              <span className={cn(
+                'shrink-0 font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground/55',
+                'group-hover:text-aurora-1 transition-colors min-w-[44px] text-right pt-0.5',
+              )}>
+                {fmtTimestamp(l.start)}
+              </span>
+              <div className="min-w-0 flex-1">
+                {s && typeof sp === 'number' && (
+                  <span className={cn(
+                    'inline-block mr-2 mb-1 rounded-full border px-2 py-[1px] text-[9px] uppercase tracking-[0.16em] align-baseline',
+                    s.bg, s.text, s.border,
+                  )}>
+                    Speaker {sp}
+                  </span>
+                )}
+                <p className="text-[13px] text-foreground/90 leading-relaxed font-serif inline">{l.text}</p>
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
