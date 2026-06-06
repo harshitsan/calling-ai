@@ -248,14 +248,15 @@ async function transcribeViaOpenAi(
 }
 
 /**
- * Tiered transcription router:
- *   1. <7 MB → Workers AI Whisper-large-v3-turbo (free, fast)
- *   2. <25 MB OR Workers AI rejection → OpenAI Whisper API (BYOK OPENAI_API_KEY)
- *   3. Any size → direct Deepgram API (BYOK DEEPGRAM_API_KEY) — bypasses
- *      Workers AI body cap entirely; the path for hour-long meetings.
+ * Tiered transcription router. Deepgram is preferred when configured because
+ * it's cheaper ($0.0043 vs $0.006/min), faster, has no file-size cap, and is
+ * the same provider as our Aura TTS + Flux live STT. Whisper paths exist as
+ * fallbacks for tenants who haven't BYOK'd a Deepgram key.
  *
- * Deepgram is preferred for huge files even if OPENAI_API_KEY is also set,
- * because Deepgram has no size limit and Whisper caps at 25 MB.
+ *   1. Any size, DEEPGRAM_API_KEY set → direct Deepgram Nova-3 (preferred)
+ *   2. <7 MB, no Deepgram → Workers AI Whisper-large-v3-turbo (free)
+ *   3. <25 MB, no Deepgram → OpenAI Whisper API (BYOK OPENAI_API_KEY)
+ *   4. Otherwise → clear error suggesting which key to add.
  */
 async function transcribeWhisper(env: Env, bytes: Uint8Array, mime: string): Promise<WhisperResult> {
   const env2 = env as unknown as { OPENAI_API_KEY?: string; DEEPGRAM_API_KEY?: string };
@@ -263,12 +264,12 @@ async function transcribeWhisper(env: Env, bytes: Uint8Array, mime: string): Pro
   const tooBigForWorkersAi = bytes.length > WORKERS_AI_SIZE_CUTOFF;
   const tooBigForOpenAi = bytes.length > OPENAI_WHISPER_LIMIT;
 
-  // Tier 3: Huge file + Deepgram available → straight to Deepgram.
-  if (tooBigForOpenAi && env2.DEEPGRAM_API_KEY) {
+  // Tier 1: Deepgram direct — preferred whenever the key is set.
+  if (env2.DEEPGRAM_API_KEY) {
     return transcribeViaDeepgram(env2.DEEPGRAM_API_KEY, bytes, mime);
   }
 
-  // Tier 1: Small file → try Workers AI first (free).
+  // Tier 2: Small file → Workers AI Whisper (free).
   if (!tooBigForWorkersAi) {
     try {
       const res = await env.AI.run(
@@ -278,20 +279,14 @@ async function transcribeWhisper(env: Env, bytes: Uint8Array, mime: string): Pro
       return res as unknown as WhisperResult;
     } catch (e) {
       const msg = (e as Error).message;
-      // Only fall through on size/type errors. Re-throw anything else.
       if (!/3006|too large|5006|Type mismatch/.test(msg)) throw e;
-      console.warn('[notetaker] Workers AI Whisper rejected — falling through to BYOK fallback');
+      console.warn('[notetaker] Workers AI Whisper rejected — falling through to OpenAI');
     }
   }
 
-  // Tier 2: Medium file → OpenAI Whisper.
+  // Tier 3: Medium file → OpenAI Whisper.
   if (!tooBigForOpenAi && env2.OPENAI_API_KEY) {
     return transcribeViaOpenAi(env2.OPENAI_API_KEY, bytes, mime);
-  }
-
-  // Last resort: Deepgram if available (even for medium files when no OpenAI key).
-  if (env2.DEEPGRAM_API_KEY) {
-    return transcribeViaDeepgram(env2.DEEPGRAM_API_KEY, bytes, mime);
   }
 
   // Nothing left — surface a useful error.
@@ -304,7 +299,7 @@ async function transcribeWhisper(env: Env, bytes: Uint8Array, mime: string): Pro
   }
   throw new Error(
     'audio too large for Workers AI and no BYOK transcription key configured. ' +
-    'Set OPENAI_API_KEY (≤25 MB) or DEEPGRAM_API_KEY (any size) as a Worker secret.',
+    'Set DEEPGRAM_API_KEY (any size, recommended) or OPENAI_API_KEY (≤25 MB).',
   );
 }
 
