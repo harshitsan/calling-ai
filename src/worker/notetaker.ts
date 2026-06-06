@@ -100,8 +100,8 @@ function extFromMime(mime: string): string {
 const NOTES_PROMPT = `You extract structured meeting notes from transcripts.
 
 The transcript MAY contain speaker labels like [Speaker 0], [Speaker 1], etc.
-Use those + content cues (e.g. someone introducing themselves as "Alex") to
-map speaker numbers to names where possible.
+Use those + explicit content cues (e.g. someone literally saying "I'm Alex")
+to map speaker numbers to names.
 
 Return ONLY a single JSON object with these exact keys:
 {
@@ -113,10 +113,17 @@ Return ONLY a single JSON object with these exact keys:
   "speakers": ["Alex (Speaker 0)", "Mira (Speaker 1)"]
 }
 
+Strict rules for "speakers":
+- If the transcript has [Speaker N] labels AND a name is EXPLICITLY stated in
+  the audio, pair them: "Alex (Speaker 0)".
+- If [Speaker N] labels exist but no name is stated, return just "Speaker 0".
+- If there are NO [Speaker N] labels at all, return [] — do NOT guess names
+  from topic or context (e.g. don't infer "Sadhguru" from food-tasting topics).
+- Maximum N speakers = how many distinct labels appear in the transcript.
+
+Other rules:
 - If a list has no items, return [].
-- Do NOT include markdown, prose, or commentary outside the JSON.
-- For speakers: pair each name with its speaker number when identifiable;
-  if only the number is known, return e.g. "Speaker 0" without a name.`;
+- Do NOT include markdown, prose, or commentary outside the JSON.`;
 
 function safeParseNotes(raw: string): NotesShape {
   const empty: NotesShape = {
