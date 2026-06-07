@@ -507,32 +507,133 @@ function renderSpeakerTranscript(
   return lines.join('\n');
 }
 
+/**
+ * Notes extractor — JSON-mode wherever possible so we don't depend on the
+ * model "remembering" to return only JSON.
+ *
+ * Preference:
+ *   1. OpenAI Responses API with response_format=json_object (reliable)
+ *   2. Gemini with responseSchema (also reliable)
+ *   3. Workers AI Llama as last resort (text mode, may fail safeParseNotes)
+ */
 async function generateNotes(
   env: Env,
   transcript: string,
   words: { word: string; start: number; end: number; speaker?: number }[],
 ): Promise<NotesShape> {
-  const env2 = env as unknown as { OPENAI_API_KEY?: string };
-  let llm: LlmPort;
-  if (env2.OPENAI_API_KEY) {
-    llm = new OpenAiLlm(env2.OPENAI_API_KEY, 'gpt-4o-mini', {
-      onError: (m, d) => console.warn('[notetaker-llm]', m, d),
-    });
-  } else {
-    llm = new WorkersAiLlm(env.AI, { onError: (m, d) => console.warn('[notetaker-llm]', m, d) });
-  }
-  // Send the speaker-labeled transcript so the LLM can map speakers → names.
+  const env2 = env as unknown as { OPENAI_API_KEY?: string; GOOGLE_AI_API_KEY?: string };
   const labeledTranscript = renderSpeakerTranscript(transcript, words);
+  const userInput = `Transcript:\n\n${labeledTranscript.slice(0, 24_000)}`;
+
+  // Tier 1: OpenAI direct (JSON mode + 30s timeout — Responses API streaming
+  // adapter wasn't enforcing JSON output, leading to "summarizing" finishing
+  // but storing an empty notes shape).
+  if (env2.OPENAI_API_KEY) {
+    try {
+      return await generateNotesOpenAi(env2.OPENAI_API_KEY, userInput);
+    } catch (e) {
+      console.warn('[notetaker-notes] OpenAI failed, falling through:', (e as Error).message);
+    }
+  }
+
+  // Tier 2: Gemini with responseSchema.
+  if (env2.GOOGLE_AI_API_KEY) {
+    try {
+      return await generateNotesGemini(env2.GOOGLE_AI_API_KEY, userInput);
+    } catch (e) {
+      console.warn('[notetaker-notes] Gemini failed, falling through:', (e as Error).message);
+    }
+  }
+
+  // Tier 3: Workers AI Llama via the streaming adapter (no JSON mode — best
+  // effort; safeParseNotes will salvage if possible).
+  const llm: LlmPort = new WorkersAiLlm(env.AI, {
+    onError: (m, d) => console.warn('[notetaker-llm]', m, d),
+  });
   const messages: Message[] = [
     { role: 'system', content: NOTES_PROMPT },
-    { role: 'user', content: `Transcript:\n\n${labeledTranscript.slice(0, 24_000)}` },
+    { role: 'user', content: userInput },
   ];
   let out = '';
   for await (const d of llm.generate(messages)) {
     if (d.type === 'text') out += d.text;
     if (d.type === 'done') break;
   }
+  if (!out.trim()) console.warn('[notetaker-notes] Workers AI Llama returned empty body');
   return safeParseNotes(out);
+}
+
+async function generateNotesOpenAi(apiKey: string, userInput: string): Promise<NotesShape> {
+  // chat.completions with response_format=json_object is the simplest reliable
+  // way to force JSON output. We don't need streaming for the notes pass.
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: NOTES_PROMPT },
+        { role: 'user', content: userInput },
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.2,
+      max_tokens: 2048,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`OpenAI ${res.status}: ${(await res.text().catch(() => '')).slice(0, 300)}`);
+  }
+  const json = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  const content = json.choices?.[0]?.message?.content ?? '';
+  if (!content) throw new Error('OpenAI returned empty content');
+  return safeParseNotes(content);
+}
+
+async function generateNotesGemini(apiKey: string, userInput: string): Promise<NotesShape> {
+  const body = {
+    contents: [{ parts: [{ text: `${NOTES_PROMPT}\n\n---\n\n${userInput}` }] }],
+    generationConfig: {
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'object',
+        properties: {
+          summary: { type: 'string' },
+          actionItems: { type: 'array', items: { type: 'string' } },
+          keyTopics: { type: 'array', items: { type: 'string' } },
+          sentiment: { type: 'string', enum: ['positive', 'neutral', 'negative', 'mixed'] },
+          decisions: { type: 'array', items: { type: 'string' } },
+          speakers: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['summary', 'actionItems', 'keyTopics', 'sentiment', 'decisions', 'speakers'],
+      },
+      temperature: 0.2,
+      maxOutputTokens: 2048,
+    },
+  };
+  const models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+  let lastErr = '';
+  for (const model of models) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (res.status === 404) { lastErr = `${model}: 404`; continue; }
+    if (!res.ok) {
+      throw new Error(`Gemini ${model} ${res.status}: ${(await res.text().catch(() => '')).slice(0, 300)}`);
+    }
+    const j = (await res.json()) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const content = j.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+    if (!content) throw new Error('Gemini returned empty content');
+    return safeParseNotes(content);
+  }
+  throw new Error(`Gemini: no usable model (${lastErr})`);
 }
 
 /**
