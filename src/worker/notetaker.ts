@@ -480,26 +480,25 @@ async function transcribeViaOpenAi(
 }
 
 /**
- * Tiered transcription router.
+ * Tiered transcription router. Deepgram is the only path that produces
+ * reliable per-word diarization (voice-pattern model — Gemini's multimodal
+ * "reasoning" approach got speakers wrong too often). Whisper paths exist
+ * only as a transcript-without-diarization fallback when Deepgram isn't
+ * configured.
  *
- *   1. DEEPGRAM_API_KEY set                  → Deepgram Nova-3 direct (best
- *                                              diarization, any size, $0.0043/min)
- *   2. GOOGLE_AI_API_KEY set + ≤20 MB        → Gemini multimodal (good diarization,
- *                                              uses existing Google key)
- *   3. <7 MB, no diarization key             → Workers AI Whisper turbo (free, no
- *                                              speaker labels)
- *   4. <25 MB + OPENAI_API_KEY               → OpenAI whisper-1 (no speaker labels)
- *   5. Otherwise                             → clear error.
+ *   1. DEEPGRAM_API_KEY set      → Deepgram Nova-3 direct (any size,
+ *                                  $0.0043/min + $0.001/min diarization)
+ *   2. <7 MB, no Deepgram        → Workers AI Whisper turbo (free, no diarization)
+ *   3. <25 MB + OPENAI_API_KEY   → OpenAI whisper-1 (no diarization)
+ *   4. Otherwise                 → clear setup error.
  */
 async function transcribeWhisper(env: Env, bytes: Uint8Array, mime: string): Promise<WhisperResult> {
   const env2 = env as unknown as {
     OPENAI_API_KEY?: string;
     DEEPGRAM_API_KEY?: string;
-    GOOGLE_AI_API_KEY?: string;
   };
   const sizeMb = bytes.length / 1024 / 1024;
   const tooBigForWorkersAi = bytes.length > WORKERS_AI_SIZE_CUTOFF;
-  const tooBigForGemini = bytes.length > GEMINI_INLINE_LIMIT;
   const tooBigForOpenAi = bytes.length > OPENAI_WHISPER_LIMIT;
 
   // Tier 1: Deepgram direct — preferred whenever the key is set.
@@ -507,27 +506,7 @@ async function transcribeWhisper(env: Env, bytes: Uint8Array, mime: string): Pro
     return transcribeViaDeepgram(env2.DEEPGRAM_API_KEY, bytes, mime);
   }
 
-  // Tier 2: Gemini multimodal — uses existing GOOGLE_AI_API_KEY, returns
-  // speaker labels. Quota / billing failures (HTTP 429) fall through to a
-  // diarization-less transcript so the user still gets a result. All other
-  // Gemini errors propagate (we want to see them in the failure card).
-  if (env2.GOOGLE_AI_API_KEY && !tooBigForGemini) {
-    try {
-      return await transcribeViaGemini(env2.GOOGLE_AI_API_KEY, bytes, mime);
-    } catch (e) {
-      const msg = (e as Error).message;
-      const isQuotaIssue = /\b429\b|RESOURCE_EXHAUSTED|prepayment credits|quota/i.test(msg);
-      if (!isQuotaIssue) throw e;
-      console.warn('[notetaker] Gemini quota exhausted — falling to Whisper (no diarization):', msg);
-      // Mark the row so the user knows why no speaker labels appear.
-      // We can't write to D1 from here without the jobId; processJob's
-      // catch block normally handles errors but this is a soft-fail.
-      // Surface via a thrown error after a successful Whisper path? No —
-      // we just continue and the detail page shows no speakers.
-    }
-  }
-
-  // Tier 3: Small file → Workers AI Whisper (free, no diarization).
+  // Tier 2: Small file → Workers AI Whisper (free, no diarization).
   if (!tooBigForWorkersAi) {
     try {
       const res = await env.AI.run(
@@ -542,23 +521,23 @@ async function transcribeWhisper(env: Env, bytes: Uint8Array, mime: string): Pro
     }
   }
 
-  // Tier 4: Medium file → OpenAI Whisper.
+  // Tier 3: Medium file → OpenAI Whisper.
   if (!tooBigForOpenAi && env2.OPENAI_API_KEY) {
     return transcribeViaOpenAi(env2.OPENAI_API_KEY, bytes, mime);
   }
 
-  // Nothing left — surface a useful error.
+  // Nothing left — surface a useful setup error.
   if (tooBigForOpenAi) {
     throw new Error(
       `audio is ${sizeMb.toFixed(1)} MB — exceeds OpenAI Whisper's 25 MB limit. ` +
       'Configure DEEPGRAM_API_KEY as a Worker secret to transcribe files this large ' +
-      '(Deepgram batch handles up to 2 GB, ~$0.0043/min).',
+      '(Deepgram handles up to 2 GB, ~$0.0043/min + $0.001/min for diarization).',
     );
   }
   throw new Error(
-    'audio too large for Workers AI and no BYOK transcription key configured. ' +
-    'Set DEEPGRAM_API_KEY (recommended) or GOOGLE_AI_API_KEY (diarization, ≤20 MB) ' +
-    'or OPENAI_API_KEY (≤25 MB, no diarization).',
+    'no transcription key configured. Set DEEPGRAM_API_KEY (diarization, any size) ' +
+    'or OPENAI_API_KEY (≤25 MB, no diarization). Get a Deepgram key with $200 free ' +
+    'credit at console.deepgram.com.',
   );
 }
 
