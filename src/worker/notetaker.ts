@@ -247,12 +247,16 @@ interface GeminiTranscriptionPayload {
   utterances?: GeminiUtterance[];
 }
 
-/** Map Gemini's MIME quirks back to something its API accepts. */
+/** Map Gemini's MIME quirks back to something its API accepts.
+ *  Per Google docs, supported audio MIMEs are: audio/wav, audio/mp3,
+ *  audio/aiff, audio/aac, audio/ogg, audio/flac, audio/mpeg.
+ *  audio/mpeg works directly — no need to remap mp3. */
 function normalizeMimeForGemini(mime: string): string {
   const m = mime.toLowerCase();
   if (m === 'audio/mpeg' || m === 'audio/mp3') return 'audio/mp3';
   if (m === 'audio/x-wav' || m === 'audio/wave') return 'audio/wav';
-  if (m === 'audio/mp4' || m === 'audio/x-m4a') return 'audio/aac';
+  if (m === 'audio/mp4' || m === 'audio/x-m4a' || m === 'audio/m4a') return 'audio/aac';
+  if (m === 'audio/webm') return 'audio/ogg';   // webm-Opus → ogg container Gemini understands
   if (m === 'application/octet-stream') return 'audio/mp3'; // best guess
   return m;
 }
@@ -323,29 +327,60 @@ async function transcribeViaGemini(
   };
 
   // Try modern models in order; fall back if one is unavailable.
-  const models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+  const models = ['gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-1.5-flash'];
   let lastErr = '';
   for (const model of models) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 120_000);
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: ac.signal,
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = `${model}: fetch threw (${(e as Error).message})`;
+      continue;
+    }
+    clearTimeout(timer);
     if (res.status === 404) { lastErr = `${model}: 404`; continue; }
     if (!res.ok) {
-      throw new Error(`Gemini ${model} ${res.status}: ${(await res.text().catch(() => '')).slice(0, 300)}`);
+      const body = (await res.text().catch(() => '')).slice(0, 500);
+      throw new Error(`Gemini ${model} ${res.status}: ${body}`);
     }
     const json = (await res.json()) as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      candidates?: Array<{
+        content?: { parts?: Array<{ text?: string }> };
+        finishReason?: string;
+        safetyRatings?: unknown;
+      }>;
+      promptFeedback?: { blockReason?: string };
     };
-    const raw = json.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
-    if (!raw) throw new Error('Gemini returned empty body');
+    if (json.promptFeedback?.blockReason) {
+      throw new Error(`Gemini ${model}: blocked (${json.promptFeedback.blockReason})`);
+    }
+    const cand = json.candidates?.[0];
+    const raw = cand?.content?.parts?.[0]?.text ?? '';
+    if (!raw) {
+      throw new Error(
+        `Gemini ${model} returned empty body (finishReason: ${cand?.finishReason ?? 'none'}). ` +
+        `Audio MIME ${audioMime} may not be supported, or the audio exceeds the model's inline budget.`,
+      );
+    }
     let parsed: GeminiTranscriptionPayload;
     try { parsed = JSON.parse(raw) as GeminiTranscriptionPayload; }
-    catch { throw new Error(`Gemini JSON parse failed: ${raw.slice(0, 200)}`); }
+    catch { throw new Error(`Gemini JSON parse failed: ${raw.slice(0, 300)}`); }
 
     const utterances = parsed.utterances ?? [];
+    if (utterances.length === 0) {
+      throw new Error(
+        `Gemini returned no utterances. transcript=${(parsed.transcript ?? '').slice(0, 100)}…`,
+      );
+    }
     // Convert utterances → word-level entries so the existing UI renders.
     const words: { word: string; start: number; end: number; speaker?: number }[] = [];
     for (const u of utterances) {
@@ -435,12 +470,11 @@ async function transcribeWhisper(env: Env, bytes: Uint8Array, mime: string): Pro
 
   // Tier 2: Gemini multimodal — uses existing GOOGLE_AI_API_KEY, returns
   // speaker labels. Only path with diarization when Deepgram isn't set.
+  // No silent fallback — if Gemini is the diarization-capable path the user
+  // expects, an error here must be visible (it lands in the job's error
+  // field via the catch in processJob).
   if (env2.GOOGLE_AI_API_KEY && !tooBigForGemini) {
-    try {
-      return await transcribeViaGemini(env2.GOOGLE_AI_API_KEY, bytes, mime);
-    } catch (e) {
-      console.warn('[notetaker] Gemini failed, falling through:', (e as Error).message);
-    }
+    return transcribeViaGemini(env2.GOOGLE_AI_API_KEY, bytes, mime);
   }
 
   // Tier 3: Small file → Workers AI Whisper (free, no diarization).
