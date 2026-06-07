@@ -59,7 +59,10 @@
     letter-spacing: -0.005em;
   }
 
-  /* Aurora background — slow drift */
+  /* Aurora background — slow drift. The radial gradients are already very
+   * soft; the extra filter:blur(2px) gave no visual lift but forced
+   * full-viewport recompositing every frame. Promote to its own GPU layer
+   * with transform:translateZ(0) so the 32s drift doesn't repaint siblings. */
   body::before {
     content: '';
     position: fixed;
@@ -70,9 +73,13 @@
       radial-gradient(1000px 800px at 86% 14%, hsl(var(--aurora-2) / 0.20), transparent 62%),
       radial-gradient(800px 600px at 78% 92%, hsl(var(--aurora-3) / 0.16), transparent 60%),
       radial-gradient(700px 500px at 18% 86%, hsl(var(--aurora-4) / 0.14), transparent 60%);
-    filter: blur(2px);
     animation: aurora 32s ease-in-out infinite alternate;
     pointer-events: none;
+    will-change: transform;
+    transform: translateZ(0);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    body::before { animation: none; }
   }
 
   /* Grain overlay for film texture */
@@ -108,11 +115,18 @@
     font-weight: 400;
   }
 
-  /* Glass surface */
+  /* Glass surface.
+   * backdrop-filter is the most expensive single CSS effect — on pages with
+   * many cards (Voiceovers, Notetaker, Voice Integrations lists) the
+   * previous 28px+saturate(140%) caused noticeable scroll/render lag because
+   * every card re-blurred its background each paint.
+   *
+   * Punched up the gradient opacity to compensate (so the glass still reads
+   * as glass without the heavy real-time blur), kept the inset highlights
+   * and drop shadows that give the depth. Modals/popovers that genuinely
+   * need backdrop-blur opt in via .glass-blur. */
   .glass {
-    background: linear-gradient(180deg, hsl(var(--card) / 0.62), hsl(var(--card) / 0.45));
-    backdrop-filter: blur(28px) saturate(140%);
-    -webkit-backdrop-filter: blur(28px) saturate(140%);
+    background: linear-gradient(180deg, hsl(var(--card) / 0.86), hsl(var(--card) / 0.72));
     border: 1px solid hsl(0 0% 100% / 0.06);
     box-shadow:
       inset 0 1px 0 hsl(0 0% 100% / 0.04),
@@ -122,7 +136,13 @@
       0 14px 30px -20px hsl(0 0% 0% / 0.5);
   }
   .glass-strong {
-    background: linear-gradient(180deg, hsl(var(--card) / 0.78), hsl(var(--card) / 0.6));
+    background: linear-gradient(180deg, hsl(var(--card) / 0.94), hsl(var(--card) / 0.82));
+  }
+  /* Opt-in real blur — use on full-screen modals / popovers where the
+   * effect is most visible, NOT on every card in a list. */
+  .glass-blur {
+    backdrop-filter: blur(12px) saturate(120%);
+    -webkit-backdrop-filter: blur(12px) saturate(120%);
   }
   .glass:hover { border-color: hsl(0 0% 100% / 0.1); }
 

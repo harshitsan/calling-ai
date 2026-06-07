@@ -128,7 +128,7 @@ export function VoicePicker({ value, language, onChange }: Props) {
         >
           <div className="absolute inset-0 bg-background/75 backdrop-blur-md" />
           <div
-            className="relative glass rounded-2xl w-full max-w-[680px] max-h-[86vh] flex flex-col overflow-hidden"
+            className="relative glass glass-blur rounded-2xl w-full max-w-[680px] max-h-[86vh] flex flex-col overflow-hidden"
             onClick={(e) => e.stopPropagation()}
           >
             <header className="px-6 pt-6 pb-5 flex items-start justify-between gap-4 border-b border-white/[0.05]">
