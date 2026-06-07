@@ -276,6 +276,9 @@ async function transcribeViaGemini(
   mime: string,
 ): Promise<WhisperResult> {
   const audioMime = normalizeMimeForGemini(mime);
+  // Gemini API uses camelCase keys throughout. snake_case fails silently
+  // (the model ignores the audio part and returns an empty/odd response,
+  // which we then fall through past without distinct error).
   const body = {
     contents: [
       {
@@ -285,7 +288,7 @@ async function transcribeViaGemini(
               "Transcribe this audio recording. Identify each distinct speaker and tag every utterance with a speaker number (0, 1, 2, ...) in order of first appearance. Estimate start/end timestamps in seconds. If you can't separate speakers, return everything as speaker 0.",
           },
           {
-            inline_data: { mime_type: audioMime, data: bytesToBase64(bytes) },
+            inlineData: { mimeType: audioMime, data: bytesToBase64(bytes) },
           },
         ],
       },
@@ -697,6 +700,15 @@ async function processJob(env: Env, jobId: string, tenantId: string): Promise<vo
     ).run();
 
     const notes = await generateNotes(env, transcript, words);
+
+    // Server-side enforcement: if the words array has no real diarization
+    // info, the LLM has no business naming speakers — strip whatever it
+    // came up with. (gpt-4o-mini was inferring speakers from conversational
+    // structure despite the strict prompt.)
+    const hasRealSpeakers = words.some((w) => typeof w.speaker === 'number');
+    if (!hasRealSpeakers) {
+      notes.speakers = [];
+    }
 
     await env.DB.prepare(
       `UPDATE notetaker_jobs
