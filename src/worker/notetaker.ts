@@ -318,7 +318,14 @@ async function transcribeViaGemini(
         parts: [
           {
             text:
-              "Transcribe this audio recording. Identify each distinct speaker and tag every utterance with a speaker number (0, 1, 2, ...) in order of first appearance. Estimate start/end timestamps in seconds. If you can't separate speakers, return everything as speaker 0.",
+              "Produce a VERBATIM transcription of this audio recording. " +
+              "REQUIREMENTS:\n" +
+              "1. Include EVERY word that is spoken. Do not summarize, paraphrase, abridge, or skip any portion. Filler words ('um', 'uh', 'like', 'you know') should be included.\n" +
+              "2. Cover the audio from start to end. Do not stop early.\n" +
+              "3. Identify each distinct speaker. Tag every utterance with a speaker number (0, 1, 2, ...) in order of first appearance.\n" +
+              "4. Provide accurate start/end timestamps in seconds for each utterance. The last utterance's end MUST be near the total audio duration.\n" +
+              "5. Split utterances at speaker changes and at natural sentence boundaries — short utterances are fine, but keep complete sentences together when one speaker is talking continuously.\n" +
+              "6. If you genuinely cannot separate speakers, return everything as speaker 0 (but try first).",
           },
           {
             inlineData: { mimeType: audioMime, data: bytesToBase64(bytes) },
@@ -351,12 +358,15 @@ async function transcribeViaGemini(
         required: ['transcript', 'utterances'],
       },
       temperature: 0,
-      maxOutputTokens: 16384,
+      // Maxed for gemini-2.5-flash (65 K). 2.0-flash caps at 8 K so it
+      // silently truncates; we prefer 2.5-flash for that reason.
+      maxOutputTokens: 65536,
     },
   };
 
-  // Try modern models in order; fall back if one is unavailable.
-  const models = ['gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-1.5-flash'];
+  // Prefer 2.5-flash first — it has a 65 K output-token budget. 2.0-flash
+  // caps at 8 K and was silently truncating long verbatim transcripts.
+  const models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
   let lastErr = '';
   for (const model of models) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
