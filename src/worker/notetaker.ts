@@ -566,30 +566,38 @@ async function generateNotes(
 async function generateNotesOpenAi(apiKey: string, userInput: string): Promise<NotesShape> {
   // chat.completions with response_format=json_object is the simplest reliable
   // way to force JSON output. We don't need streaming for the notes pass.
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: NOTES_PROMPT },
-        { role: 'user', content: userInput },
-      ],
-      response_format: { type: 'json_object' },
-      temperature: 0.2,
-      max_tokens: 2048,
-    }),
-  });
-  if (!res.ok) {
-    throw new Error(`OpenAI ${res.status}: ${(await res.text().catch(() => '')).slice(0, 300)}`);
+  // Hard 90s timeout so a hung remote can't pin the job in 'summarizing' forever.
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 90_000);
+  try {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: NOTES_PROMPT },
+          { role: 'user', content: userInput },
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0.2,
+        max_tokens: 2048,
+      }),
+      signal: ac.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`OpenAI ${res.status}: ${(await res.text().catch(() => '')).slice(0, 300)}`);
+    }
+    const json = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const content = json.choices?.[0]?.message?.content ?? '';
+    if (!content) throw new Error('OpenAI returned empty content');
+    return safeParseNotes(content);
+  } finally {
+    clearTimeout(timer);
   }
-  const json = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-  const content = json.choices?.[0]?.message?.content ?? '';
-  if (!content) throw new Error('OpenAI returned empty content');
-  return safeParseNotes(content);
 }
 
 async function generateNotesGemini(apiKey: string, userInput: string): Promise<NotesShape> {
@@ -617,21 +625,28 @@ async function generateNotesGemini(apiKey: string, userInput: string): Promise<N
   let lastErr = '';
   for (const model of models) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (res.status === 404) { lastErr = `${model}: 404`; continue; }
-    if (!res.ok) {
-      throw new Error(`Gemini ${model} ${res.status}: ${(await res.text().catch(() => '')).slice(0, 300)}`);
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 90_000);
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: ac.signal,
+      });
+      if (res.status === 404) { lastErr = `${model}: 404`; continue; }
+      if (!res.ok) {
+        throw new Error(`Gemini ${model} ${res.status}: ${(await res.text().catch(() => '')).slice(0, 300)}`);
+      }
+      const j = (await res.json()) as {
+        candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      };
+      const content = j.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+      if (!content) throw new Error('Gemini returned empty content');
+      return safeParseNotes(content);
+    } finally {
+      clearTimeout(timer);
     }
-    const j = (await res.json()) as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-    };
-    const content = j.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
-    if (!content) throw new Error('Gemini returned empty content');
-    return safeParseNotes(content);
   }
   throw new Error(`Gemini: no usable model (${lastErr})`);
 }
