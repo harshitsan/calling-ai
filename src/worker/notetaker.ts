@@ -469,12 +469,23 @@ async function transcribeWhisper(env: Env, bytes: Uint8Array, mime: string): Pro
   }
 
   // Tier 2: Gemini multimodal — uses existing GOOGLE_AI_API_KEY, returns
-  // speaker labels. Only path with diarization when Deepgram isn't set.
-  // No silent fallback — if Gemini is the diarization-capable path the user
-  // expects, an error here must be visible (it lands in the job's error
-  // field via the catch in processJob).
+  // speaker labels. Quota / billing failures (HTTP 429) fall through to a
+  // diarization-less transcript so the user still gets a result. All other
+  // Gemini errors propagate (we want to see them in the failure card).
   if (env2.GOOGLE_AI_API_KEY && !tooBigForGemini) {
-    return transcribeViaGemini(env2.GOOGLE_AI_API_KEY, bytes, mime);
+    try {
+      return await transcribeViaGemini(env2.GOOGLE_AI_API_KEY, bytes, mime);
+    } catch (e) {
+      const msg = (e as Error).message;
+      const isQuotaIssue = /\b429\b|RESOURCE_EXHAUSTED|prepayment credits|quota/i.test(msg);
+      if (!isQuotaIssue) throw e;
+      console.warn('[notetaker] Gemini quota exhausted — falling to Whisper (no diarization):', msg);
+      // Mark the row so the user knows why no speaker labels appear.
+      // We can't write to D1 from here without the jobId; processJob's
+      // catch block normally handles errors but this is a soft-fail.
+      // Surface via a thrown error after a successful Whisper path? No —
+      // we just continue and the detail page shows no speakers.
+    }
   }
 
   // Tier 3: Small file → Workers AI Whisper (free, no diarization).
