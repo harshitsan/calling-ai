@@ -61,6 +61,7 @@ interface NotesShape {
   sentiment: 'positive' | 'neutral' | 'negative' | 'mixed';
   decisions: string[];
   speakers: string[];
+  speakerMap: Record<string, string | null>;
 }
 
 function rowToJson(r: JobRow): Record<string, unknown> {
@@ -101,8 +102,15 @@ function extFromMime(mime: string): string {
 const NOTES_PROMPT = `You extract structured meeting notes from transcripts.
 
 The transcript MAY contain speaker labels like [Speaker 0], [Speaker 1], etc.
-Use those + explicit content cues (e.g. someone literally saying "I'm Alex")
-to map speaker numbers to names.
+Your job for the "speakers" field is to map each speaker NUMBER to a real
+person's NAME whenever the transcript reveals it.
+
+How to find names in the transcript:
+1. Direct introduction: "I'm Alex", "My name is Mira", "This is Sadhguru"
+2. Being addressed: "Welcome back Sadhguru", "All right Alex", "Thanks Mira"
+3. Being referred to in third person: "Sadhguru, what do you think?", "As Alex said"
+4. Signature phrases / known content patterns ONLY IF very strong (e.g.
+   someone explicitly says they host a specific show)
 
 Return ONLY a single JSON object with these exact keys:
 {
@@ -111,16 +119,20 @@ Return ONLY a single JSON object with these exact keys:
   "keyTopics": ["topic #1", "..."],
   "sentiment": "positive" | "neutral" | "negative" | "mixed",
   "decisions": ["decision reached on..."],
-  "speakers": ["Alex (Speaker 0)", "Mira (Speaker 1)"]
+  "speakers": ["Sadhguru (Speaker 0)", "Speaker 1", "Ian Somerhalder (Speaker 2)"],
+  "speakerMap": { "0": "Sadhguru", "1": null, "2": "Ian Somerhalder" }
 }
 
-Strict rules for "speakers":
-- If the transcript has [Speaker N] labels AND a name is EXPLICITLY stated in
-  the audio, pair them: "Alex (Speaker 0)".
-- If [Speaker N] labels exist but no name is stated, return just "Speaker 0".
-- If there are NO [Speaker N] labels at all, return [] — do NOT guess names
-  from topic or context (e.g. don't infer "Sadhguru" from food-tasting topics).
-- Maximum N speakers = how many distinct labels appear in the transcript.
+Strict rules for speakers / speakerMap:
+- ONE entry per distinct [Speaker N] number that appears in the transcript.
+- If you can identify the name from the transcript (rules 1-3 above), include
+  it in BOTH the speakers string ("Name (Speaker N)") and the speakerMap
+  ({ "N": "Name" }).
+- If you can't identify a name, use just "Speaker N" in speakers and null in
+  speakerMap.
+- If the transcript has NO [Speaker N] labels at all, return [] and {}.
+- Be aggressive about finding names when they're stated, but do NOT invent
+  names from topic/context alone.
 
 Other rules:
 - If a list has no items, return [].
@@ -129,6 +141,7 @@ Other rules:
 function safeParseNotes(raw: string): NotesShape {
   const empty: NotesShape = {
     summary: '', actionItems: [], keyTopics: [], sentiment: 'neutral', decisions: [], speakers: [],
+    speakerMap: {},
   };
   if (!raw) return empty;
   // LLMs occasionally wrap JSON in ```json fences. Strip them.
@@ -140,6 +153,21 @@ function safeParseNotes(raw: string): NotesShape {
     const arrStr = (v: unknown): string[] =>
       Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
     const sentiment = obj.sentiment;
+    let speakerMap: Record<string, string | null> = {};
+    if (obj.speakerMap && typeof obj.speakerMap === 'object' && !Array.isArray(obj.speakerMap)) {
+      for (const [k, v] of Object.entries(obj.speakerMap as Record<string, unknown>)) {
+        if (typeof v === 'string' && v.trim().length > 0) speakerMap[k] = v.trim();
+        else speakerMap[k] = null;
+      }
+    }
+    // Last-resort: derive speakerMap from "Name (Speaker N)" entries in
+    // speakers[] if speakerMap wasn't returned at all.
+    if (Object.keys(speakerMap).length === 0) {
+      for (const s of arrStr(obj.speakers)) {
+        const m = s.match(/^(.+?)\s*\(\s*Speaker\s+(\d+)\s*\)\s*$/i);
+        if (m) speakerMap[m[2]!] = m[1]!.trim();
+      }
+    }
     return {
       summary: typeof obj.summary === 'string' ? obj.summary : '',
       actionItems: arrStr(obj.actionItems),
@@ -147,6 +175,7 @@ function safeParseNotes(raw: string): NotesShape {
       sentiment: sentiment === 'positive' || sentiment === 'negative' || sentiment === 'mixed' ? sentiment : 'neutral',
       decisions: arrStr(obj.decisions),
       speakers: arrStr(obj.speakers),
+      speakerMap,
     };
   } catch {
     return empty;
@@ -753,6 +782,7 @@ async function processJob(env: Env, jobId: string, tenantId: string): Promise<vo
     const hasRealSpeakers = words.some((w) => typeof w.speaker === 'number');
     if (!hasRealSpeakers) {
       notes.speakers = [];
+      notes.speakerMap = {};
     }
 
     await env.DB.prepare(

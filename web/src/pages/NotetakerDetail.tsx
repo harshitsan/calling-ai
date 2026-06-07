@@ -36,6 +36,31 @@ interface Notes {
   sentiment: 'positive' | 'neutral' | 'negative' | 'mixed';
   decisions: string[];
   speakers: string[];
+  speakerMap?: Record<string, string | null>;
+}
+
+/** Build a Speaker N → "Name" lookup from both the structured speakerMap
+ *  and the legacy "Name (Speaker N)" strings — back-compat with notes
+ *  written before the speakerMap field existed. */
+function buildSpeakerNameLookup(notes: Notes | null): Record<number, string> {
+  if (!notes) return {};
+  const out: Record<number, string> = {};
+  if (notes.speakerMap) {
+    for (const [k, v] of Object.entries(notes.speakerMap)) {
+      const n = Number(k);
+      if (Number.isInteger(n) && typeof v === 'string' && v.trim().length > 0) {
+        out[n] = v.trim();
+      }
+    }
+  }
+  for (const s of notes.speakers ?? []) {
+    const m = s.match(/^(.+?)\s*\(\s*Speaker\s+(\d+)\s*\)\s*$/i);
+    if (m) {
+      const n = Number(m[2]);
+      if (Number.isInteger(n) && !out[n]) out[n] = m[1]!.trim();
+    }
+  }
+  return out;
 }
 interface NotetakerJob {
   id: string;
@@ -220,7 +245,10 @@ export function NotetakerDetail() {
             </button>
           </div>
           {job.transcriptWords.length > 0 ? (
-            <TimestampedTranscript words={job.transcriptWords} />
+            <TimestampedTranscript
+              words={job.transcriptWords}
+              speakerNames={buildSpeakerNameLookup(job.notes)}
+            />
           ) : (
             <p className="text-[13px] text-foreground/90 leading-relaxed whitespace-pre-wrap font-serif">
               {job.transcriptText}
@@ -308,7 +336,13 @@ function groupIntoLines(words: Word[], maxSilenceSec = 1.5, maxWords = 28): Tran
   return lines;
 }
 
-function TimestampedTranscript({ words }: { words: Word[] }) {
+function TimestampedTranscript({
+  words,
+  speakerNames = {},
+}: {
+  words: Word[];
+  speakerNames?: Record<number, string>;
+}) {
   const lines = useMemo(() => groupIntoLines(words), [words]);
   const hasSpeakers = useMemo(() => words.some((w) => typeof w.speaker === 'number'), [words]);
   const distinctSpeakers = useMemo(() => {
@@ -316,6 +350,8 @@ function TimestampedTranscript({ words }: { words: Word[] }) {
     for (const l of lines) if (typeof l.speaker === 'number') s.add(l.speaker);
     return Array.from(s).sort((a, b) => a - b);
   }, [lines]);
+
+  const labelFor = (n: number) => speakerNames[n] ?? `Speaker ${n}`;
 
   return (
     <div>
@@ -328,7 +364,7 @@ function TimestampedTranscript({ words }: { words: Word[] }) {
             const s = speakerStyle(n);
             return (
               <Badge key={n} className={cn('border', s.bg, s.text, s.border)}>
-                Speaker {n}
+                {labelFor(n)}
               </Badge>
             );
           })}
@@ -353,7 +389,7 @@ function TimestampedTranscript({ words }: { words: Word[] }) {
                     'inline-block mr-2 mb-1 rounded-full border px-2 py-[1px] text-[9px] uppercase tracking-[0.16em] align-baseline',
                     s.bg, s.text, s.border,
                   )}>
-                    Speaker {sp}
+                    {labelFor(sp)}
                   </span>
                 )}
                 <p className="text-[13px] text-foreground/90 leading-relaxed font-serif inline">{l.text}</p>
