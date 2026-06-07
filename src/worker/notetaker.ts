@@ -652,8 +652,11 @@ async function generateNotesGemini(apiKey: string, userInput: string): Promise<N
 }
 
 /**
- * Background processing for one job. Runs inside ctx.waitUntil so the
- * upload response returns in <1s; the heavy work continues afterward.
+ * Process one job — transcription + notes. Called inline from the upload
+ * handler so the work has the full request lifetime (and visibility) rather
+ * than being orphaned by ctx.waitUntil, which we observed dying mid-execution
+ * with no error trail. Upload response is slower (~30-60s for typical meeting
+ * audio) but the job actually completes; the detail page polls anyway.
  */
 async function processJob(env: Env, jobId: string, tenantId: string): Promise<void> {
   async function fail(msg: string): Promise<void> {
@@ -774,11 +777,13 @@ export async function handleNotetakerApi(
       id, auth.tenantId, auth.userId, title.trim() || null, r2Key, file.size, mime, createdAt,
     ).run();
 
-    // Kick off background processing — response returns immediately.
-    ctx.waitUntil(processJob(env, id, auth.tenantId));
+    // Synchronous: run the whole pipeline inside this request. waitUntil()
+    // was getting terminated by the runtime mid-call. Upload waits longer
+    // (~30-60s) but the job actually finishes.
+    await processJob(env, id, auth.tenantId);
 
     const row = await env.DB.prepare('SELECT * FROM notetaker_jobs WHERE id=?').bind(id).first<JobRow>();
-    return json({ notetaker: rowToJson(row!) }, { status: 202 });
+    return json({ notetaker: rowToJson(row!) }, { status: 201 });
   }
 
   // GET /api/notetaker/:id/audio
@@ -822,9 +827,9 @@ export async function handleNotetakerApi(
     await env.DB.prepare(
       `UPDATE notetaker_jobs SET status='queued', error=NULL, completed_at=NULL WHERE id=?`,
     ).bind(id).run();
-    ctx.waitUntil(processJob(env, id, auth.tenantId));
+    await processJob(env, id, auth.tenantId);
     const updated = await env.DB.prepare('SELECT * FROM notetaker_jobs WHERE id=?').bind(id).first<JobRow>();
-    return json({ notetaker: rowToJson(updated!) }, { status: 202 });
+    return json({ notetaker: rowToJson(updated!) }, { status: 200 });
   }
 
   // DELETE /api/notetaker/:id

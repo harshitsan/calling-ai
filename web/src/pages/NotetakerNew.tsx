@@ -73,6 +73,9 @@ export function NotetakerNew() {
           } catch {
             reject(new Error('invalid server response'));
           }
+        } else if (xhr.status === 0) {
+          // Connection cut mid-stream — usually proxy/browser HTTP timeout.
+          reject(new Error('request timed out — for very large files, processing can take >60s; the job is still running, check /notetaker'));
         } else {
           let msg = `upload failed (${xhr.status})`;
           try {
@@ -206,8 +209,9 @@ export function NotetakerNew() {
       </Card>
 
       <p className="text-[11px] text-muted-foreground/60 italic mt-4 leading-relaxed">
-        Processing runs in the background after upload. Transcription typically takes ~10% of the audio
-        length; you can leave this page and come back — the list view auto-refreshes.
+        The upload includes transcription + notes — typically 30-60 seconds for a few-minute file,
+        longer for large meetings. Leave this page open while it runs; we redirect you to the result
+        as soon as it's ready.
       </p>
     </div>
   );
