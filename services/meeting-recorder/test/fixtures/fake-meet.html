@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Fake Meet</title></head>
+<body>
+  <div id="prejoin">
+    <input id="name" placeholder="Your name" />
+    <button id="join">Ask to join</button>
+  </div>
+  <div id="incall" style="display:none">
+    <span id="count" data-count="2">2 participants</span>
+    <div id="removed" style="display:none">You've been removed from the meeting</div>
+    <button id="leave">Leave call</button>
+  </div>
+  <script>
+    document.getElementById('join').addEventListener('click', () => {
+      setTimeout(() => {
+        document.getElementById('prejoin').style.display = 'none';
+        document.getElementById('incall').style.display = 'block';
+      }, 300);
+    });
+    // Test hooks
+    window.__setCount = (n) => {
+      const el = document.getElementById('count');
+      el.setAttribute('data-count', String(n));
+      el.textContent = n + ' participants';
+    };
+    window.__remove = () => { document.getElementById('removed').style.display = 'block'; };
+  </script>
+</body>
+</html>
