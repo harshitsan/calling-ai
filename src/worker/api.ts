@@ -22,10 +22,10 @@ async function authenticate(request: Request, env: Env): Promise<Auth | null> {
   const apiKey = request.headers.get('x-api-key');
   if (apiKey) {
     const hash = await hashApiKey(apiKey);
-    const row = await env.DB.prepare('SELECT tenant_id FROM api_keys WHERE key_hash = ?')
+    const row = await env.DB.prepare('SELECT tenant_id, user_id FROM api_keys WHERE key_hash = ?')
       .bind(hash)
-      .first<{ tenant_id: string }>();
-    if (row) return { tenantId: row.tenant_id };
+      .first<{ tenant_id: string; user_id: string | null }>();
+    if (row) return { tenantId: row.tenant_id, userId: row.user_id ?? undefined };
   }
   return null;
 }
