@@ -29,4 +29,8 @@ describe('loadConfig', () => {
   it('throws when a required field is missing', () => {
     expect(() => loadConfig({ NOTETAKER_URL: 'x', NOTETAKER_API_KEY: 'y' })).toThrow(/CONTROL_SECRET/);
   });
+
+  it('throws when a numeric field is not a number', () => {
+    expect(() => loadConfig({ CONTROL_SECRET: 'sek', NOTETAKER_URL: 'u', NOTETAKER_API_KEY: 'k', PORT: 'abc' })).toThrow(/must be a number/);
+  });
 });

@@ -22,7 +22,7 @@ function req(env: Record<string, string | undefined>, key: string): string {
 
 function num(env: Record<string, string | undefined>, key: string, def: number): number {
   const v = env[key];
-  if (v === undefined) return def;
+  if (v === undefined || v === '') return def;
   const n = Number(v);
   if (!Number.isFinite(n)) throw new Error(`env ${key} must be a number`);
   return n;
