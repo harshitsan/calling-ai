@@ -1,11 +1,11 @@
-import { ArrowLeft, FileAudio, Loader2, Sparkles, UploadCloud, X } from 'lucide-react';
-import { useRef, useState } from 'react';
+import { ArrowLeft, FileAudio, Loader2, Sparkles, UploadCloud, Video, X } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { getToken } from '@/lib/api';
+import { api, getToken } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
 const MAX_BYTES = 100 * 1024 * 1024;
@@ -15,6 +15,125 @@ function fmtSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+interface BotSession {
+  id: string;
+  status: 'queued' | 'joining' | 'waiting_admit' | 'recording' | 'uploading' | 'done' | 'failed';
+  reason: string | null;
+}
+
+const BOT_STATUS_LABEL: Record<BotSession['status'], string> = {
+  queued: 'Bot queued…',
+  joining: 'Bot opening the meeting…',
+  waiting_admit: 'Waiting in the lobby — admit “Notetaker Bot” in Meet',
+  recording: 'Recording the meeting',
+  uploading: 'Meeting ended — uploading & transcribing…',
+  done: 'Done! The recording is in your Notetaker list.',
+  failed: 'Failed',
+};
+
+const BOT_ACTIVE = new Set<BotSession['status']>(['queued', 'joining', 'waiting_admit', 'recording', 'uploading']);
+
+function RecordMeetingCard() {
+  const [meetUrl, setMeetUrl] = useState('');
+  const [dispatching, setDispatching] = useState(false);
+  const [session, setSession] = useState<BotSession | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const active = session !== null && BOT_ACTIVE.has(session.status);
+
+  useEffect(() => {
+    if (!active || !session) return;
+    const t = setInterval(() => {
+      api<{ meeting: BotSession }>(`/api/notetaker/meetings/${session.id}`)
+        .then((r) => setSession({ ...r.meeting, id: session.id }))
+        .catch(() => { /* transient poll errors are fine — keep the last state */ });
+    }, 3000);
+    return () => clearInterval(t);
+  }, [active, session?.id, session?.status]);
+
+  async function sendBot() {
+    if (!meetUrl.trim() || dispatching) return;
+    setDispatching(true);
+    setError(null);
+    setSession(null);
+    try {
+      const r = await api<{ meeting: { sessionId: string; status: BotSession['status'] } }>(
+        '/api/notetaker/meetings',
+        { method: 'POST', body: JSON.stringify({ meetingUrl: meetUrl.trim() }) },
+      );
+      setSession({ id: r.meeting.sessionId, status: r.meeting.status, reason: null });
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setDispatching(false);
+    }
+  }
+
+  return (
+    <Card className="p-6 space-y-4 mt-6">
+      <div>
+        <div className="flex items-center gap-2 mb-1">
+          <Video className="h-4 w-4 text-aurora-1" />
+          <h2 className="font-display text-xl tracking-tight text-foreground/95">
+            Record a live Google Meet
+          </h2>
+        </div>
+        <p className="text-[12px] text-muted-foreground leading-relaxed">
+          Paste a Meet link and our bot joins, records, and drops the notes here when the
+          meeting ends. Admit the bot when it knocks.
+        </p>
+      </div>
+
+      <div className="flex items-center gap-3">
+        <Input
+          value={meetUrl}
+          onChange={(e) => setMeetUrl(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') sendBot(); }}
+          placeholder="https://meet.google.com/xxx-xxxx-xxx"
+          disabled={dispatching || active}
+        />
+        <Button onClick={sendBot} disabled={dispatching || active || !meetUrl.trim()}>
+          {dispatching ? (
+            <><Loader2 className="h-4 w-4 animate-spin" /> Sending…</>
+          ) : (
+            <><Video className="h-4 w-4" /> Send bot</>
+          )}
+        </Button>
+      </div>
+
+      {session && (
+        <div
+          className={cn(
+            'rounded-xl border px-4 py-3 text-[13px] flex items-center gap-2.5',
+            session.status === 'failed'
+              ? 'border-red-500/20 bg-red-500/[0.06] text-red-400/90'
+              : session.status === 'done'
+                ? 'border-aurora-1/25 bg-aurora-1/[0.07] text-foreground/90'
+                : 'border-white/[0.08] bg-white/[0.03] text-foreground/85',
+          )}
+        >
+          {active && <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0 text-aurora-1" />}
+          <span>
+            {BOT_STATUS_LABEL[session.status]}
+            {session.status === 'failed' && session.reason ? ` — ${session.reason}` : ''}
+          </span>
+          {session.status === 'done' && (
+            <Link to="/notetaker" className="ml-auto underline underline-offset-2 shrink-0">
+              Open Notetaker
+            </Link>
+          )}
+        </div>
+      )}
+
+      {error && (
+        <p className="text-[12px] text-red-400/90 bg-red-500/8 border border-red-500/15 rounded-md px-3 py-2">
+          {error}
+        </p>
+      )}
+    </Card>
+  );
 }
 
 export function NotetakerNew() {
@@ -207,6 +326,8 @@ export function NotetakerNew() {
           </Button>
         </div>
       </Card>
+
+      <RecordMeetingCard />
 
       <p className="text-[11px] text-muted-foreground/60 italic mt-4 leading-relaxed">
         The upload includes transcription + notes — typically 30-60 seconds for a few-minute file,

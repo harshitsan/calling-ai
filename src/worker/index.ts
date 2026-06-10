@@ -10,6 +10,7 @@ import { handleTataStream } from './voice-stream-tata';
 import { NOTETAKER_ENABLED, handleNotetakerApi, handleNotetakerQueue } from './notetaker';
 import type { NotetakerQueueMessage } from './notetaker';
 import { handleApiKeysApi } from './api-keys';
+import { handleMeetingDispatchApi } from './meeting-dispatch';
 
 export { CallSession, LogHub, MemoryStore };
 
@@ -65,6 +66,18 @@ export default {
         if (claims) sessionAuth = { tenantId: claims.tid, userId: claims.sub };
       }
       const res = await handleApiKeysApi(request, env, sessionAuth);
+      if (res) {
+        const headers = new Headers(res.headers);
+        for (const [k, v] of Object.entries(CORS)) headers.set(k, v);
+        return new Response(res.body, { status: res.status, headers });
+      }
+    }
+
+    // Meeting dispatch — must run before the notetaker handler so
+    // /api/notetaker/meetings* isn't swallowed by its catch-all 404.
+    if (NOTETAKER_ENABLED && url.pathname.startsWith('/api/notetaker/meetings')) {
+      const auth = await authenticate(request, env);
+      const res = await handleMeetingDispatchApi(request, env, auth);
       if (res) {
         const headers = new Headers(res.headers);
         for (const [k, v] of Object.entries(CORS)) headers.set(k, v);

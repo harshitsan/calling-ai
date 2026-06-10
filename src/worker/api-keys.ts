@@ -14,6 +14,34 @@ function randomHex(bytes: number): string {
   return [...buf].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+export interface MintedKey {
+  id: string;
+  name: string;
+  key: string;
+  prefix: string;
+  createdAt: number;
+}
+
+/** Mint a tenant API key. The returned `key` exists only in memory — the row
+ *  stores its SHA-256 hash and display prefix. Also used by meeting-dispatch
+ *  to give the recorder bot an upload credential for the right tenant. */
+export async function mintApiKey(
+  env: Env,
+  tenantId: string,
+  userId: string | null,
+  name: string,
+): Promise<MintedKey> {
+  const key = `cai_${randomHex(16)}`;
+  const prefix = key.slice(0, 12);
+  const id = uuid();
+  const createdAt = now();
+  await env.DB.prepare(
+    `INSERT INTO api_keys (id, tenant_id, name, key_hash, prefix, created_at, user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(id, tenantId, name, await hashApiKey(key), prefix, createdAt, userId).run();
+  return { id, name, key, prefix, createdAt };
+}
+
 /** Tenant webhook signing secret, generated lazily on first key creation. */
 async function ensureWebhookSecret(env: Env, tenantId: string): Promise<string> {
   const row = await env.DB.prepare('SELECT webhook_secret FROM tenants WHERE id = ?')
@@ -46,17 +74,10 @@ export async function handleApiKeysApi(
     if (!name) return err(400, 'name is required');
     if (name.length > 100) return err(400, 'name too long (max 100 chars)');
 
-    const key = `cai_${randomHex(16)}`;
-    const prefix = key.slice(0, 12);
-    const id = uuid();
-    const createdAt = now();
-    await env.DB.prepare(
-      `INSERT INTO api_keys (id, tenant_id, name, key_hash, prefix, created_at, user_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(id, auth.tenantId, name, await hashApiKey(key), prefix, createdAt, auth.userId ?? null).run();
+    const minted = await mintApiKey(env, auth.tenantId, auth.userId ?? null, name);
 
     const webhookSecret = await ensureWebhookSecret(env, auth.tenantId);
-    return json({ apiKey: { id, name, key, prefix, createdAt }, webhookSecret }, { status: 201 });
+    return json({ apiKey: minted, webhookSecret }, { status: 201 });
   }
 
   // GET /api/api-keys — list (prefixes only, never hashes or full keys).
