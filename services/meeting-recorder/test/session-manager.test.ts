@@ -49,3 +49,17 @@ describe('SessionManager', () => {
     expect(m.get(s.id)!.reason).toContain('boom');
   });
 });
+
+describe('per-session api keys (multi-tenant)', () => {
+  it('stores the tenant api key on the session', () => {
+    const m = makeManager(2, async () => {});
+    const s = m.start('https://meet.example/abc', 'T', 'cai_tenant1');
+    expect(s.apiKey).toBe('cai_tenant1');
+  });
+
+  it('defaults apiKey to null when not provided', () => {
+    const m = makeManager(2, async () => {});
+    const s = m.start('https://meet.example/abc', 'T');
+    expect(s.apiKey).toBeNull();
+  });
+});

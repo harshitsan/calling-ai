@@ -14,7 +14,9 @@ RUN npx playwright install chromium
 
 COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
-RUN npx tsc -p tsconfig.build.json
+# Typecheck gate only — runtime uses tsx (Node ESM needs explicit .js extensions
+# that our extensionless source omits; tsx resolves them transparently).
+RUN npx tsc -p tsconfig.build.json --noEmit
 
 COPY docker-entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

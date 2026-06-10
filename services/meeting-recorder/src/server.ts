@@ -20,13 +20,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   app.post('/recordings', async (req, reply) => {
-    const body = (req.body ?? {}) as { meetingUrl?: unknown; title?: unknown };
+    const body = (req.body ?? {}) as { meetingUrl?: unknown; title?: unknown; apiKey?: unknown };
     if (typeof body.meetingUrl !== 'string' || !body.meetingUrl) {
       return reply.code(400).send({ error: 'meetingUrl is required' });
     }
     const title = typeof body.title === 'string' ? body.title : null;
+    const apiKey = typeof body.apiKey === 'string' && body.apiKey ? body.apiKey : null;
     try {
-      const session = deps.manager.start(body.meetingUrl, title);
+      const session = deps.manager.start(body.meetingUrl, title, apiKey);
       return reply.code(201).send({ sessionId: session.id, status: session.status });
     } catch (e) {
       if ((e as Error).message === 'at capacity') {
@@ -40,7 +41,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const { id } = req.params as { id: string };
     const s = deps.manager.get(id);
     if (!s) return reply.code(404).send({ error: 'not found' });
-    return reply.send(s);
+    // apiKey is an upload credential — never echo it back.
+    const { apiKey: _apiKey, ...publicView } = s;
+    return reply.send(publicView);
   });
 
   app.post('/recordings/:id/stop', async (req, reply) => {

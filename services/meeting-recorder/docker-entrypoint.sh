@@ -8,4 +8,5 @@ pulseaudio --start --exit-idle-time=-1
 # Null sink: Chromium plays meeting audio into it; ffmpeg records its .monitor.
 pactl load-module module-null-sink sink_name="${AUDIO_SINK:-meet_sink}" sink_properties=device.description="${AUDIO_SINK:-meet_sink}"
 pactl set-default-sink "${AUDIO_SINK:-meet_sink}"
-exec node dist/index.js
+mkdir -p "$(dirname "${DB_PATH:-./data/sessions.db}")" "${RECORDINGS_DIR:-./data/recordings}"
+exec npx tsx src/index.ts

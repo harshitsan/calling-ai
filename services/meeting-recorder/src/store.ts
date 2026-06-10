@@ -14,9 +14,11 @@ export class SessionStore {
   }
 
   upsert(s: Session): void {
+    // apiKey is deliberately excluded — upload credentials never touch disk.
+    const { apiKey: _apiKey, ...row } = s;
     this.db.prepare(`INSERT INTO sessions (id, meeting_url, title, status, reason, created_at, updated_at)
       VALUES (@id, @meetingUrl, @title, @status, @reason, @createdAt, @updatedAt)
-      ON CONFLICT(id) DO UPDATE SET status=@status, reason=@reason, updated_at=@updatedAt`).run(s);
+      ON CONFLICT(id) DO UPDATE SET status=@status, reason=@reason, updated_at=@updatedAt`).run(row);
   }
 
   get(id: string): Session | undefined {
@@ -26,6 +28,7 @@ export class SessionStore {
       id: r.id as string, meetingUrl: r.meeting_url as string, title: (r.title as string) ?? null,
       status: r.status as Session['status'], reason: (r.reason as string) ?? null,
       createdAt: r.created_at as number, updatedAt: r.updated_at as number,
+      apiKey: null, // never persisted, so never recoverable from disk
     };
   }
 

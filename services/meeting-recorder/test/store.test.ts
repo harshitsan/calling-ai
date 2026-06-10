@@ -20,3 +20,16 @@ describe('SessionStore', () => {
     expect(store.get('b')!.status).toBe('done');
   });
 });
+
+describe('api key handling', () => {
+  it('persists a session carrying an apiKey without storing the key', () => {
+    const store = new SessionStore(':memory:');
+    store.upsert({
+      id: 'k1', meetingUrl: 'https://m/a', title: null, status: 'queued',
+      reason: null, createdAt: 1, updatedAt: 1, apiKey: 'cai_secret',
+    });
+    const back = store.get('k1');
+    expect(back).toBeDefined();
+    expect(JSON.stringify(back)).not.toContain('cai_secret');
+  });
+});

@@ -15,4 +15,7 @@ export interface Session {
   reason: string | null;
   createdAt: number;
   updatedAt: number;
+  /** Tenant's notetaker API key — upload credential only. Must never appear
+   *  in API responses or the on-disk store. */
+  apiKey: string | null;
 }

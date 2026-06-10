@@ -40,7 +40,7 @@ export class SessionManager {
     return true;
   }
 
-  start(meetingUrl: string, title: string | null): Session {
+  start(meetingUrl: string, title: string | null, apiKey: string | null = null): Session {
     if (this.active >= this.opts.maxConcurrent) {
       throw new Error('at capacity');
     }
@@ -53,6 +53,7 @@ export class SessionManager {
       reason: null,
       createdAt: now,
       updatedAt: now,
+      apiKey,
     };
     this.sessions.set(session.id, session);
     this.active++;

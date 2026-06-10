@@ -71,3 +71,25 @@ describe('control API', () => {
     expect(res.statusCode).toBe(200);
   });
 });
+
+describe('multi-tenant api keys', () => {
+  it('passes the apiKey from the request body to the session', async () => {
+    const { app, manager } = setup();
+    await app.inject({
+      method: 'POST', url: '/recordings', headers: { authorization: 'Bearer sek' },
+      payload: { meetingUrl: 'https://m/a', apiKey: 'cai_tenant1' },
+    });
+    expect(manager.get('sid')!.apiKey).toBe('cai_tenant1');
+  });
+
+  it('never exposes the apiKey in GET responses', async () => {
+    const { app } = setup();
+    await app.inject({
+      method: 'POST', url: '/recordings', headers: { authorization: 'Bearer sek' },
+      payload: { meetingUrl: 'https://m/a', apiKey: 'cai_secret' },
+    });
+    const res = await app.inject({ method: 'GET', url: '/recordings/sid', headers: { authorization: 'Bearer sek' } });
+    expect(res.statusCode).toBe(200);
+    expect(JSON.stringify(res.json())).not.toContain('cai_secret');
+  });
+});

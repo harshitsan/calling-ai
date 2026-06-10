@@ -1,26 +1,44 @@
 import { readFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { chromium } from 'playwright';
 import type { Config } from './config';
 import type { Runner } from './session-manager';
 import { MEET_SELECTORS } from './meet-selectors';
 import { joinMeeting, isInCall, readParticipantCount, isRemoved, leaveMeeting } from './bot-driver';
 import { Recorder } from './recorder';
+import { createSessionSink, removeSessionSink, type ExecFn } from './audio-sink';
 import { decideEnd } from './end-detector';
 import { uploadRecording } from './uploader';
 
-export function makeRunner(config: Config, now: () => number = () => Date.now()): Runner {
+const execFileAsync = promisify(execFile);
+const defaultExec: ExecFn = async (cmd, args) => {
+  const { stdout } = await execFileAsync(cmd, args);
+  return { stdout };
+};
+
+export function makeRunner(
+  config: Config,
+  now: () => number = () => Date.now(),
+  exec: ExecFn = defaultExec,
+): Runner {
   return async (session, ctx) => {
     mkdirSync(config.recordingsDir, { recursive: true });
     const outputPath = join(config.recordingsDir, `${session.id}.mp3`);
+    // Per-session sink: this session's Chromium plays only into it and this
+    // session's ffmpeg records only its monitor — parallel sessions stay
+    // acoustically isolated.
+    const { sinkName, moduleId } = await createSessionSink(exec, session.id);
     // headed under Xvfb so meeting audio actually plays into the sink.
     const browser = await chromium.launch({
       headless: false,
+      env: { ...(process.env as Record<string, string>), PULSE_SINK: sinkName },
       args: ['--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required'],
     });
     // Restore the bot's pre-authenticated Google session captured by bootstrap-login.
     const context = await browser.newContext({ storageState: config.storageStatePath });
-    const recorder = new Recorder({ outputPath, inputArgs: ['-f', 'pulse', '-i', `${config.audioSink}.monitor`] });
+    const recorder = new Recorder({ outputPath, inputArgs: ['-f', 'pulse', '-i', `${sinkName}.monitor`] });
     const page = await context.newPage();
     try {
       ctx.setStatus('joining');
@@ -55,7 +73,8 @@ export function makeRunner(config: Config, now: () => number = () => Date.now())
       ctx.setStatus('uploading');
       const bytes = readFileSync(outputPath);
       await uploadRecording({
-        notetakerUrl: config.notetakerUrl, apiKey: config.notetakerApiKey,
+        // Per-session tenant key (multi-tenant) with the global key as fallback.
+        notetakerUrl: config.notetakerUrl, apiKey: session.apiKey ?? config.notetakerApiKey,
         title: session.title, fileName: `${session.id}.mp3`, bytes: new Uint8Array(bytes),
       });
       ctx.setStatus('done', session.reason);
@@ -63,6 +82,7 @@ export function makeRunner(config: Config, now: () => number = () => Date.now())
     } finally {
       await recorder.stop().catch(() => {});
       await browser.close().catch(() => {});
+      await removeSessionSink(exec, moduleId).catch(() => {});
     }
   };
 }
