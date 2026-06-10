@@ -14,6 +14,14 @@
   "r2_buckets": [
     { "binding": "RECORDINGS", "bucket_name": "calling-ai-recordings" }
   ],
+  "queues": {
+    "producers": [
+      { "binding": "NOTETAKER_QUEUE", "queue": "notetaker-jobs" }
+    ],
+    "consumers": [
+      { "queue": "notetaker-jobs", "max_batch_size": 1, "max_retries": 5 }
+    ]
+  },
   "kv_namespaces": [
     { "binding": "TTS_CACHE", "id": "cbc4a20ca23a46c6b2b78d4bf3775225" }
   ],

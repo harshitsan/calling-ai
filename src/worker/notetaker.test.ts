@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { safeParseNotes } from './notetaker';
+import { safeParseNotes, realignSpeakers, parseCorrectionUtterances } from './notetaker';
 
 describe('safeParseNotes', () => {
   it('parses a valid JSON response', () => {
@@ -55,5 +55,68 @@ describe('safeParseNotes', () => {
     expect(out.keyTopics).toEqual([]);
     expect(out.decisions).toEqual([]);
     expect(out.speakers).toEqual([]);
+  });
+});
+
+describe('realignSpeakers', () => {
+  // Real data from job 0ad282fb: Deepgram mis-attributed the single word
+  // "Welcome" to Speaker 1 (across a 3.5s gap), splitting the sentence
+  // "Welcome back to California." The LLM correction pass regroups it.
+  it('reassigns a word the LLM moved to the correct speaker', () => {
+    const words = [
+      { word: "that's", start: 4.0, end: 4.16, speaker: 1 },
+      { word: 'for', start: 4.16, end: 4.32, speaker: 1 },
+      { word: 'you.', start: 4.32, end: 4.64, speaker: 1 },
+      { word: 'Welcome', start: 4.64, end: 5.0, speaker: 1 }, // WRONG → should be 0
+      { word: 'back', start: 8.16, end: 8.32, speaker: 0 },
+      { word: 'to', start: 8.32, end: 8.48, speaker: 0 },
+      { word: 'California.', start: 8.48, end: 8.9, speaker: 0 },
+    ];
+    const utterances = [
+      { speaker: 1, text: "that's for you." },
+      { speaker: 0, text: 'Welcome back to California.' },
+    ];
+    const out = realignSpeakers(words, utterances);
+    expect(out.find((w) => w.word === 'Welcome')!.speaker).toBe(0);
+    // Every other word, its timing, and order is preserved.
+    expect(out.length).toBe(words.length);
+    expect(out.map((w) => w.word)).toEqual(words.map((w) => w.word));
+    expect(out[0]!.start).toBe(4.0);
+    expect(out.map((w) => w.speaker)).toEqual([1, 1, 1, 0, 0, 0, 0]);
+  });
+
+  it('leaves speakers untouched when the LLM output does not align with the words', () => {
+    // Fail-safe: a garbage / reworded LLM response must never corrupt labels.
+    const words = [
+      { word: 'hello', start: 0, end: 1, speaker: 0 },
+      { word: 'world', start: 1, end: 2, speaker: 0 },
+    ];
+    const utterances = [{ speaker: 1, text: 'completely different words entirely' }];
+    const out = realignSpeakers(words, utterances);
+    expect(out.map((w) => w.speaker)).toEqual([0, 0]);
+  });
+});
+
+describe('parseCorrectionUtterances', () => {
+  it('parses a valid utterances payload', () => {
+    const raw = '{"utterances":[{"speaker":0,"text":"Welcome back."},{"speaker":1,"text":"Thanks."}]}';
+    expect(parseCorrectionUtterances(raw)).toEqual([
+      { speaker: 0, text: 'Welcome back.' },
+      { speaker: 1, text: 'Thanks.' },
+    ]);
+  });
+
+  it('strips ```json fences', () => {
+    const raw = '```json\n{"utterances":[{"speaker":2,"text":"Hi"}]}\n```';
+    expect(parseCorrectionUtterances(raw)).toEqual([{ speaker: 2, text: 'Hi' }]);
+  });
+
+  it('drops entries with a missing or non-numeric speaker or empty text', () => {
+    const raw = '{"utterances":[{"speaker":0,"text":"ok"},{"text":"no speaker"},{"speaker":1,"text":""},{"speaker":"x","text":"bad"}]}';
+    expect(parseCorrectionUtterances(raw)).toEqual([{ speaker: 0, text: 'ok' }]);
+  });
+
+  it('returns [] on invalid JSON', () => {
+    expect(parseCorrectionUtterances('not json at all')).toEqual([]);
   });
 });

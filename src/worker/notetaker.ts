@@ -52,6 +52,21 @@ interface JobRow {
   created_at: number;
   transcribed_at: number | null;
   completed_at: number | null;
+  webhook_url?: string | null;
+  webhook_status?: string | null;
+  webhook_attempts?: number | null;
+}
+
+export interface NotetakerQueueMessage {
+  kind: 'process' | 'webhook';
+  jobId: string;
+  tenantId: string;
+}
+
+/** Queue producer binding — typed loosely until `wrangler types` regen. */
+function getQueue(env: Env): { send(msg: NotetakerQueueMessage): Promise<unknown> } {
+  return (env as unknown as { NOTETAKER_QUEUE: { send(msg: NotetakerQueueMessage): Promise<unknown> } })
+    .NOTETAKER_QUEUE;
 }
 
 interface NotesShape {
@@ -573,6 +588,69 @@ function renderSpeakerTranscript(
   return lines.join('\n');
 }
 
+type SpeakerWord = { word: string; start: number; end: number; speaker?: number };
+
+function normalizeToken(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9']/g, '');
+}
+
+/**
+ * Re-apply speaker labels from an LLM correction pass onto the original
+ * timestamped words. The LLM regroups words by speaker — fixing Deepgram
+ * diarization boundary errors (e.g. a single word stranded on the wrong
+ * speaker across a pause) — but must NOT change the words themselves. We
+ * verify that by matching tokens 1:1 against the originals. On ANY divergence
+ * (reworded, dropped, or added tokens) we return the original labels untouched,
+ * so a bad LLM response can never corrupt the transcript — only improve it.
+ */
+function realignSpeakers(
+  words: SpeakerWord[],
+  utterances: { speaker: number; text: string }[],
+): SpeakerWord[] {
+  const expectedTok: string[] = [];
+  const expectedSpk: number[] = [];
+  for (const u of utterances) {
+    for (const t of u.text.split(/\s+/)) {
+      const n = normalizeToken(t);
+      if (!n) continue;
+      expectedTok.push(n);
+      expectedSpk.push(u.speaker);
+    }
+  }
+  // Fail-safe: tokens must line up 1:1 with the original words, in order.
+  if (expectedTok.length !== words.length) return words.map((w) => ({ ...w }));
+  for (let i = 0; i < words.length; i++) {
+    if (normalizeToken(words[i]!.word) !== expectedTok[i]) return words.map((w) => ({ ...w }));
+  }
+  return words.map((w, i) => ({ ...w, speaker: expectedSpk[i]! }));
+}
+
+/**
+ * Parse the diarization-correction LLM response into ordered utterances.
+ * Tolerates ```json fences / prose wrappers; drops malformed entries; returns
+ * [] on any failure so the caller falls back to the original speaker labels.
+ */
+function parseCorrectionUtterances(raw: string): { speaker: number; text: string }[] {
+  if (!raw) return [];
+  const cleaned = raw.replace(/^[\s\S]*?(\{[\s\S]*\})[\s\S]*$/m, '$1').trim();
+  try {
+    const obj = JSON.parse(cleaned) as { utterances?: unknown };
+    const arr = Array.isArray(obj.utterances) ? obj.utterances : [];
+    const out: { speaker: number; text: string }[] = [];
+    for (const u of arr) {
+      if (!u || typeof u !== 'object') continue;
+      const spk = (u as Record<string, unknown>).speaker;
+      const text = (u as Record<string, unknown>).text;
+      if (typeof spk === 'number' && Number.isFinite(spk) && typeof text === 'string' && text.trim().length > 0) {
+        out.push({ speaker: spk, text });
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Notes extractor — JSON-mode wherever possible so we don't depend on the
  * model "remembering" to return only JSON.
@@ -717,6 +795,103 @@ async function generateNotesGemini(apiKey: string, userInput: string): Promise<N
   throw new Error(`Gemini: no usable model (${lastErr})`);
 }
 
+const CORRECTION_PROMPT = `You correct speaker diarization on a transcript.
+
+You are given a transcript where each line is tagged with a speaker number,
+but some words are attributed to the WRONG speaker — diarization engines
+routinely mis-assign words at sentence boundaries and across pauses (e.g. a
+single word like "Welcome" gets stranded on the previous speaker even though
+it begins the next speaker's sentence).
+
+Your task: regroup the EXACT SAME WORDS into utterances by their correct
+speaker, using linguistic continuity. A complete sentence ("Welcome back to
+California.") belongs to ONE speaker. A question and its answer are DIFFERENT
+speakers.
+
+CRITICAL RULES:
+- Reproduce every word EXACTLY as it appears, in the EXACT SAME ORDER. Do NOT
+  add, remove, rephrase, correct, translate, or merge any word.
+- Only change which speaker each word is grouped under.
+- Reuse ONLY the speaker numbers present in the input. Do NOT invent new ones.
+- Return ONLY a JSON object: {"utterances":[{"speaker":<int>,"text":"..."}]}`;
+
+/**
+ * Diarization-correction pass. Deepgram's per-word speaker labels have boundary
+ * errors on conversational single-channel audio; an LLM with linguistic context
+ * regroups the words by their true speaker. We never trust the LLM to change
+ * words — realignSpeakers re-applies only the speaker labels, 1:1 against the
+ * originals, and any divergence falls back to the untouched input. Skipped
+ * unless there are ≥2 real speakers to disambiguate.
+ */
+async function correctSpeakers(env: Env, words: SpeakerWord[]): Promise<SpeakerWord[]> {
+  const env2 = env as unknown as { OPENAI_API_KEY?: string; GOOGLE_AI_API_KEY?: string };
+  const distinct = new Set(words.map((w) => w.speaker).filter((s): s is number => typeof s === 'number'));
+  if (distinct.size < 2) return words;
+  if (!env2.OPENAI_API_KEY && !env2.GOOGLE_AI_API_KEY) return words;
+
+  const labeled = renderSpeakerTranscript('', words).slice(0, 24_000);
+  if (!labeled.trim()) return words;
+
+  try {
+    let raw = '';
+    if (env2.OPENAI_API_KEY) {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 60_000);
+      try {
+        const res = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${env2.OPENAI_API_KEY}` },
+          body: JSON.stringify({
+            model: 'gpt-4o-mini',
+            messages: [
+              { role: 'system', content: CORRECTION_PROMPT },
+              { role: 'user', content: labeled },
+            ],
+            response_format: { type: 'json_object' },
+            temperature: 0,
+            max_tokens: 4096,
+          }),
+          signal: ac.signal,
+        });
+        if (res.ok) {
+          const j = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+          raw = j.choices?.[0]?.message?.content ?? '';
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    if (!raw && env2.GOOGLE_AI_API_KEY) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env2.GOOGLE_AI_API_KEY}`;
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 60_000);
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: `${CORRECTION_PROMPT}\n\n---\n\n${labeled}` }] }],
+            generationConfig: { responseMimeType: 'application/json', temperature: 0, maxOutputTokens: 8192 },
+          }),
+          signal: ac.signal,
+        });
+        if (res.ok) {
+          const j = (await res.json()) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+          raw = j.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    const utterances = parseCorrectionUtterances(raw);
+    if (utterances.length === 0) return words;
+    return realignSpeakers(words, utterances);
+  } catch (e) {
+    console.warn('[notetaker] speaker correction failed, keeping original labels:', (e as Error).message);
+    return words;
+  }
+}
+
 /**
  * Process one job — transcription + notes. Called inline from the upload
  * handler so the work has the full request lifetime (and visibility) rather
@@ -736,6 +911,8 @@ async function processJob(env: Env, jobId: string, tenantId: string): Promise<vo
     const row = await env.DB.prepare('SELECT * FROM notetaker_jobs WHERE id=? AND tenant_id=?')
       .bind(jobId, tenantId).first<JobRow>();
     if (!row) return;
+    // Queue redelivery must never double-process a finished job.
+    if (row.status === 'ready' || row.status === 'failed') return;
 
     await env.DB.prepare(`UPDATE notetaker_jobs SET status='transcribing' WHERE id=?`).bind(jobId).run();
 
@@ -748,7 +925,11 @@ async function processJob(env: Env, jobId: string, tenantId: string): Promise<vo
     const transcript = (whisper.text ?? '').trim();
     if (!transcript) { await fail('transcription returned empty text'); return; }
 
-    const words = Array.isArray(whisper.words) ? whisper.words : [];
+    const rawWords = Array.isArray(whisper.words) ? whisper.words : [];
+    // Diarization-correction pass: fix Deepgram's word-boundary speaker
+    // mis-attributions before we store/render. Falls back to rawWords on any
+    // failure, so this can only improve labels, never corrupt them.
+    const words = await correctSpeakers(env, rawWords);
     const duration = whisper.transcription_info?.duration ?? null;
     const transcribedAt = now();
     await env.DB.prepare(
@@ -786,6 +967,122 @@ async function processJob(env: Env, jobId: string, tenantId: string): Promise<vo
   }
 }
 
+const WEBHOOK_MAX_ATTEMPTS = 5;
+
+async function hmacSha256Hex(secret: string, body: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(body));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Deliver the job-finished webhook: a JSON payload signed with the tenant's
+ * webhook secret (HMAC-SHA256 over the raw body). Throws on any failure so
+ * the queue redelivers; the consumer caps attempts at WEBHOOK_MAX_ATTEMPTS.
+ */
+export async function deliverWebhook(
+  env: Env,
+  jobId: string,
+  tenantId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const row = await env.DB.prepare('SELECT * FROM notetaker_jobs WHERE id=? AND tenant_id=?')
+    .bind(jobId, tenantId).first<JobRow>();
+  if (!row?.webhook_url || row.webhook_status === 'delivered') return;
+
+  const tenant = await env.DB.prepare('SELECT webhook_secret FROM tenants WHERE id = ?')
+    .bind(tenantId).first<{ webhook_secret: string | null }>();
+  const secret = tenant?.webhook_secret ?? '';
+
+  const body = JSON.stringify({
+    event: row.status === 'failed' ? 'notetaker.failed' : 'notetaker.ready',
+    notetaker: rowToJson(row),
+  });
+
+  let res: Response;
+  try {
+    res = await fetchImpl(row.webhook_url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'X-Notetaker-Signature': `sha256=${await hmacSha256Hex(secret, body)}`,
+        'X-Notetaker-Delivery': uuid(),
+      },
+      body,
+    });
+  } catch (e) {
+    await env.DB.prepare('UPDATE notetaker_jobs SET webhook_attempts = webhook_attempts + 1 WHERE id=?')
+      .bind(jobId).run().catch(() => {});
+    throw new Error(`webhook fetch threw: ${(e as Error).message}`);
+  }
+  if (!res.ok) {
+    await env.DB.prepare('UPDATE notetaker_jobs SET webhook_attempts = webhook_attempts + 1 WHERE id=?')
+      .bind(jobId).run().catch(() => {});
+    throw new Error(`webhook delivery failed: status ${res.status}`);
+  }
+  await env.DB.prepare(
+    `UPDATE notetaker_jobs SET webhook_status='delivered', webhook_attempts = webhook_attempts + 1 WHERE id=?`,
+  ).bind(jobId).run();
+}
+
+interface QueueMsg {
+  body: NotetakerQueueMessage;
+  attempts: number;
+  retry(): void;
+  ack(): void;
+}
+
+/** Injectable seams so tests don't run the real transcription pipeline. */
+export interface NotetakerQueueDeps {
+  processJobImpl?: (env: Env, jobId: string, tenantId: string) => Promise<void>;
+  deliverWebhookImpl?: (env: Env, jobId: string, tenantId: string) => Promise<void>;
+}
+
+/**
+ * Queue consumer. 'process' runs the pipeline then enqueues a 'webhook'
+ * message if the job asked for one. 'webhook' delivers; failures retry via
+ * the queue until WEBHOOK_MAX_ATTEMPTS, then the job is marked
+ * webhook_status='failed' and the message acked (job stays pollable).
+ */
+export async function handleNotetakerQueue(
+  batch: { messages: QueueMsg[] },
+  env: Env,
+  deps: NotetakerQueueDeps = {},
+): Promise<void> {
+  const processImpl = deps.processJobImpl ?? processJob;
+  const deliverImpl = deps.deliverWebhookImpl
+    ?? ((e: Env, id: string, t: string) => deliverWebhook(e, id, t));
+
+  for (const m of batch.messages) {
+    const { kind, jobId, tenantId } = m.body;
+    try {
+      if (kind === 'process') {
+        await processImpl(env, jobId, tenantId);
+        const row = await env.DB.prepare('SELECT webhook_url FROM notetaker_jobs WHERE id=? AND tenant_id=?')
+          .bind(jobId, tenantId).first<{ webhook_url: string | null }>();
+        if (row?.webhook_url) {
+          await getQueue(env).send({ kind: 'webhook', jobId, tenantId });
+        }
+      } else if (kind === 'webhook') {
+        await deliverImpl(env, jobId, tenantId);
+      }
+      m.ack();
+    } catch (e) {
+      if (kind === 'webhook' && m.attempts >= WEBHOOK_MAX_ATTEMPTS) {
+        await env.DB.prepare(`UPDATE notetaker_jobs SET webhook_status='failed' WHERE id=? AND tenant_id=?`)
+          .bind(jobId, tenantId).run().catch(() => {});
+        console.error('[notetaker-queue] webhook gave up after', m.attempts, 'attempts:', jobId);
+        m.ack();
+      } else {
+        console.warn('[notetaker-queue]', kind, jobId, 'attempt', m.attempts, 'failed:', (e as Error).message);
+        m.retry();
+      }
+    }
+  }
+}
+
 interface RuntimeCtx {
   waitUntil(p: Promise<unknown>): void;
 }
@@ -798,7 +1095,8 @@ export async function handleNotetakerApi(
 ): Promise<Response | null> {
   if (!NOTETAKER_ENABLED) return null;
   const url = new URL(request.url);
-  const path = url.pathname;
+  // Public versioned alias: /api/v1/notetaker* is the same surface.
+  const path = url.pathname.replace(/^\/api\/v1\/notetaker/, '/api/notetaker');
   const method = request.method;
 
   if (!path.startsWith('/api/notetaker')) return null;
@@ -824,11 +1122,16 @@ export async function handleNotetakerApi(
     try { form = await request.formData(); } catch { return err(400, 'invalid multipart payload'); }
     const file = form.get('audio');
     const title = (form.get('title') as string | null) ?? '';
+    const webhookUrl = ((form.get('webhookUrl') as string | null) ?? '').trim();
     if (!(file instanceof File)) return err(400, '`audio` form field must be a File');
     if (file.size === 0) return err(400, 'empty audio file');
     if (file.size > MAX_AUDIO_BYTES) {
       return err(413, `audio exceeds ${MAX_AUDIO_BYTES / 1024 / 1024} MB limit`);
     }
+    if (webhookUrl && !/^https:\/\/.+/.test(webhookUrl)) {
+      return err(400, 'webhookUrl must be an https:// URL');
+    }
+    if (webhookUrl.length > 2048) return err(400, 'webhookUrl too long');
     const mime = (file.type || 'application/octet-stream').toLowerCase();
     if (!ALLOWED_MIME.has(mime) && !mime.startsWith('audio/')) {
       return err(415, `unsupported mime type: ${mime}`);
@@ -843,23 +1146,31 @@ export async function handleNotetakerApi(
       httpMetadata: { contentType: mime, cacheControl: 'private, max-age=86400' },
     });
 
+    const row: JobRow = {
+      id, tenant_id: auth.tenantId, user_id: auth.userId, title: title.trim() || null,
+      audio_r2_key: r2Key, audio_size_bytes: file.size, audio_duration_sec: null,
+      mime_type: mime, status: 'queued', error: null, transcript_text: null,
+      transcript_words: null, notes_json: null, chars: null, cost_usd_micro: null,
+      created_at: createdAt, transcribed_at: null, completed_at: null,
+      webhook_url: webhookUrl || null, webhook_status: null, webhook_attempts: 0,
+    };
     await env.DB.prepare(
       `INSERT INTO notetaker_jobs
         (id, tenant_id, user_id, title, audio_r2_key, audio_size_bytes, audio_duration_sec,
          mime_type, status, error, transcript_text, transcript_words, notes_json,
-         chars, cost_usd_micro, created_at, transcribed_at, completed_at)
-       VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'queued', NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL)`,
+         chars, cost_usd_micro, created_at, transcribed_at, completed_at, webhook_url)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'queued', NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, ?)`,
     ).bind(
-      id, auth.tenantId, auth.userId, title.trim() || null, r2Key, file.size, mime, createdAt,
+      id, auth.tenantId, auth.userId, row.title, r2Key, file.size, mime, createdAt,
+      row.webhook_url,
     ).run();
 
-    // Synchronous: run the whole pipeline inside this request. waitUntil()
-    // was getting terminated by the runtime mid-call. Upload waits longer
-    // (~30-60s) but the job actually finishes.
-    await processJob(env, id, auth.tenantId);
+    // Async: a Cloudflare Queue consumer runs the pipeline (transcribe +
+    // notes) and delivers the webhook. waitUntil() is NOT used here — it was
+    // observed dying mid-execution with no error trail.
+    await getQueue(env).send({ kind: 'process', jobId: id, tenantId: auth.tenantId });
 
-    const row = await env.DB.prepare('SELECT * FROM notetaker_jobs WHERE id=?').bind(id).first<JobRow>();
-    return json({ notetaker: rowToJson(row!) }, { status: 201 });
+    return json({ notetaker: rowToJson(row) }, { status: 202 });
   }
 
   // GET /api/notetaker/:id/audio
@@ -924,4 +1235,4 @@ export async function handleNotetakerApi(
   return err(404, 'not found');
 }
 
-export { safeParseNotes };
+export { safeParseNotes, realignSpeakers, parseCorrectionUtterances, processJob };

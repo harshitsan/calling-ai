@@ -1,4 +1,4 @@
-import { Bot, FileText, LogOut, Mic, Phone, PhoneCall, Radio, ScrollText } from 'lucide-react';
+import { Bot, FileText, KeyRound, LogOut, Mic, Phone, PhoneCall, Radio, ScrollText } from 'lucide-react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { clearToken } from '@/lib/api';
 import { NOTETAKER_ENABLED, VOICEOVERS_ENABLED, VOICE_INTEGRATIONS_ENABLED } from '@/lib/features';
@@ -14,6 +14,7 @@ const nav = [
   { to: '/calls', label: 'Call Logs', icon: Phone },
   { to: '/test', label: 'Test Call', icon: PhoneCall },
   { to: '/logs', label: 'Live Logs', icon: ScrollText },
+  { to: '/api-keys', label: 'API Keys', icon: KeyRound },
 ];
 
 export function Layout() {

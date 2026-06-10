@@ -21,6 +21,7 @@ const TataSetup = lazy(() => import('./pages/TataSetup').then((m) => ({ default:
 const Notetaker = lazy(() => import('./pages/Notetaker').then((m) => ({ default: m.Notetaker })));
 const NotetakerNew = lazy(() => import('./pages/NotetakerNew').then((m) => ({ default: m.NotetakerNew })));
 const NotetakerDetail = lazy(() => import('./pages/NotetakerDetail').then((m) => ({ default: m.NotetakerDetail })));
+const ApiKeys = lazy(() => import('./pages/ApiKeys').then((m) => ({ default: m.ApiKeys })));
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   return getToken() ? <>{children}</> : <Navigate to="/login" replace />;
@@ -55,6 +56,7 @@ export function App() {
             <Route path="/calls/:id" element={<CallDetail />} />
             <Route path="/test" element={<TestCall />} />
             <Route path="/logs" element={<Logs />} />
+            <Route path="/api-keys" element={<ApiKeys />} />
             {VOICEOVERS_ENABLED && (
               <>
                 <Route path="/voiceovers" element={<Voiceovers />} />

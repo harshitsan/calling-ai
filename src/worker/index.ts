@@ -7,7 +7,9 @@ import { MemoryStore } from './memory-store';
 import { VOICEOVERS_ENABLED, handleVoiceoverApi } from './voiceovers';
 import { VOICE_INTEGRATIONS_ENABLED, handleVoiceIntegrationsApi } from './voice-integrations';
 import { handleTataStream } from './voice-stream-tata';
-import { NOTETAKER_ENABLED, handleNotetakerApi } from './notetaker';
+import { NOTETAKER_ENABLED, handleNotetakerApi, handleNotetakerQueue } from './notetaker';
+import type { NotetakerQueueMessage } from './notetaker';
+import { handleApiKeysApi } from './api-keys';
 
 export { CallSession, LogHub, MemoryStore };
 
@@ -52,8 +54,28 @@ export default {
       }
     }
 
+    // API key self-service. Session (JWT) auth ONLY — deliberately not
+    // authenticate(), so an api key can never mint or revoke keys.
+    if (url.pathname.startsWith('/api/api-keys')) {
+      const secret = (env as unknown as { JWT_SECRET?: string }).JWT_SECRET ?? 'dev-insecure-secret-change-me';
+      const authz = request.headers.get('authorization');
+      let sessionAuth: { tenantId: string; userId: string } | null = null;
+      if (authz?.startsWith('Bearer ')) {
+        const claims = await verifyJwt(authz.slice(7), secret);
+        if (claims) sessionAuth = { tenantId: claims.tid, userId: claims.sub };
+      }
+      const res = await handleApiKeysApi(request, env, sessionAuth);
+      if (res) {
+        const headers = new Headers(res.headers);
+        for (const [k, v] of Object.entries(CORS)) headers.set(k, v);
+        return new Response(res.body, { status: res.status, headers });
+      }
+    }
+
     // Notetaker (isolated module — flip NOTETAKER_ENABLED in src/worker/notetaker.ts to disable).
-    if (NOTETAKER_ENABLED && url.pathname.startsWith('/api/notetaker')) {
+    // /api/v1/notetaker is the public versioned alias for external orgs.
+    if (NOTETAKER_ENABLED &&
+        (url.pathname.startsWith('/api/notetaker') || url.pathname.startsWith('/api/v1/notetaker'))) {
       const auth = await authenticate(request, env);
       let resolvedAuth = auth;
       // <audio src> can't send headers — accept `?_t=<jwt>` on audio sub-path.
@@ -148,6 +170,11 @@ export default {
 
     // Everything else: serve the React dashboard (SPA fallback handled by assets config).
     return env.ASSETS.fetch(request);
+  },
+
+  // Notetaker async pipeline — see queues config in wrangler.jsonc.
+  async queue(batch: MessageBatch<NotetakerQueueMessage>, env: Env): Promise<void> {
+    await handleNotetakerQueue(batch as unknown as Parameters<typeof handleNotetakerQueue>[0], env);
   },
 };
 
