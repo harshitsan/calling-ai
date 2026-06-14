@@ -1,7 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import type { Ai } from '@cloudflare/workers-types';
-import { FluxStt } from './adapters';
-import type { SttEvent } from '../engine/types';
+import { FluxStt, OpenAiLlm } from './adapters';
+import type { Message, SttEvent } from '../engine/types';
 
 // Minimal stand-in for the Workers AI Flux WebSocket.
 function fakeWs() {
@@ -64,5 +64,49 @@ describe('FluxStt', () => {
 
     ws.emit('message', { data: JSON.stringify({ type: 'TurnInfo', event: 'Update', transcript: 'Hello' }) });
     expect(events).toContainEqual({ type: 'partial', text: 'Hello' });
+  });
+});
+
+describe('OpenAiLlm (Responses API thread continuity)', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  // SSE body for one Responses turn — sets the response id and emits some text.
+  function sse(id: string) {
+    const events = [
+      `data: ${JSON.stringify({ type: 'response.created', response: { id } })}\n\n`,
+      `data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'ok' })}\n\n`,
+      `data: ${JSON.stringify({ type: 'response.completed', response: { id } })}\n\n`,
+    ];
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        const enc = new TextEncoder();
+        for (const e of events) c.enqueue(enc.encode(e));
+        c.close();
+      },
+    });
+    return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  }
+
+  async function drain(it: AsyncIterable<unknown>) {
+    for await (const _ of it) { /* consume */ }
+  }
+
+  it('sends the system prompt as instructions on EVERY turn (persona must survive past turn 1)', async () => {
+    const bodies: Record<string, unknown>[] = [];
+    let n = 0;
+    vi.stubGlobal('fetch', async (_url: string, init: RequestInit) => {
+      bodies.push(JSON.parse(init.body as string));
+      return sse(`resp-${++n}`);
+    });
+
+    const llm = new OpenAiLlm('key', 'gpt-4o-mini');
+    const sys: Message = { role: 'system', content: 'You are Zorp.' };
+    await drain(llm.generate([sys, { role: 'user', content: 'hi' }]));
+    await drain(llm.generate([sys, { role: 'user', content: 'hi' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'again' }]));
+
+    expect(bodies).toHaveLength(2);
+    // Turn 2 must continue the thread AND re-send the persona.
+    expect(bodies[1].previous_response_id).toBe('resp-1');
+    expect(bodies[1].instructions).toBe('You are Zorp.');
   });
 });

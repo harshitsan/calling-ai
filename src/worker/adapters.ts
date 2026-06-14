@@ -523,8 +523,11 @@ export class OpenAiLlm implements LlmPort {
     };
     if (this.lastResponseId) {
       body.previous_response_id = this.lastResponseId;
-    } else if (systemMsg) {
-      // First turn — anchor the thread with the system prompt as instructions.
+    }
+    if (systemMsg) {
+      // Re-send the system prompt every turn. OpenAI threads the message
+      // history via previous_response_id but does NOT carry `instructions`
+      // forward — omitting it after turn 1 drops the agent's persona.
       body.instructions = systemMsg.content;
     }
     if (this.tools && this.tools.length) {
