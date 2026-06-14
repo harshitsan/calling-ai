@@ -706,3 +706,23 @@ async function toBytes(res: unknown): Promise<Uint8Array> {
   }
   return new Uint8Array(0);
 }
+
+/**
+ * One-shot OpenAI chat completion (non-streaming) for background tasks like
+ * call summaries and memory extraction. Throws on a non-2xx response so callers
+ * can log-and-skip. Defaults to gpt-4o-mini.
+ */
+export async function openaiComplete(
+  apiKey: string,
+  messages: { role: string; content: string }[],
+  opts: { model?: string; maxTokens?: number; baseUrl?: string } = {},
+): Promise<string> {
+  const res = await fetch(`${opts.baseUrl ?? 'https://api.openai.com/v1'}/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({ model: opts.model ?? 'gpt-4o-mini', messages, max_tokens: opts.maxTokens ?? 256 }),
+  });
+  if (!res.ok) throw new Error(`OpenAI completion ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+  return data.choices?.[0]?.message?.content ?? '';
+}

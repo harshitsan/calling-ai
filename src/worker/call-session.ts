@@ -2,7 +2,7 @@ import { ConversationEngine } from '../engine/conversation-engine';
 import type { ClientPort } from '../engine/ports';
 import { dispatchTool, type ToolCall, type ToolResult } from '../engine/tools';
 import type { ClientEvent } from '../engine/types';
-import { AuraTts, FluxStt, OpenAiLlm, type OpenAiTool, WorkersAiLlm } from './adapters';
+import { AuraTts, FluxStt, OpenAiLlm, openaiComplete, type OpenAiTool, WorkersAiLlm } from './adapters';
 import { END_CALL_TOOL } from '../engine/tools';
 import type { LlmPort } from '../engine/ports';
 
@@ -14,7 +14,9 @@ import { uuid } from './util';
 
 const DEFAULT_SYSTEM_PROMPT =
   'You are a friendly, concise voice agent on a phone call. Keep replies short and natural, one or two sentences.';
-const SUMMARY_MODEL = '@cf/meta/llama-3.1-8b-instruct';
+// Background summary/memory model. OpenAI gpt-4o-mini — the Workers AI llama
+// these used was deprecated by Cloudflare (error 5028, 2026-05-30).
+const SUMMARY_MODEL = 'gpt-4o-mini';
 
 const GUARDRAILS = [
   '',
@@ -345,15 +347,18 @@ export class CallSession {
   private async summarize(): Promise<string> {
     const convo = this.turns.map((t) => `${t.role}: ${t.text}`).join('\n');
     if (!convo.trim()) return '';
+    const openaiKey = (this.env as unknown as { OPENAI_API_KEY?: string }).OPENAI_API_KEY;
+    if (!openaiKey) return '';
     try {
-      const r = (await this.env.AI.run(SUMMARY_MODEL as never, {
-        messages: [
+      const text = await openaiComplete(
+        openaiKey,
+        [
           { role: 'system', content: 'Summarize this phone call transcript in 1-2 sentences. Be factual.' },
           { role: 'user', content: convo.slice(0, 6000) },
         ],
-        max_tokens: 120,
-      } as never)) as { response?: string };
-      return (r.response ?? '').trim();
+        { model: SUMMARY_MODEL, maxTokens: 120 },
+      );
+      return text.trim();
     } catch (e) {
       this.log('llm', 'summary generation failed', { error: String(e) }, 'warn');
       return '';
@@ -492,9 +497,12 @@ export class CallSession {
     if (!this.tenantId) return;
     const convo = this.turns.map((t) => `${t.role}: ${t.text}`).join('\n');
     if (!convo.trim()) return;
+    const openaiKey = (this.env as unknown as { OPENAI_API_KEY?: string }).OPENAI_API_KEY;
+    if (!openaiKey) return;
     try {
-      const r = (await this.env.AI.run(SUMMARY_MODEL as never, {
-        messages: [
+      const response = await openaiComplete(
+        openaiKey,
+        [
           {
             role: 'system',
             content:
@@ -502,9 +510,9 @@ export class CallSession {
           },
           { role: 'user', content: convo.slice(0, 6000) },
         ],
-        max_tokens: 300,
-      } as never)) as { response?: string };
-      const match = (r.response ?? '').match(/\[[\s\S]*\]/);
+        { model: SUMMARY_MODEL, maxTokens: 300 },
+      );
+      const match = response.match(/\[[\s\S]*\]/);
       if (!match) return;
       const facts = JSON.parse(match[0]) as { subject?: string; predicate?: string; object?: string }[];
       if (!Array.isArray(facts) || facts.length === 0) return;
