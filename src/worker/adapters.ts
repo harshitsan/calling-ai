@@ -311,8 +311,6 @@ export class FluxStt implements SttPort {
     ai: Ai,
     sampleRate = '16000',
     private onError?: ErrorReporter,
-    private eotThreshold = 0.55,
-    private eotTimeoutMs = 2500,
   ) {
     this.ready = this.connect(ai, sampleRate);
   }
@@ -324,14 +322,15 @@ export class FluxStt implements SttPort {
 
   private async connect(ai: Ai, sampleRate: string): Promise<void> {
     try {
+      // NOTE: only `encoding` and `sample_rate` are accepted here. Passing
+      // Deepgram endpointing params (eot_threshold / eot_timeout_ms) makes
+      // @cf/deepgram/flux return {} instead of a WebSocket — that silently
+      // killed STT on every call (see adapters.test.ts regression guard).
       const resp = (await ai.run(
         '@cf/deepgram/flux' as never,
         {
           encoding: 'linear16',
           sample_rate: sampleRate,
-          // More eager endpointing — Flux's defaults wait too long for our use.
-          eot_threshold: this.eotThreshold,
-          eot_timeout_ms: this.eotTimeoutMs,
         } as never,
         { websocket: true } as never,
       )) as unknown as { webSocket?: WebSocket };
