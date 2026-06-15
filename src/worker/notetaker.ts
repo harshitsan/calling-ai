@@ -242,7 +242,7 @@ interface DeepgramResponse {
  * We use Nova-3 (Deepgram's flagship batch model) — same family as the
  * Flux STT we use for live calls and the Aura TTS we use for voiceovers.
  */
-async function transcribeViaDeepgram(
+export async function transcribeViaDeepgram(
   apiKey: string,
   bytes: Uint8Array,
   mime: string,
@@ -252,7 +252,11 @@ async function transcribeViaDeepgram(
     smart_format: 'true',
     punctuate: 'true',
     diarize: 'true',           // speaker labels per word
-    detect_language: 'true',
+    // Multilingual code-switching (English + Hindi + others in one file).
+    // `detect_language` picks ONE dominant language and drops the rest — it
+    // silently lost all Hindi in mixed en/hi calls. `language=multi` (Nova-3)
+    // transcribes each language in place, incl. Devanagari Hindi.
+    language: 'multi',
     paragraphs: 'true',
   });
   const res = await fetch(`https://api.deepgram.com/v1/listen?${params}`, {

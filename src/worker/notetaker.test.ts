@@ -1,5 +1,31 @@
-import { describe, expect, it } from 'vitest';
-import { safeParseNotes, realignSpeakers, parseCorrectionUtterances } from './notetaker';
+import { describe, expect, it, vi, afterEach } from 'vitest';
+import { safeParseNotes, realignSpeakers, parseCorrectionUtterances, transcribeViaDeepgram } from './notetaker';
+
+describe('transcribeViaDeepgram', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('requests multilingual transcription (language=multi, not detect_language)', async () => {
+    let url = '';
+    vi.stubGlobal('fetch', async (u: string) => {
+      url = u;
+      return new Response(
+        JSON.stringify({ results: { channels: [{ alternatives: [{ transcript: 'Hello नमस्ते', words: [] }] }] } }),
+        { status: 200 },
+      );
+    });
+
+    const out = await transcribeViaDeepgram('dg-key', new Uint8Array([1, 2, 3]), 'audio/mpeg');
+
+    const q = new URL(url).searchParams;
+    // Regression guard: detect_language picks ONE language and drops mixed
+    // Hindi/English — language=multi keeps both.
+    expect(q.get('language')).toBe('multi');
+    expect(q.get('detect_language')).toBeNull();
+    expect(q.get('model')).toBe('nova-3');
+    expect(q.get('diarize')).toBe('true');
+    expect(out.text).toBe('Hello नमस्ते');
+  });
+});
 
 describe('safeParseNotes', () => {
   it('parses a valid JSON response', () => {
