@@ -55,30 +55,30 @@
       }
     };
     window.__remove = () => { document.getElementById('removed').style.display = 'block'; };
-    // Render the People panel from a list of names (one .prow each).
+    // Render the People panel like Meet: one row per participant, each
+    // carrying a data-participant-id + aria-label name (what the in-page probe
+    // auto-discovers). The bot's own row uses id "self".
     window.__setRoster = (names) => {
       const panel = document.getElementById('panel');
       panel.innerHTML = '';
-      for (const name of names) {
+      names.forEach((name, i) => {
         const row = document.createElement('div');
-        row.className = 'prow';
-        const n = document.createElement('span');
-        n.className = 'pname';
-        n.textContent = name;
-        row.appendChild(n);
+        row.setAttribute('data-participant-id', i === 0 ? 'self' : 'p_' + name.replace(/\s+/g, '_'));
+        row.setAttribute('aria-label', name);
+        row.textContent = name;
         panel.appendChild(row);
-      }
+      });
     };
-    // Mark a set of names as currently speaking (adds/removes a .speaking child
-    // on the matching .prow — present iff that participant is talking).
+    // Mark names as currently speaking via an explicit indicator child whose
+    // class contains "speaking" (one of the markers the probe recognizes).
     window.__setSpeaking = (names) => {
       const set = new Set(names);
-      for (const row of document.querySelectorAll('#panel .prow')) {
-        const name = row.querySelector('.pname').textContent;
-        const existing = row.querySelector('.speaking');
+      for (const row of document.querySelectorAll('#panel [data-participant-id]')) {
+        const name = row.getAttribute('aria-label');
+        const existing = row.querySelector('.speaking-indicator');
         if (set.has(name) && !existing) {
           const s = document.createElement('span');
-          s.className = 'speaking';
+          s.className = 'speaking-indicator';
           row.appendChild(s);
         } else if (!set.has(name) && existing) {
           existing.remove();

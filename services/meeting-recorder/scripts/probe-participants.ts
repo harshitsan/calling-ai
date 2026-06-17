@@ -8,7 +8,8 @@
 // another participant for the bot to count, then admit the bot.
 import { chromium } from 'playwright';
 import { MEET_SELECTORS } from '../src/meet-selectors';
-import { joinMeeting, isInCall, dumpParticipantCandidates, readParticipantCount } from '../src/bot-driver';
+import { joinMeeting, isInCall, dumpParticipantCandidates } from '../src/bot-driver';
+import { PROBE_SOURCE } from '../src/participant-probe';
 
 const meetingUrl = process.argv[2];
 if (!meetingUrl) {
@@ -51,40 +52,20 @@ try {
   });
   console.log('\n[probe] RICH DUMP:\n' + JSON.stringify(rich, null, 2));
 
-  // Open the People panel and dump the roster + speaking-indicator DOM so we
-  // can confirm/correct peopleButton / participantRow / participantName /
-  // speakingIndicator in meet-selectors.ts.
-  console.log('\n[probe] opening People panel via', MEET_SELECTORS.peopleButton);
-  const peopleBtn = page.locator(MEET_SELECTORS.peopleButton).first();
-  if (await peopleBtn.count().catch(() => 0)) {
-    await peopleBtn.click({ timeout: 5000 }).catch((e) => console.log('[probe] people click failed:', e.message));
-    await page.waitForTimeout(1500);
-  } else {
-    console.log('[probe] peopleButton NOT FOUND — selector needs fixing');
-  }
-  const panel = await page.evaluate((sel) => {
-    const rows = Array.from(document.querySelectorAll(sel.row));
-    const nameMatches = Array.from(document.querySelectorAll(sel.name)).length;
-    const speakingMatches = Array.from(document.querySelectorAll(sel.speak)).length;
-    return {
-      participantRowMatches: rows.length,
-      participantRowSample: rows.slice(0, 4).map((r) => ({
-        tag: r.tagName.toLowerCase(),
-        ariaLabel: r.getAttribute('aria-label'),
-        dataPid: r.getAttribute('data-participant-id'),
-        text: (r.textContent ?? '').trim().slice(0, 60),
-        class: (r.getAttribute('class') ?? '').slice(0, 80),
-      })),
-      participantNameMatches: nameMatches,
-      speakingIndicatorMatches: speakingMatches,
-    };
-  }, { row: MEET_SELECTORS.participantRow, name: MEET_SELECTORS.participantName, speak: MEET_SELECTORS.speakingIndicator });
-  console.log('\n[probe] PANEL DUMP (current guessed selectors):\n' + JSON.stringify(panel, null, 2));
+  // Inject the SAME auto-discovery probe the bot uses and verify what it finds
+  // — this is no longer about hand-picking selectors, just confirming the
+  // runtime discovery works against the live DOM.
+  await page.evaluate(PROBE_SOURCE);
+  const marked = await page.evaluate(() => (window as any).__ntProbe.markPeopleButton());
+  console.log('\n[probe] auto-discovered People button:', marked);
+  if (marked) await page.locator('[data-nt-people="1"]').first().click({ timeout: 5000 }).catch((e) => console.log('[probe] click failed:', e.message));
+  await page.waitForTimeout(1500);
+  console.log('[probe] discover():', JSON.stringify(await page.evaluate(() => (window as any).__ntProbe.discover())));
 
   for (let i = 0; i < 6; i++) {
     await page.waitForTimeout(5000);
-    const count = await readParticipantCount(page, MEET_SELECTORS);
-    console.log(`[probe] poll#${i} participantTiles=${count} others=${count - 1}`);
+    const sample = await page.evaluate(() => (window as any).__ntProbe.sample());
+    console.log(`[probe] poll#${i} sample=${JSON.stringify(sample)}`);
   }
   console.log('[probe] done — leaving the bot in the call; close this process to exit.');
 } catch (e) {

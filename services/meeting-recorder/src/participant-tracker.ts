@@ -1,6 +1,6 @@
 import type { Page } from 'playwright';
-import type { Selectors } from './meet-selectors';
 import type { Platform } from './platform';
+import { PROBE_SOURCE, type ProbeSample } from './participant-probe';
 
 export interface TimelineSample {
   // Milliseconds since the recording started (same origin as the audio, so it
@@ -36,35 +36,55 @@ export class ParticipantTracker {
 
   /**
    * Open the People panel so the roster + speaking indicators are in the DOM.
-   * Best-effort: if the button is missing, polls just read an empty roster,
-   * which the fail-safe in the runner treats as "unknown", never "alone".
+   * The bot auto-discovers the People button (no hand-confirmed selector) and
+   * clicks it via Playwright so Meet sees a trusted event. Best-effort: if it
+   * can't be found, polls just read an empty roster, which the fail-safe in the
+   * runner treats as "unknown", never "alone".
    */
   async openPanel(): Promise<void> {
-    const btn = this.page.locator(this.platform.selectors.peopleButton).first();
-    if (await btn.count().catch(() => 0)) await btn.click({ timeout: 5000 }).catch(() => {});
+    await this.ensureInjected();
+    const marked = await this.page
+      .evaluate(() => (window as unknown as { __ntProbe: { markPeopleButton(): boolean } }).__ntProbe.markPeopleButton())
+      .catch(() => false);
+    if (marked) await this.page.locator('[data-nt-people="1"]').first().click({ timeout: 5000 }).catch(() => {});
+    const d = await this.page
+      .evaluate(() => (window as unknown as { __ntProbe: { discover(): { strategy: string; count: number } } }).__ntProbe.discover())
+      .catch(() => null);
+    if (d) console.log(`[tracker ${this.platform.id}] panel discovery: strategy=${d.strategy} rows=${d.count}`);
   }
 
   /**
-   * One poll cycle: read the roster + active speakers and record a timeline
-   * sample. Returns the confident count of OTHER participants (excluding the
-   * bot), or `null` if the panel couldn't be read at all.
+   * One poll cycle: auto-discover the roster + active speakers via the in-page
+   * probe and record a timeline sample. Returns the confident count of OTHER
+   * participants, or `null` if the panel couldn't be read at all.
    *
-   * A working read always sees at least the bot's own row, so an empty result
-   * means the selector didn't match (drift / panel not open) — the caller MUST
-   * treat null as "unknown" and never start the alone countdown on it. This is
-   * the deliberate inverse of the old bug, where an unread DOM read as "alone".
+   * A working read always sees at least the bot's own row, so `ok=false` /
+   * zero participants means the probe found nothing (DOM drift / panel not
+   * open) — the caller MUST treat null as "unknown" and never start the alone
+   * countdown on it. This is the deliberate inverse of the old bug, where an
+   * unread DOM read as "alone".
    */
   async poll(): Promise<number | null> {
-    const sel = this.platform.selectors;
-    const names = await this.readRoster(sel).catch(() => [] as string[]);
-    if (names.length === 0) return null;
-    for (const n of names) if (!this.isBot(n)) this.roster.add(n);
+    await this.ensureInjected();
+    const s = await this.page
+      .evaluate(() => (window as unknown as { __ntProbe: { sample(): ProbeSample } }).__ntProbe.sample())
+      .catch(() => null) as ProbeSample | null;
+    if (!s || !s.ok || s.participants.length === 0) return null;
 
-    const speaking = (await this.readActiveSpeakers(sel).catch(() => [] as string[]))
-      .filter((n) => !this.isBot(n));
+    const others = s.participants.filter((n) => !this.isBot(n));
+    for (const n of others) this.roster.add(n);
+    const speaking = s.speaking.filter((n) => !this.isBot(n));
     this.samples.push({ tMs: Math.max(0, this.now() - this.startedAtMs), speaking });
+    return others.length;
+  }
 
-    return names.length - 1; // minus the bot's own row
+  // Inject the auto-discovery probe if it isn't present (re-injects after any
+  // in-call SPA navigation that would have wiped window.__ntProbe).
+  private async ensureInjected(): Promise<void> {
+    const present = await this.page
+      .evaluate(() => !!(window as unknown as { __ntProbe?: unknown }).__ntProbe)
+      .catch(() => false);
+    if (!present) await this.page.evaluate(PROBE_SOURCE).catch(() => {});
   }
 
   /** Distinct participant names seen across the session (bot excluded). */
@@ -81,26 +101,6 @@ export class ParticipantTracker {
     const n = name.trim().toLowerCase();
     const bot = this.botDisplayName.trim().toLowerCase();
     return n === bot || n === `${bot} (you)` || n.endsWith('(you)');
-  }
-
-  private readRoster(sel: Selectors): Promise<string[]> {
-    return this.page.evaluate(
-      (s) => Array.from(document.querySelectorAll(s.row)).map((r) => {
-        const el = s.name ? r.querySelector(s.name) : r;
-        return (((el && el.textContent) || (r.textContent || '')) as string).trim();
-      }).filter((t) => t.length > 0),
-      { row: sel.participantRow, name: sel.participantName },
-    );
-  }
-
-  private readActiveSpeakers(sel: Selectors): Promise<string[]> {
-    return this.page.evaluate(
-      (s) => Array.from(document.querySelectorAll(s.row)).filter((r) => !!r.querySelector(s.speak)).map((r) => {
-        const el = s.name ? r.querySelector(s.name) : r;
-        return (((el && el.textContent) || (r.textContent || '')) as string).trim();
-      }).filter((t) => t.length > 0),
-      { row: sel.participantRow, name: sel.participantName, speak: sel.speakingIndicator },
-    );
   }
 }
 
