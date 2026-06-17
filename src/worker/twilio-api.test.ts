@@ -46,6 +46,13 @@ describe('POST /twilio/voice', () => {
     expect(body).toContain('<Parameter name="to" value="+14155551212"/>');
   });
 
+  it('resolves a SIP-URI To (Twilio SIP Domain) and still returns streaming TwiML', async () => {
+    const sip = { To: 'sip:+14155551212@co.sip.twilio.com', From: 'sip:+14158675309@pbx', CallSid: 'CA2' };
+    const res = await handleTwilioVoice(await signedForm(URL_, sip, 'tok'), fakeEnv([ROUTE, CFG]).env);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('<Parameter name="to" value="+14155551212"/>');
+  });
+
   it('404s when no tenant owns the dialed number', async () => {
     const res = await handleTwilioVoice(await signedForm(URL_, PARAMS, 'tok'), fakeEnv([{ match: /FROM did_routes/, first: null }]).env);
     expect(res.status).toBe(404);

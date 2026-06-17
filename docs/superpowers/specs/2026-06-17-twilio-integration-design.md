@@ -85,11 +85,14 @@ POST /api/voice-integrations/pstn/call {agentId, customerNumber, callerId}
 
 ### SIP Trunking via Twilio
 
-No new media path. Tenant creates a Twilio **Elastic SIP Trunk**, points its
-Origination/Voice webhook at our `/twilio/voice`, and their SBC/PBX sends calls
-into Twilio. Twilio normalizes SIP → Programmable Voice → our inbound webhook.
-Backend work is minimal: store the trunk SID / SIP domain for display in
-`sip_*`, add a guided setup page, and flip the card from PREVIEW to configurable.
+No new media path. The tenant points their SBC/PBX at a Twilio **Programmable
+Voice SIP Domain** (`<tenant>.sip.twilio.com`) whose Voice webhook is our
+`/twilio/voice` — Twilio answers the SIP INVITE and invokes the webhook for
+TwiML, exactly like a PSTN call. (Elastic SIP Trunking, the PSTN-backed variant,
+routes through a TwiML app the same way.) The one backend nuance: SIP `To`/`From`
+arrive as SIP/tel URIs (`sip:+1415…@co.sip.twilio.com`), so `extractDialedNumber`
+pulls the user part before DID resolution. Phase 3 = that extraction + reuse;
+the guided setup page and card flip are Phase 4 (UI).
 
 ## Components
 

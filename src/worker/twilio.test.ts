@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { createHmac } from 'node:crypto';
-import { computeTwilioSignature, validateTwilioSignature, buildConnectStreamTwiml, buildTwilioCallRequest } from './twilio';
+import {
+  computeTwilioSignature, validateTwilioSignature, buildConnectStreamTwiml,
+  buildTwilioCallRequest, extractDialedNumber,
+} from './twilio';
 
 // Independent reference: Twilio signs the URL with each POST param appended as
 // key+value in key-sorted order, HMAC-SHA1, base64. Computed here with Node's
@@ -35,6 +38,20 @@ describe('computeTwilioSignature', () => {
     expect(await validateTwilioSignature(url, params, 'tok', null)).toBe(false);
     // tampering with a param invalidates it
     expect(await validateTwilioSignature(url, { ...params, To: '+1000' }, 'tok', sig)).toBe(false);
+  });
+});
+
+describe('extractDialedNumber', () => {
+  it('passes through plain E.164', () => {
+    expect(extractDialedNumber('+14155551212')).toBe('+14155551212');
+  });
+  it('extracts the user part of a SIP URI and drops the scheme + domain', () => {
+    expect(extractDialedNumber('sip:+14155551212@co.sip.twilio.com')).toBe('+14155551212');
+    expect(extractDialedNumber('sips:18005551212@1234.example.com')).toBe('18005551212');
+  });
+  it('handles tel: URIs and blanks', () => {
+    expect(extractDialedNumber('tel:+14155551212')).toBe('+14155551212');
+    expect(extractDialedNumber('')).toBe('');
   });
 });
 

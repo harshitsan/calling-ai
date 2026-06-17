@@ -51,6 +51,22 @@ export async function validateTwilioSignature(
   return timingSafeEqual(await computeTwilioSignature(url, params, authToken), signature);
 }
 
+/**
+ * Extract the dialable number from a To/From value. Twilio PSTN calls send plain
+ * E.164, but calls arriving via a Twilio Programmable Voice SIP Domain (or an
+ * Elastic SIP Trunk) send SIP/tel URIs like `sip:+14155551212@co.sip.twilio.com`.
+ * We take the user part before `@` and drop the scheme so DID resolution sees a
+ * clean number (its digit-only normalization would otherwise fold in the
+ * domain's digits).
+ */
+export function extractDialedNumber(raw: string): string {
+  if (!raw) return '';
+  let s = raw.trim().replace(/^sips?:/i, '').replace(/^tel:/i, '');
+  const at = s.indexOf('@');
+  if (at >= 0) s = s.slice(0, at);
+  return s.trim();
+}
+
 const escXml = (s: string): string =>
   s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
@@ -121,8 +137,9 @@ export async function handleTwilioStatus(request: Request, env: Env): Promise<Re
   const callStatus = params.CallStatus ?? '';
   if (!callSid) return err(400, 'missing CallSid');
 
-  // Outbound: our DID is From. Fall back to To for safety.
-  const route = (await resolveDidRoute(env, params.From ?? '')) ?? (await resolveDidRoute(env, params.To ?? ''));
+  // Outbound: our DID is From. Fall back to To for safety. (SIP-aware extraction.)
+  const route = (await resolveDidRoute(env, extractDialedNumber(params.From ?? '')))
+    ?? (await resolveDidRoute(env, extractDialedNumber(params.To ?? '')));
   if (!route) return new Response(null, { status: 204 });
 
   const cfg = await env.DB.prepare(
@@ -161,8 +178,8 @@ export async function handleTwilioVoice(request: Request, env: Env): Promise<Res
   const params: Record<string, string> = {};
   for (const [k, v] of form.entries()) if (typeof v === 'string') params[k] = v;
 
-  const to = params.To ?? '';
-  const from = params.From ?? '';
+  const to = extractDialedNumber(params.To ?? '');
+  const from = extractDialedNumber(params.From ?? '');
   const callSid = params.CallSid ?? '';
   if (!to) return err(400, 'missing To');
 
