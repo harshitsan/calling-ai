@@ -70,6 +70,12 @@ export function makeRunner(
           if (others <= 0) aloneSinceMs ??= now();
           else aloneSinceMs = null;
         }
+        // DIAGNOSTIC: trace the alone-timer state each poll so an early leave is
+        // explainable from the logs alone.
+        console.log(
+          `[recorder ${session.id}] poll others=${others} aloneSinceMs=${aloneSinceMs} ` +
+          `elapsedMs=${now() - startedAtMs} aloneGraceMs=${config.aloneGraceMs}`,
+        );
         const decision = decideEnd({
           removed: await isRemoved(page, sel),
           stopRequested: ctx.isStopRequested(),

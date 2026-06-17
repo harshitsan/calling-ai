@@ -69,12 +69,18 @@ export class ParticipantTracker {
     const s = await this.page
       .evaluate(() => (window as unknown as { __ntProbe: { sample(): ProbeSample } }).__ntProbe.sample())
       .catch(() => null) as ProbeSample | null;
-    if (!s || !s.ok || s.participants.length === 0) return null;
+    if (!s || !s.ok || s.participants.length === 0) {
+      // DIAGNOSTIC: an unreadable panel reads as "unknown" (never "alone").
+      console.log(`[tracker ${this.platform.id}] poll unreadable: ok=${s?.ok ?? 'null'} strategy=${s?.strategy ?? 'n/a'} participants=${s?.participants.length ?? 'n/a'} → others=null`);
+      return null;
+    }
 
     const others = s.participants.filter((n) => !this.isBot(n));
     for (const n of others) this.roster.add(n);
     const speaking = s.speaking.filter((n) => !this.isBot(n));
     this.samples.push({ tMs: Math.max(0, this.now() - this.startedAtMs), speaking });
+    // DIAGNOSTIC: exactly what the probe saw, so an early "alone" leave is explainable.
+    console.log(`[tracker ${this.platform.id}] poll strategy=${s.strategy} participants=${JSON.stringify(s.participants)} speaking=${JSON.stringify(speaking)} others=${others.length}`);
     return others.length;
   }
 
