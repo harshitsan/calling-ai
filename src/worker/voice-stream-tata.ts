@@ -470,14 +470,15 @@ export async function handleTataStream(request: Request, env: Env): Promise<Resp
         });
         env.DB.prepare(
           `INSERT INTO calls
-            (id, tenant_id, agent_id, caller_ref, started_at, status, end_reason)
-           VALUES (?, ?, NULL, ?, ?, 'active', NULL)`,
+            (id, tenant_id, agent_id, caller_ref, started_at, status, end_reason, carrier_call_id)
+           VALUES (?, ?, NULL, ?, ?, 'active', NULL, ?)`,
         )
           .bind(
             state.callDbId,
             auth.tenantId,
             `${state.from ?? '?'}→${state.to ?? '?'}`,
             state.startedAt,
+            state.callSid,
           )
           .run()
           .catch(() => { /* duplicate id on reconnect is fine */ });

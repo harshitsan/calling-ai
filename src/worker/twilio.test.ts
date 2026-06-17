@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createHmac } from 'node:crypto';
-import { computeTwilioSignature, validateTwilioSignature, buildConnectStreamTwiml } from './twilio';
+import { computeTwilioSignature, validateTwilioSignature, buildConnectStreamTwiml, buildTwilioCallRequest } from './twilio';
 
 // Independent reference: Twilio signs the URL with each POST param appended as
 // key+value in key-sorted order, HMAC-SHA1, base64. Computed here with Node's
@@ -35,6 +35,37 @@ describe('computeTwilioSignature', () => {
     expect(await validateTwilioSignature(url, params, 'tok', null)).toBe(false);
     // tampering with a param invalidates it
     expect(await validateTwilioSignature(url, { ...params, To: '+1000' }, 'tok', sig)).toBe(false);
+  });
+});
+
+describe('buildTwilioCallRequest', () => {
+  it('builds a form-encoded Calls.json POST with Basic auth and a status callback', () => {
+    const { url, init } = buildTwilioCallRequest({
+      accountSid: 'AC123',
+      authToken: 'tok',
+      to: '+14155551212',
+      from: '+14158675309',
+      twiml: '<Response/>',
+      statusCallback: 'https://h/twilio/status',
+    });
+    expect(url).toBe('https://api.twilio.com/2010-04-01/Accounts/AC123/Calls.json');
+    const headers = init.headers as Record<string, string>;
+    expect(headers.authorization).toBe(`Basic ${btoa('AC123:tok')}`);
+    expect(headers['content-type']).toBe('application/x-www-form-urlencoded');
+    const form = new URLSearchParams(init.body as string);
+    expect(form.get('To')).toBe('+14155551212');
+    expect(form.get('From')).toBe('+14158675309');
+    expect(form.get('Twiml')).toBe('<Response/>');
+    expect(form.get('StatusCallback')).toBe('https://h/twilio/status');
+    expect(form.get('StatusCallbackMethod')).toBe('POST');
+  });
+
+  it('omits status-callback fields when no callback url is given', () => {
+    const { init } = buildTwilioCallRequest({
+      accountSid: 'AC1', authToken: 't', to: '+1', from: '+2', twiml: '<x/>',
+    });
+    const form = new URLSearchParams(init.body as string);
+    expect(form.get('StatusCallback')).toBeNull();
   });
 });
 

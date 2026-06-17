@@ -13,6 +13,8 @@
 import { hashApiKey } from './auth';
 import { err, json, now, uuid } from './util';
 import { syncTenantDidRoutes } from './did-routes';
+import { mintStreamToken } from './stream-token';
+import { buildConnectStreamTwiml, buildTwilioCallRequest } from './twilio';
 
 export const VOICE_INTEGRATIONS_ENABLED = true;
 
@@ -325,8 +327,12 @@ export async function handleVoiceIntegrationsApi(
     if (!customerNumber) return err(400, 'customerNumber is required');
 
     const cfg = await ensureRow(env, tenantId);
+    // Twilio's endpoint URL is derived from the Account SID, so it's the one
+    // provider that doesn't need pstn_endpoint_url configured.
+    const isTwilio =
+      cfg.pstn_provider === 'twilio' || /api\.twilio\.com/i.test(cfg.pstn_endpoint_url ?? '');
     if (!cfg.pstn_enabled) return err(409, 'PSTN integration is not enabled for this tenant');
-    if (!cfg.pstn_endpoint_url) return err(409, 'carrier endpoint URL is not configured');
+    if (!isTwilio && !cfg.pstn_endpoint_url) return err(409, 'carrier endpoint URL is not configured');
     if (!cfg.pstn_auth_token) return err(409, 'carrier API key is not configured');
 
     const route = await resolveOutboundRoute(
@@ -337,6 +343,32 @@ export async function handleVoiceIntegrationsApi(
     );
     if (!route.ok) return err(400, route.error);
     const callerId = route.did;
+
+    // Twilio uses its REST Calls API (Basic auth, form-encoded, E.164 numbers)
+    // and connects the answered call to our media bridge via inline TwiML with a
+    // per-call stream token — NOT the generic JSON proxy below.
+    if (isTwilio) {
+      const sid = cfg.pstn_account_id?.trim();
+      if (!sid) return err(409, 'Twilio Account SID (accountId) is not configured');
+      const secret = (env as unknown as { STREAM_TOKEN_SECRET?: string }).STREAM_TOKEN_SECRET;
+      if (!secret) return err(503, 'STREAM_TOKEN_SECRET not configured');
+      const streamToken = await mintStreamToken(
+        { tenantId, agentId: route.agentId, callSid: null, direction: 'outbound' },
+        secret,
+      );
+      const host = new URL(request.url).host;
+      const wssUrl = `wss://${host}/voice/stream?token=${encodeURIComponent(streamToken)}`;
+      const twiml = buildConnectStreamTwiml(wssUrl, { from: callerId, to: customerNumber });
+      const { url, init } = buildTwilioCallRequest({
+        accountSid: sid,
+        authToken: cfg.pstn_auth_token!,
+        to: customerNumber,
+        from: callerId,
+        twiml,
+        statusCallback: `https://${host}/twilio/status`,
+      });
+      return fetchAndRespond(url, init, cfg.pstn_provider);
+    }
 
     // Bare digits — Tata rejects E.164 + prefix in the call form.
     const destinationNumber = customerNumber.replace(/^\+/, '');

@@ -67,6 +67,88 @@ function xml(body: string, status = 200): Response {
 }
 
 /**
+ * Build the Twilio outbound-call REST request: form-encoded POST to the
+ * account's Calls resource, Basic auth (AccountSid:AuthToken), inline TwiML that
+ * streams the answered call into our media bridge, and a status callback.
+ */
+export function buildTwilioCallRequest(opts: {
+  accountSid: string;
+  authToken: string;
+  to: string;
+  from: string;
+  twiml: string;
+  statusCallback?: string;
+}): { url: string; init: RequestInit } {
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(opts.accountSid)}/Calls.json`;
+  const form = new URLSearchParams();
+  form.set('To', opts.to);
+  form.set('From', opts.from);
+  form.set('Twiml', opts.twiml);
+  if (opts.statusCallback) {
+    form.set('StatusCallback', opts.statusCallback);
+    form.set('StatusCallbackEvent', 'initiated ringing answered completed');
+    form.set('StatusCallbackMethod', 'POST');
+  }
+  return {
+    url,
+    init: {
+      method: 'POST',
+      headers: {
+        'authorization': `Basic ${btoa(`${opts.accountSid}:${opts.authToken}`)}`,
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: form.toString(),
+    },
+  };
+}
+
+const ENDED_STATUSES = new Set(['completed', 'busy', 'no-answer', 'failed', 'canceled']);
+
+/**
+ * POST /twilio/status — Twilio's async call-status callback for outbound calls.
+ * Resolves the tenant by our DID (From), validates the signature, and closes
+ * the matching calls row on a terminal status. Always 2xx so Twilio doesn't
+ * retry; unknown/unconfigured calls are acked and ignored.
+ */
+export async function handleTwilioStatus(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'POST') return err(405, 'POST required');
+  let form: FormData;
+  try { form = await request.formData(); } catch { return err(400, 'expected form-encoded body'); }
+  const params: Record<string, string> = {};
+  for (const [k, v] of form.entries()) if (typeof v === 'string') params[k] = v;
+
+  const callSid = params.CallSid ?? '';
+  const callStatus = params.CallStatus ?? '';
+  if (!callSid) return err(400, 'missing CallSid');
+
+  // Outbound: our DID is From. Fall back to To for safety.
+  const route = (await resolveDidRoute(env, params.From ?? '')) ?? (await resolveDidRoute(env, params.To ?? ''));
+  if (!route) return new Response(null, { status: 204 });
+
+  const cfg = await env.DB.prepare(
+    `SELECT pstn_auth_token FROM voice_integrations WHERE tenant_id = ? AND pstn_provider = 'twilio'`,
+  ).bind(route.tenantId).first<{ pstn_auth_token: string | null }>();
+  const authToken = cfg?.pstn_auth_token ?? null;
+  if (!authToken) return new Response(null, { status: 204 });
+
+  const signature = request.headers.get('x-twilio-signature');
+  if (!(await validateTwilioSignature(request.url, params, authToken, signature))) {
+    return err(403, 'invalid twilio signature');
+  }
+
+  if (ENDED_STATUSES.has(callStatus)) {
+    const durationS = Number(params.CallDuration) || null;
+    await env.DB.prepare(
+      `UPDATE calls SET status = 'ended', ended_at = ?, duration_s = COALESCE(duration_s, ?),
+              end_reason = COALESCE(end_reason, ?)
+       WHERE carrier_call_id = ? AND tenant_id = ?`,
+    ).bind(Date.now(), durationS, `twilio:${callStatus}`.slice(0, 64), callSid, route.tenantId)
+      .run().catch(() => { /* row may not exist for unanswered calls */ });
+  }
+  return new Response(null, { status: 204 });
+}
+
+/**
  * POST /twilio/voice — Twilio's inbound Voice webhook (also the entry point for
  * SIP calls arriving via a Twilio Elastic SIP Trunk). Resolves the tenant/agent
  * from the dialed number, validates the signature with that tenant's Auth Token,

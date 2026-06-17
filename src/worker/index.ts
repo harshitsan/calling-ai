@@ -7,7 +7,7 @@ import { MemoryStore } from './memory-store';
 import { VOICEOVERS_ENABLED, handleVoiceoverApi } from './voiceovers';
 import { VOICE_INTEGRATIONS_ENABLED, handleVoiceIntegrationsApi } from './voice-integrations';
 import { handleTataStream } from './voice-stream-tata';
-import { handleTwilioVoice } from './twilio';
+import { handleTwilioVoice, handleTwilioStatus } from './twilio';
 import { NOTETAKER_ENABLED, handleNotetakerApi, handleNotetakerQueue } from './notetaker';
 import type { NotetakerQueueMessage } from './notetaker';
 import { handleApiKeysApi } from './api-keys';
@@ -142,6 +142,11 @@ export default {
     // /voice/stream. No CORS — Twilio is a server-to-server caller.
     if (VOICE_INTEGRATIONS_ENABLED && url.pathname === '/twilio/voice') {
       return handleTwilioVoice(request, env);
+    }
+
+    // Twilio outbound call-status callbacks (ringing/answered/completed).
+    if (VOICE_INTEGRATIONS_ENABLED && url.pathname === '/twilio/status') {
+      return handleTwilioStatus(request, env);
     }
 
     // Carrier streaming endpoint — Twilio Media Streams format (also spoken
