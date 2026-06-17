@@ -1,5 +1,5 @@
 import { handleApi, authenticate } from './api';
-import { synthesizeTtsCached } from './adapters';
+import { openaiComplete, synthesizeTtsCached } from './adapters';
 import { verifyJwt } from './auth';
 import { CallSession } from './call-session';
 import { LogHub } from './log-hub';
@@ -7,14 +7,16 @@ import { MemoryStore } from './memory-store';
 import { VOICEOVERS_ENABLED, handleVoiceoverApi } from './voiceovers';
 import { VOICE_INTEGRATIONS_ENABLED, handleVoiceIntegrationsApi } from './voice-integrations';
 import { handleTataStream } from './voice-stream-tata';
+import { handleTwilioVoice } from './twilio';
 import { NOTETAKER_ENABLED, handleNotetakerApi, handleNotetakerQueue } from './notetaker';
 import type { NotetakerQueueMessage } from './notetaker';
 import { handleApiKeysApi } from './api-keys';
 import { handleMeetingDispatchApi } from './meeting-dispatch';
+import { RecorderContainer } from './recorder-container';
 
-export { CallSession, LogHub, MemoryStore };
+export { CallSession, LogHub, MemoryStore, RecorderContainer };
 
-const LLM_MODEL = '@cf/meta/llama-3.1-8b-instruct';
+const LLM_MODEL = 'gpt-4o-mini';
 
 const CORS = {
   'access-control-allow-origin': '*',
@@ -32,6 +34,19 @@ export default {
 
     if (url.pathname === '/healthz') {
       return new Response('ok', { headers: { 'content-type': 'text/plain' } });
+    }
+
+    // Bot Google session for the recorder container's boot (see
+    // recorder-container.ts). Gated on the same secret that authenticates
+    // worker→recorder calls.
+    if (url.pathname === '/internal/recorder/storage-state' && request.method === 'GET') {
+      const secret = (env as unknown as { RECORDER_CONTROL_SECRET?: string }).RECORDER_CONTROL_SECRET;
+      if (!secret || request.headers.get('authorization') !== `Bearer ${secret}`) {
+        return new Response('unauthorized', { status: 401 });
+      }
+      const obj = await env.RECORDINGS.get('internal/bot-storage-state.json');
+      if (!obj) return new Response('storage state not uploaded', { status: 404 });
+      return new Response(obj.body, { headers: { 'content-type': 'application/json' } });
     }
 
     if (url.pathname.startsWith('/api/auth/') || url.pathname === '/api/me' ||
@@ -122,6 +137,13 @@ export default {
       }
     }
 
+    // Twilio inbound Voice webhook (also the entry point for SIP calls via a
+    // Twilio Elastic SIP Trunk). Returns TwiML that streams the call to
+    // /voice/stream. No CORS — Twilio is a server-to-server caller.
+    if (VOICE_INTEGRATIONS_ENABLED && url.pathname === '/twilio/voice') {
+      return handleTwilioVoice(request, env);
+    }
+
     // Carrier streaming endpoint — Twilio Media Streams format (also spoken
     // by Tata, Acefone, and others). The /voice/stream/tata alias keeps any
     // pre-existing carrier-side config working.
@@ -147,11 +169,10 @@ export default {
     if (url.pathname === '/api/chat' && request.method === 'POST') {
       const body = (await request.json().catch(() => ({}))) as { text?: string };
       const text = body.text ?? 'Say hello in one short sentence.';
-      const r = (await env.AI.run(LLM_MODEL as never, {
-        messages: [{ role: 'user', content: text }],
-        max_tokens: 256,
-      } as never)) as { response?: string };
-      return Response.json({ reply: r.response ?? '' });
+      const openaiKey = (env as unknown as { OPENAI_API_KEY?: string }).OPENAI_API_KEY;
+      if (!openaiKey) return Response.json({ error: 'OPENAI_API_KEY not configured' }, { status: 503 });
+      const reply = await openaiComplete(openaiKey, [{ role: 'user', content: text }], { model: LLM_MODEL });
+      return Response.json({ reply });
     }
 
     if (url.pathname === '/api/tts') {

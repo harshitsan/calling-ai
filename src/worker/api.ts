@@ -1,6 +1,7 @@
 import { hashApiKey, hashPassword, signJwt, verifyJwt, verifyPassword } from './auth';
 import { AgentSchema, LoginSchema, RegisterSchema } from './schemas';
 import { err, json, now, uuid } from './util';
+import { syncTenantDidRoutes } from './did-routes';
 
 const JWT_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 
@@ -168,6 +169,7 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
         ts, ts,
       )
       .run();
+    await syncTenantDidRoutes(env, auth.tenantId).catch(() => {});
     const row = await env.DB.prepare('SELECT * FROM agents WHERE id = ?').bind(id).first<AgentRow>();
     return json({ agent: agentToJson(row!) }, { status: 201 });
   }
@@ -201,6 +203,7 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
           now(), agentId, auth.tenantId,
         )
         .run();
+      await syncTenantDidRoutes(env, auth.tenantId).catch(() => {});
       const updated = await env.DB.prepare('SELECT * FROM agents WHERE id = ?').bind(agentId).first<AgentRow>();
       return json({ agent: agentToJson(updated!) });
     }
@@ -209,6 +212,7 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
       await env.DB.prepare('DELETE FROM agents WHERE id = ? AND tenant_id = ?')
         .bind(agentId, auth.tenantId)
         .run();
+      await syncTenantDidRoutes(env, auth.tenantId).catch(() => {});
       return json({ ok: true });
     }
   }

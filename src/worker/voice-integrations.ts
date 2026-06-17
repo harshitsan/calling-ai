@@ -12,6 +12,7 @@
 
 import { hashApiKey } from './auth';
 import { err, json, now, uuid } from './util';
+import { syncTenantDidRoutes } from './did-routes';
 
 export const VOICE_INTEGRATIONS_ENABLED = true;
 
@@ -298,6 +299,9 @@ export async function handleVoiceIntegrationsApi(
            pstn_phone_numbers = ?, pstn_endpoint_url = ?, pstn_extra = ?, updated_at = ?
        WHERE tenant_id = ?`,
     ).bind(enabled, provider, accountId, authToken, JSON.stringify(numbers), endpointUrl, extra, now(), tenantId).run();
+    // Keep the inbound DID→tenant routing index in sync with the new numbers.
+    await syncTenantDidRoutes(env, tenantId).catch((e) =>
+      console.warn('[voice-integrations] did route sync failed', (e as Error).message));
     const row = (await env.DB.prepare('SELECT * FROM voice_integrations WHERE tenant_id = ?')
       .bind(tenantId).first<RowAll>())!;
     return json({ integrations: rowToJson(row) });

@@ -22,6 +22,7 @@
 
 import { FluxStt, OpenAiLlm, WorkersAiLlm, synthesizePcm } from './adapters';
 import { hashApiKey } from './auth';
+import { verifyStreamToken } from './stream-token';
 import {
   base64ToBytes,
   bytesToBase64,
@@ -237,11 +238,26 @@ export async function handleTataStream(request: Request, env: Env): Promise<Resp
   if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
     return err(426, 'expected WebSocket upgrade');
   }
-  const apiKey = extractApiKey(request);
-  if (!apiKey) return err(401, 'missing API key (Bearer / X-Api-Key / ?key=)');
-  const auth = await authenticateStream(env, apiKey);
-  if (!auth) return err(401, 'unknown API key');
-  if (!auth.enabled) return err(403, 'streaming is disabled for this tenant');
+  // Two auth paths: a per-call stream token (Twilio inbound/outbound — minted by
+  // the TwiML webhook / outbound adapter, since Twilio's <Stream> can't send
+  // headers), or the long-lived streaming API key (raw-PCM / direct carriers).
+  let resolvedAuth: AuthResult | null = null;
+  let tokenAgentId: string | null = null;
+  const token = new URL(request.url).searchParams.get('token');
+  if (token) {
+    const secret = (env as unknown as { STREAM_TOKEN_SECRET?: string }).STREAM_TOKEN_SECRET;
+    const claims = secret ? await verifyStreamToken(token, secret) : null;
+    if (!claims) return err(401, 'invalid or expired stream token');
+    resolvedAuth = { tenantId: claims.tenantId, enabled: true };
+    tokenAgentId = claims.agentId;
+  } else {
+    const apiKey = extractApiKey(request);
+    if (!apiKey) return err(401, 'missing API key (Bearer / X-Api-Key / ?key=)');
+    resolvedAuth = await authenticateStream(env, apiKey);
+    if (!resolvedAuth) return err(401, 'unknown API key');
+    if (!resolvedAuth.enabled) return err(403, 'streaming is disabled for this tenant');
+  }
+  const auth = resolvedAuth;
 
   const pair = new WebSocketPair();
   const client = pair[0];
@@ -357,6 +373,9 @@ export async function handleTataStream(request: Request, env: Env): Promise<Resp
         if (parsed?.agentId) explicitAgentId = parsed.agentId;
       } catch { /* not JSON — ignore */ }
     }
+    // Twilio stream tokens carry the resolved agent (the TwiML webhook already
+    // did DID→agent routing); honor it when the carrier sent no override.
+    if (!explicitAgentId) explicitAgentId = tokenAgentId;
     const direction = m.start.direction;
     const ourDid =
       direction === 'outbound' ? (m.start.from ?? null) : (m.start.to ?? null);
