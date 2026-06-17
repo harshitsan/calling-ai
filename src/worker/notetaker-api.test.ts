@@ -41,11 +41,13 @@ function fakeEnv(handlers: Array<{ match: RegExp; first?: unknown; all?: unknown
 const CTX = { waitUntil: () => {} };
 const AUTH = { tenantId: 't1', userId: 'u1' };
 
-function uploadReq(fields: { webhookUrl?: string } = {}): Request {
+function uploadReq(fields: { webhookUrl?: string; participants?: string; speakerTimeline?: string } = {}): Request {
   const form = new FormData();
   form.append('audio', new File([new Uint8Array([1, 2, 3])], 'a.mp3', { type: 'audio/mpeg' }));
   form.append('title', 'standup');
   if (fields.webhookUrl) form.append('webhookUrl', fields.webhookUrl);
+  if (fields.participants !== undefined) form.append('participants', fields.participants);
+  if (fields.speakerTimeline !== undefined) form.append('speakerTimeline', fields.speakerTimeline);
   return new Request('https://x/api/notetaker', { method: 'POST', body: form });
 }
 
@@ -67,6 +69,26 @@ describe('POST /api/notetaker (async ingestion)', () => {
     expect(res?.status).toBe(202);
     const insert = stmts.find((s) => /INSERT INTO notetaker_jobs/.test(s.sql))!;
     expect(insert.binds).toContain('https://org.example/hook');
+  });
+
+  it('stores the participant roster + speaker timeline when valid JSON arrays', async () => {
+    const { env, stmts } = fakeEnv();
+    const participants = JSON.stringify(['Alex', 'Mira']);
+    const timeline = JSON.stringify([{ startMs: 0, endMs: 1000, name: 'Alex' }]);
+    const res = await handleNotetakerApi(uploadReq({ participants, speakerTimeline: timeline }), env, CTX, AUTH);
+    expect(res?.status).toBe(202);
+    const insert = stmts.find((s) => /INSERT INTO notetaker_jobs/.test(s.sql))!;
+    expect(insert.binds).toContain(participants);
+    expect(insert.binds).toContain(timeline);
+  });
+
+  it('stores null for malformed (non-array) diarization sidecars', async () => {
+    const { env, stmts } = fakeEnv();
+    const res = await handleNotetakerApi(uploadReq({ participants: 'not json', speakerTimeline: '{"x":1}' }), env, CTX, AUTH);
+    expect(res?.status).toBe(202);
+    const insert = stmts.find((s) => /INSERT INTO notetaker_jobs/.test(s.sql))!;
+    // The two trailing binds (participants_json, speaker_timeline_json) are null.
+    expect(insert.binds.slice(-2)).toEqual([null, null]);
   });
 
   it('rejects non-https webhook urls and stores nothing', async () => {

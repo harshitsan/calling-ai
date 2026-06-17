@@ -5,9 +5,18 @@
   <div id="prejoin">
     <input id="name" placeholder="Your name" />
     <button id="join">Ask to join</button>
+    <button id="switch" style="display:none">Switch here</button>
   </div>
   <div id="incall" style="display:none">
-    <span id="count" data-count="2">2 participants</span>
+    <!-- One tile per participant (incl. the bot), like Meet's grid. -->
+    <div id="tiles">
+      <div data-participant-id="self"></div>
+      <div data-participant-id="p1"></div>
+    </div>
+    <!-- People panel: opened by clicking #people; one .prow per participant,
+         with the name in .pname and a .speaking child present while talking. -->
+    <button id="people">People</button>
+    <div id="panel" style="display:none"></div>
     <div id="removed" style="display:none">You've been removed from the meeting</div>
     <button id="leave">Leave call</button>
   </div>
@@ -18,13 +27,64 @@
         document.getElementById('incall').style.display = 'block';
       }, 300);
     });
+    // ?switchHere=1 — the account is already in the call elsewhere, so Meet
+    // offers "Switch here" instead of a join button.
+    if (new URLSearchParams(location.search).get('switchHere')) {
+      document.getElementById('join').style.display = 'none';
+      document.getElementById('switch').style.display = '';
+    }
+    // ?joinDelay=N — pre-join UI renders slowly, like real Meet on cold loads.
+    const joinDelay = Number(new URLSearchParams(location.search).get('joinDelay') || 0);
+    if (joinDelay > 0) {
+      const btn = document.getElementById('join');
+      btn.style.display = 'none';
+      setTimeout(() => { btn.style.display = ''; }, joinDelay);
+    }
+    // Open the People panel.
+    document.getElementById('people').addEventListener('click', () => {
+      document.getElementById('panel').style.display = 'block';
+    });
     // Test hooks
     window.__setCount = (n) => {
-      const el = document.getElementById('count');
-      el.setAttribute('data-count', String(n));
-      el.textContent = n + ' participants';
+      const tiles = document.getElementById('tiles');
+      tiles.innerHTML = '';
+      for (let i = 0; i < n; i++) {
+        const t = document.createElement('div');
+        t.setAttribute('data-participant-id', i === 0 ? 'self' : 'p' + i);
+        tiles.appendChild(t);
+      }
     };
     window.__remove = () => { document.getElementById('removed').style.display = 'block'; };
+    // Render the People panel from a list of names (one .prow each).
+    window.__setRoster = (names) => {
+      const panel = document.getElementById('panel');
+      panel.innerHTML = '';
+      for (const name of names) {
+        const row = document.createElement('div');
+        row.className = 'prow';
+        const n = document.createElement('span');
+        n.className = 'pname';
+        n.textContent = name;
+        row.appendChild(n);
+        panel.appendChild(row);
+      }
+    };
+    // Mark a set of names as currently speaking (adds/removes a .speaking child
+    // on the matching .prow — present iff that participant is talking).
+    window.__setSpeaking = (names) => {
+      const set = new Set(names);
+      for (const row of document.querySelectorAll('#panel .prow')) {
+        const name = row.querySelector('.pname').textContent;
+        const existing = row.querySelector('.speaking');
+        if (set.has(name) && !existing) {
+          const s = document.createElement('span');
+          s.className = 'speaking';
+          row.appendChild(s);
+        } else if (!set.has(name) && existing) {
+          existing.remove();
+        }
+      }
+    };
   </script>
 </body>
 </html>

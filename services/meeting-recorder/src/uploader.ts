@@ -1,9 +1,15 @@
+import type { SpeakerSegment } from './participant-tracker';
+
 export interface UploadOptions {
   notetakerUrl: string;
   apiKey: string;
   title: string | null;
   fileName: string;
   bytes: Uint8Array;
+  // Roster of participant names + who-spoke-when timeline, for speaker
+  // diarization by real name on the notetaker side. Omitted when unavailable.
+  participants?: string[];
+  speakerTimeline?: SpeakerSegment[];
   fetchImpl?: typeof fetch;
   maxRetries?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -28,6 +34,12 @@ export async function uploadRecording(opts: UploadOptions): Promise<UploadResult
     // strict lib mismatch (Uint8Array<ArrayBufferLike> vs ArrayBufferView<ArrayBuffer>).
     form.append('audio', new File([opts.bytes as unknown as BlobPart], opts.fileName, { type: 'audio/mpeg' }));
     if (opts.title) form.append('title', opts.title);
+    if (opts.participants && opts.participants.length > 0) {
+      form.append('participants', JSON.stringify(opts.participants));
+    }
+    if (opts.speakerTimeline && opts.speakerTimeline.length > 0) {
+      form.append('speakerTimeline', JSON.stringify(opts.speakerTimeline));
+    }
 
     let res: Response;
     try {

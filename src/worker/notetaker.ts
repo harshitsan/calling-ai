@@ -55,6 +55,8 @@ interface JobRow {
   webhook_url?: string | null;
   webhook_status?: string | null;
   webhook_attempts?: number | null;
+  participants_json?: string | null;
+  speaker_timeline_json?: string | null;
 }
 
 export interface NotetakerQueueMessage {
@@ -84,6 +86,8 @@ function rowToJson(r: JobRow): Record<string, unknown> {
   try { const v = JSON.parse(r.transcript_words ?? '[]'); if (Array.isArray(v)) words = v; } catch { /* ignore */ }
   let notes: unknown = null;
   try { notes = r.notes_json ? JSON.parse(r.notes_json) : null; } catch { notes = null; }
+  let participants: unknown[] = [];
+  try { const v = JSON.parse(r.participants_json ?? '[]'); if (Array.isArray(v)) participants = v; } catch { /* ignore */ }
   return {
     id: r.id,
     title: r.title ?? '',
@@ -96,6 +100,7 @@ function rowToJson(r: JobRow): Record<string, unknown> {
     transcriptText: r.transcript_text,
     transcriptWords: words,
     notes,
+    participants,
     chars: r.chars,
     costUsdMicro: r.cost_usd_micro,
     createdAt: r.created_at,
@@ -592,6 +597,79 @@ function renderSpeakerTranscript(
   return lines.join('\n');
 }
 
+export interface TimelineSegment { startMs: number; endMs: number; name: string }
+
+/**
+ * Map each transcriber speaker index (Deepgram's 0,1,2…) to a real participant
+ * name by maximal temporal overlap with the recorder's who-spoke-when timeline.
+ *
+ * Word timestamps are in SECONDS; timeline segments are in MILLISECONDS from
+ * recording start (same origin as the audio). Returns `{ "<index>": "<name>" }`
+ * only for indices that have a clear overlap winner — indices with no timeline
+ * overlap are left out, so the LLM's content-based guess can still fill them.
+ */
+export function alignSpeakerNames(
+  words: { start: number; end: number; speaker?: number }[],
+  timeline: TimelineSegment[],
+): Record<string, string> {
+  if (timeline.length === 0) return {};
+  const overlap = new Map<number, Map<string, number>>(); // index -> name -> overlap ms
+  for (const w of words) {
+    if (typeof w.speaker !== 'number') continue;
+    const wStart = w.start * 1000;
+    const wEnd = w.end * 1000;
+    if (!(wEnd > wStart)) continue;
+    let perName = overlap.get(w.speaker);
+    if (!perName) { perName = new Map(); overlap.set(w.speaker, perName); }
+    for (const seg of timeline) {
+      const ov = Math.min(wEnd, seg.endMs) - Math.max(wStart, seg.startMs);
+      if (ov > 0) perName.set(seg.name, (perName.get(seg.name) ?? 0) + ov);
+    }
+  }
+  const map: Record<string, string> = {};
+  for (const [idx, perName] of overlap) {
+    let best = '';
+    let bestOv = 0;
+    for (const [name, ov] of perName) {
+      if (ov > bestOv) { bestOv = ov; best = name; }
+    }
+    if (best && bestOv > 0) map[String(idx)] = best;
+  }
+  return map;
+}
+
+/** Accept a form field only if it parses to a JSON array under the size cap;
+ *  re-serialize it so we store canonical JSON. Returns null otherwise. */
+function sanitizeJsonArray(raw: string | null, maxLen = 256 * 1024): string | null {
+  const s = (raw ?? '').trim();
+  if (!s || s.length > maxLen) return null;
+  try {
+    const v = JSON.parse(s);
+    return Array.isArray(v) ? JSON.stringify(v) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Parse the recorder's speaker-timeline JSON into validated segments. */
+export function parseTimeline(raw: string | null | undefined): TimelineSegment[] {
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    if (!Array.isArray(v)) return [];
+    return v.flatMap((s) =>
+      s && typeof s === 'object'
+        && typeof (s as TimelineSegment).startMs === 'number'
+        && typeof (s as TimelineSegment).endMs === 'number'
+        && typeof (s as TimelineSegment).name === 'string'
+        ? [{ startMs: (s as TimelineSegment).startMs, endMs: (s as TimelineSegment).endMs, name: (s as TimelineSegment).name }]
+        : [],
+    );
+  } catch {
+    return [];
+  }
+}
+
 type SpeakerWord = { word: string; start: number; end: number; speaker?: number };
 
 function normalizeToken(s: string): string {
@@ -668,10 +746,26 @@ async function generateNotes(
   env: Env,
   transcript: string,
   words: { word: string; start: number; end: number; speaker?: number }[],
+  opts: { nameMap?: Record<string, string>; roster?: string[] } = {},
 ): Promise<NotesShape> {
   const env2 = env as unknown as { OPENAI_API_KEY?: string; GOOGLE_AI_API_KEY?: string };
   const labeledTranscript = renderSpeakerTranscript(transcript, words);
-  const userInput = `Transcript:\n\n${labeledTranscript.slice(0, 24_000)}`;
+  // Seed the model with ground-truth identities from the meeting roster +
+  // who-spoke-when timeline. The deterministic alignment overrides speakerMap
+  // afterward regardless, but these hints let the summary use real names and
+  // help fill any speaker indices the timeline didn't cover.
+  const hints: string[] = [];
+  if (opts.nameMap && Object.keys(opts.nameMap).length > 0) {
+    hints.push(
+      'Known speaker identities (from the meeting roster + who-spoke-when timeline, treat as ground truth): '
+        + Object.entries(opts.nameMap).map(([i, n]) => `Speaker ${i} = ${n}`).join('; ') + '.',
+    );
+  }
+  if (opts.roster && opts.roster.length > 0) {
+    hints.push(`Meeting participants: ${opts.roster.join(', ')}.`);
+  }
+  const hintBlock = hints.length > 0 ? hints.join('\n') + '\n\n' : '';
+  const userInput = `${hintBlock}Transcript:\n\n${labeledTranscript.slice(0, 24_000)}`;
 
   // Tier 1: OpenAI direct (JSON mode + 30s timeout — Responses API streaming
   // adapter wasn't enforcing JSON output, leading to "summarizing" finishing
@@ -947,7 +1041,17 @@ async function processJob(env: Env, jobId: string, tenantId: string): Promise<vo
       transcript.length, transcribedAt, jobId,
     ).run();
 
-    const notes = await generateNotes(env, transcript, words);
+    // Diarization by real name: align transcriber speaker indices to the
+    // meeting roster via the recorder's who-spoke-when timeline.
+    const timeline = parseTimeline(row.speaker_timeline_json);
+    let roster: string[] = [];
+    try {
+      const v = JSON.parse(row.participants_json ?? '[]');
+      if (Array.isArray(v)) roster = v.filter((x): x is string => typeof x === 'string');
+    } catch { /* ignore malformed roster */ }
+    const timelineMap = alignSpeakerNames(words, timeline);
+
+    const notes = await generateNotes(env, transcript, words, { nameMap: timelineMap, roster });
 
     // Server-side enforcement: if the words array has no real diarization
     // info, the LLM has no business naming speakers — strip whatever it
@@ -957,6 +1061,13 @@ async function processJob(env: Env, jobId: string, tenantId: string): Promise<vo
     if (!hasRealSpeakers) {
       notes.speakers = [];
       notes.speakerMap = {};
+    } else if (Object.keys(timelineMap).length > 0) {
+      // Timeline-derived names are ground truth — they win over the LLM's
+      // content-based guesses; the LLM fills indices the timeline didn't cover.
+      for (const [idx, name] of Object.entries(timelineMap)) notes.speakerMap[idx] = name;
+      notes.speakers = Object.entries(notes.speakerMap)
+        .sort((a, b) => Number(a[0]) - Number(b[0]))
+        .map(([idx, name]) => (name ? `${name} (Speaker ${idx})` : `Speaker ${idx}`));
     }
 
     await env.DB.prepare(
@@ -1127,6 +1238,10 @@ export async function handleNotetakerApi(
     const file = form.get('audio');
     const title = (form.get('title') as string | null) ?? '';
     const webhookUrl = ((form.get('webhookUrl') as string | null) ?? '').trim();
+    // Optional diarization sidecars from the recorder bot: participant roster +
+    // who-spoke-when timeline. Stored verbatim if they parse to JSON arrays.
+    const participantsJson = sanitizeJsonArray(form.get('participants') as string | null);
+    const speakerTimelineJson = sanitizeJsonArray(form.get('speakerTimeline') as string | null);
     if (!(file instanceof File)) return err(400, '`audio` form field must be a File');
     if (file.size === 0) return err(400, 'empty audio file');
     if (file.size > MAX_AUDIO_BYTES) {
@@ -1157,16 +1272,18 @@ export async function handleNotetakerApi(
       transcript_words: null, notes_json: null, chars: null, cost_usd_micro: null,
       created_at: createdAt, transcribed_at: null, completed_at: null,
       webhook_url: webhookUrl || null, webhook_status: null, webhook_attempts: 0,
+      participants_json: participantsJson, speaker_timeline_json: speakerTimelineJson,
     };
     await env.DB.prepare(
       `INSERT INTO notetaker_jobs
         (id, tenant_id, user_id, title, audio_r2_key, audio_size_bytes, audio_duration_sec,
          mime_type, status, error, transcript_text, transcript_words, notes_json,
-         chars, cost_usd_micro, created_at, transcribed_at, completed_at, webhook_url)
-       VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'queued', NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, ?)`,
+         chars, cost_usd_micro, created_at, transcribed_at, completed_at, webhook_url,
+         participants_json, speaker_timeline_json)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'queued', NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, ?, ?, ?)`,
     ).bind(
       id, auth.tenantId, auth.userId, row.title, r2Key, file.size, mime, createdAt,
-      row.webhook_url,
+      row.webhook_url, participantsJson, speakerTimelineJson,
     ).run();
 
     // Async: a Cloudflare Queue consumer runs the pipeline (transcribe +

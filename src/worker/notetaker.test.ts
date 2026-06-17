@@ -1,5 +1,8 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
-import { safeParseNotes, realignSpeakers, parseCorrectionUtterances, transcribeViaDeepgram } from './notetaker';
+import {
+  safeParseNotes, realignSpeakers, parseCorrectionUtterances, transcribeViaDeepgram,
+  alignSpeakerNames, parseTimeline,
+} from './notetaker';
 
 describe('transcribeViaDeepgram', () => {
   afterEach(() => vi.unstubAllGlobals());
@@ -120,6 +123,64 @@ describe('realignSpeakers', () => {
     const utterances = [{ speaker: 1, text: 'completely different words entirely' }];
     const out = realignSpeakers(words, utterances);
     expect(out.map((w) => w.speaker)).toEqual([0, 0]);
+  });
+});
+
+describe('alignSpeakerNames', () => {
+  // Word times are SECONDS; timeline segments are MILLISECONDS from start.
+  const timeline = [
+    { startMs: 0, endMs: 5000, name: 'Alex' },
+    { startMs: 5000, endMs: 10000, name: 'Mira' },
+  ];
+
+  it('maps each speaker index to the name it overlaps most', () => {
+    const words = [
+      { word: 'hi', start: 0.0, end: 1.0, speaker: 0 },   // in Alex's window
+      { word: 'there', start: 1.0, end: 2.0, speaker: 0 },
+      { word: 'hello', start: 6.0, end: 7.0, speaker: 1 }, // in Mira's window
+    ];
+    expect(alignSpeakerNames(words, timeline)).toEqual({ '0': 'Alex', '1': 'Mira' });
+  });
+
+  it('assigns by MAXIMAL overlap when a speaker straddles a boundary', () => {
+    // Speaker 0: 1s in Alex's window, 3s in Mira's → Mira wins.
+    const words = [
+      { word: 'a', start: 4.0, end: 5.0, speaker: 0 },
+      { word: 'b', start: 5.0, end: 8.0, speaker: 0 },
+    ];
+    expect(alignSpeakerNames(words, timeline)).toEqual({ '0': 'Mira' });
+  });
+
+  it('leaves out indices with no timeline overlap (LLM fills them later)', () => {
+    const words = [{ word: 'x', start: 50.0, end: 51.0, speaker: 3 }];
+    expect(alignSpeakerNames(words, timeline)).toEqual({});
+  });
+
+  it('returns {} when there is no timeline', () => {
+    expect(alignSpeakerNames([{ word: 'x', start: 0, end: 1, speaker: 0 }], [])).toEqual({});
+  });
+
+  it('ignores words without a speaker index', () => {
+    const words = [{ word: 'x', start: 0, end: 1 }];
+    expect(alignSpeakerNames(words, timeline)).toEqual({});
+  });
+});
+
+describe('parseTimeline', () => {
+  it('parses valid segments', () => {
+    const raw = '[{"startMs":0,"endMs":1000,"name":"Alex"},{"startMs":1000,"endMs":2000,"name":"Mira"}]';
+    expect(parseTimeline(raw)).toEqual([
+      { startMs: 0, endMs: 1000, name: 'Alex' },
+      { startMs: 1000, endMs: 2000, name: 'Mira' },
+    ]);
+  });
+
+  it('drops malformed entries and tolerates junk', () => {
+    expect(parseTimeline('[{"startMs":0,"endMs":1,"name":"A"},{"bad":true},42]'))
+      .toEqual([{ startMs: 0, endMs: 1, name: 'A' }]);
+    expect(parseTimeline('not json')).toEqual([]);
+    expect(parseTimeline(null)).toEqual([]);
+    expect(parseTimeline('{"not":"an array"}')).toEqual([]);
   });
 });
 
