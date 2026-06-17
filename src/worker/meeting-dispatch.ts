@@ -1,38 +1,50 @@
 // Meeting dispatch — paste a Google Meet link in the dashboard and the
 // recorder bot joins, records, and uploads into the caller's tenant.
 //
-// The browser never talks to the recorder: this module forwards to it using
-// two worker secrets (RECORDER_URL, RECORDER_CONTROL_SECRET) and proxies
-// status reads back. Each dispatch mints a tenant API key for the bot's
-// upload, so the recording lands in the right account (visible/revocable on
-// the API Keys page as "meeting bot (auto)").
+// The recorder runs as a Cloudflare Container attached to this worker via the
+// RECORDER Durable Object binding (see recorder-container.ts) — it has no
+// public URL. RECORDER_CONTROL_SECRET authenticates worker→recorder calls and
+// is also injected into the container so both sides agree. Each dispatch
+// mints a tenant API key for the bot's upload, so the recording lands in the
+// right account (visible/revocable on the API Keys page as
+// "meeting bot (auto)").
 
 import { mintApiKey } from './api-keys';
 import { err, json } from './util';
 
 const MEET_URL = /^https:\/\/meet\.google\.com\/[a-z0-9?&=_.-]+$/i;
 
-interface RecorderConfig {
-  RECORDER_URL?: string;
+// All recorder sessions share one container instance; the service inside
+// multiplexes sessions up to MAX_CONCURRENT.
+const RECORDER_INSTANCE = 'main';
+
+interface RecorderEnv {
+  RECORDER?: DurableObjectNamespace;
   RECORDER_CONTROL_SECRET?: string;
+}
+
+function recorderStub(env: Env): { fetch: typeof fetch; secret: string } | null {
+  const cfg = env as unknown as RecorderEnv;
+  const ns = cfg.RECORDER;
+  const secret = cfg.RECORDER_CONTROL_SECRET ?? '';
+  if (!ns || !secret) return null;
+  const stub = ns.get(ns.idFromName(RECORDER_INSTANCE));
+  return { fetch: stub.fetch.bind(stub) as typeof fetch, secret };
 }
 
 export async function handleMeetingDispatchApi(
   request: Request,
   env: Env,
   auth: { tenantId: string; userId?: string } | null,
-  fetchImpl: typeof fetch = fetch,
 ): Promise<Response | null> {
   const url = new URL(request.url);
   const path = url.pathname;
   if (!path.startsWith('/api/notetaker/meetings')) return null;
   if (!auth) return err(401, 'unauthorized');
 
-  const cfg = env as unknown as RecorderConfig;
-  const base = (cfg.RECORDER_URL ?? '').replace(/\/$/, '');
-  const secret = cfg.RECORDER_CONTROL_SECRET ?? '';
-  if (!base || !secret) {
-    return err(503, 'recorder not configured: set the RECORDER_URL and RECORDER_CONTROL_SECRET worker secrets');
+  const recorder = recorderStub(env);
+  if (!recorder) {
+    return err(503, 'recorder not configured: deploy the recorder container and set the RECORDER_CONTROL_SECRET worker secret');
   }
 
   // POST /api/notetaker/meetings — send the bot to a meeting.
@@ -49,9 +61,9 @@ export async function handleMeetingDispatchApi(
 
     let res: Response;
     try {
-      res = await fetchImpl(`${base}/recordings`, {
+      res = await recorder.fetch('http://recorder/recordings', {
         method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${secret}` },
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${recorder.secret}` },
         body: JSON.stringify({ meetingUrl, title, apiKey: key }),
       });
     } catch (e) {
@@ -68,8 +80,8 @@ export async function handleMeetingDispatchApi(
   if (m && request.method === 'GET') {
     let res: Response;
     try {
-      res = await fetchImpl(`${base}/recordings/${m[1]}`, {
-        headers: { authorization: `Bearer ${secret}` },
+      res = await recorder.fetch(`http://recorder/recordings/${m[1]}`, {
+        headers: { authorization: `Bearer ${recorder.secret}` },
       });
     } catch (e) {
       return err(502, `recorder unreachable: ${(e as Error).message}`);

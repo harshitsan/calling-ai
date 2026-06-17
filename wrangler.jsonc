@@ -32,16 +32,26 @@
       "database_id": "e461e69e-16d5-470d-b3df-54fee411b4ed"
     }
   ],
+  "containers": [
+    {
+      "class_name": "RecorderContainer",
+      "image": "./services/meeting-recorder/Dockerfile",
+      "max_instances": 1,
+      "instance_type": "standard-2"
+    }
+  ],
   "durable_objects": {
     "bindings": [
       { "name": "CALL_SESSION", "class_name": "CallSession" },
       { "name": "MEMORY", "class_name": "MemoryStore" },
-      { "name": "LOGS", "class_name": "LogHub" }
+      { "name": "LOGS", "class_name": "LogHub" },
+      { "name": "RECORDER", "class_name": "RecorderContainer" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["CallSession"] },
     { "tag": "v2", "new_sqlite_classes": ["MemoryStore"] },
-    { "tag": "v3", "new_sqlite_classes": ["LogHub"] }
+    { "tag": "v3", "new_sqlite_classes": ["LogHub"] },
+    { "tag": "v4", "new_sqlite_classes": ["RecorderContainer"] }
   ]
 }

@@ -40,6 +40,21 @@ export class SessionManager {
     return true;
   }
 
+  // Graceful shutdown: flag every session, then drain() until the runners
+  // finish their stop→upload sequence (or the host's grace period runs out).
+  requestStopAll(): void {
+    for (const id of this.sessions.keys()) this.stopFlags.set(id, true);
+  }
+
+  async drain(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.active > 0) {
+      if (Date.now() >= deadline) return false;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return true;
+  }
+
   start(meetingUrl: string, title: string | null, apiKey: string | null = null): Session {
     if (this.active >= this.opts.maxConcurrent) {
       throw new Error('at capacity');

@@ -15,6 +15,7 @@
     "ws": "^8.21.0"
   },
   "dependencies": {
+    "@cloudflare/containers": "^0.3.7",
     "zod": "^4.4.3"
   }
 }

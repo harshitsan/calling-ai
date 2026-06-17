@@ -24,4 +24,30 @@ describe('bot driver (fixture)', () => {
     expect(await isRemoved(page, FIXTURE_SELECTORS)).toBe(true);
     await page.close();
   });
+
+  it('joins when the join button renders slowly but within the lobby timeout', async () => {
+    const page = await browser.newPage();
+    await page.goto(fixtureUrl + '?joinDelay=1000');
+    await joinMeeting(page, FIXTURE_SELECTORS, 'Notetaker Bot', 5000);
+    expect(await isInCall(page, FIXTURE_SELECTORS)).toBe(true);
+    await page.close();
+  });
+
+  it('fails fast with a clear error when the account is already in the call elsewhere', async () => {
+    const page = await browser.newPage();
+    await page.goto(fixtureUrl + '?switchHere=1');
+    await expect(joinMeeting(page, FIXTURE_SELECTORS, 'Notetaker Bot', 5000))
+      .rejects.toThrow(/already in this meeting/i);
+    await page.close();
+  });
+
+  it('fails within lobbyTimeoutMs when the join button never appears in time', async () => {
+    const page = await browser.newPage();
+    await page.goto(fixtureUrl + '?joinDelay=3000');
+    const startedAt = Date.now();
+    await expect(joinMeeting(page, FIXTURE_SELECTORS, 'Notetaker Bot', 500)).rejects.toThrow(/timeout/i);
+    // lobbyTimeoutMs governs the join-button wait — not Playwright's 30s default.
+    expect(Date.now() - startedAt).toBeLessThan(2500);
+    await page.close();
+  });
 });

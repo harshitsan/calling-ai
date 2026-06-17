@@ -4,7 +4,18 @@ import { hashApiKey } from './auth';
 
 interface Stmt { sql: string; binds: unknown[] }
 
-function fakeEnv(extra: Record<string, string> = {}) {
+// Minimal stand-in for the RecorderContainer Durable Object namespace: the
+// dispatch module only uses idFromName().get().fetch().
+function fakeRecorder(handler: (req: Request) => Promise<Response> | Response) {
+  return {
+    idFromName: (name: string) => ({ name }),
+    get: () => ({
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => handler(new Request(input, init)),
+    }),
+  };
+}
+
+function fakeEnv(extra: Record<string, unknown> = {}) {
   const stmts: Stmt[] = [];
   const env = {
     DB: {
@@ -21,7 +32,8 @@ function fakeEnv(extra: Record<string, string> = {}) {
         };
       },
     },
-    RECORDER_URL: 'https://recorder.example',
+    RECORDER: fakeRecorder(async () =>
+      new Response(JSON.stringify({ sessionId: 'sess-1', status: 'queued' }), { status: 201 })),
     RECORDER_CONTROL_SECRET: 'ctl-secret',
     ...extra,
   } as unknown as Env;
@@ -38,29 +50,26 @@ function post(body: unknown): Request {
   });
 }
 
-function recorderOk(captured: { url?: string; init?: RequestInit }) {
-  return (async (url: string, init: RequestInit) => {
-    captured.url = url;
-    captured.init = init;
-    return new Response(JSON.stringify({ sessionId: 'sess-1', status: 'queued' }), { status: 201 });
-  }) as unknown as typeof fetch;
-}
-
 describe('POST /api/notetaker/meetings', () => {
-  it('mints a tenant key, dispatches to the recorder, returns 202', async () => {
-    const { env, stmts } = fakeEnv();
-    const captured: { url?: string; init?: RequestInit } = {};
+  it('mints a tenant key, dispatches to the recorder container, returns 202', async () => {
+    const captured: { req?: Request; body?: string } = {};
+    const { env, stmts } = fakeEnv({
+      RECORDER: fakeRecorder(async (req) => {
+        captured.req = req;
+        captured.body = await req.text();
+        return new Response(JSON.stringify({ sessionId: 'sess-1', status: 'queued' }), { status: 201 });
+      }),
+    });
     const res = await handleMeetingDispatchApi(
       post({ meetingUrl: 'https://meet.google.com/abc-defg-hij', title: 'standup' }),
-      env, AUTH, recorderOk(captured),
+      env, AUTH,
     );
     expect(res?.status).toBe(202);
     expect((await res!.json()) as object).toEqual({ meeting: { sessionId: 'sess-1', status: 'queued' } });
 
-    expect(captured.url).toBe('https://recorder.example/recordings');
-    const headers = captured.init!.headers as Record<string, string>;
-    expect(headers.authorization).toBe('Bearer ctl-secret');
-    const sent = JSON.parse(captured.init!.body as string) as { meetingUrl: string; apiKey: string; title: string };
+    expect(new URL(captured.req!.url).pathname).toBe('/recordings');
+    expect(captured.req!.headers.get('authorization')).toBe('Bearer ctl-secret');
+    const sent = JSON.parse(captured.body!) as { meetingUrl: string; apiKey: string; title: string };
     expect(sent.meetingUrl).toBe('https://meet.google.com/abc-defg-hij');
     expect(sent.title).toBe('standup');
     expect(sent.apiKey).toMatch(/^cai_[0-9a-f]{32}$/);
@@ -73,34 +82,36 @@ describe('POST /api/notetaker/meetings', () => {
   it('rejects non-Meet urls', async () => {
     const { env } = fakeEnv();
     const res = await handleMeetingDispatchApi(
-      post({ meetingUrl: 'https://zoom.us/j/123' }), env, AUTH, recorderOk({}),
+      post({ meetingUrl: 'https://zoom.us/j/123' }), env, AUTH,
     );
     expect(res?.status).toBe(400);
   });
 
-  it('503s with a setup hint when recorder secrets are missing', async () => {
-    const { env } = fakeEnv({ RECORDER_URL: '', RECORDER_CONTROL_SECRET: '' });
+  it('503s with a setup hint when the recorder is not configured', async () => {
+    const { env } = fakeEnv({ RECORDER: undefined, RECORDER_CONTROL_SECRET: '' });
     const res = await handleMeetingDispatchApi(
-      post({ meetingUrl: 'https://meet.google.com/abc-defg-hij' }), env, AUTH, recorderOk({}),
+      post({ meetingUrl: 'https://meet.google.com/abc-defg-hij' }), env, AUTH,
     );
     expect(res?.status).toBe(503);
-    expect(((await res!.json()) as { error: string }).error).toMatch(/RECORDER_URL/);
+    expect(((await res!.json()) as { error: string }).error).toMatch(/recorder not configured/);
   });
 
   it('passes through recorder capacity as 429', async () => {
-    const { env } = fakeEnv();
-    const fetchImpl = (async () => new Response('{"error":"at capacity"}', { status: 429 })) as unknown as typeof fetch;
+    const { env } = fakeEnv({
+      RECORDER: fakeRecorder(() => new Response('{"error":"at capacity"}', { status: 429 })),
+    });
     const res = await handleMeetingDispatchApi(
-      post({ meetingUrl: 'https://meet.google.com/abc-defg-hij' }), env, AUTH, fetchImpl,
+      post({ meetingUrl: 'https://meet.google.com/abc-defg-hij' }), env, AUTH,
     );
     expect(res?.status).toBe(429);
   });
 
-  it('502s when the recorder is unreachable', async () => {
-    const { env } = fakeEnv();
-    const fetchImpl = (async () => { throw new Error('connect ECONNREFUSED'); }) as unknown as typeof fetch;
+  it('502s when the recorder container is unreachable', async () => {
+    const { env } = fakeEnv({
+      RECORDER: fakeRecorder(() => { throw new Error('container failed to start'); }),
+    });
     const res = await handleMeetingDispatchApi(
-      post({ meetingUrl: 'https://meet.google.com/abc-defg-hij' }), env, AUTH, fetchImpl,
+      post({ meetingUrl: 'https://meet.google.com/abc-defg-hij' }), env, AUTH,
     );
     expect(res?.status).toBe(502);
   });
@@ -108,7 +119,7 @@ describe('POST /api/notetaker/meetings', () => {
   it('requires auth', async () => {
     const { env } = fakeEnv();
     const res = await handleMeetingDispatchApi(
-      post({ meetingUrl: 'https://meet.google.com/abc-defg-hij' }), env, null, recorderOk({}),
+      post({ meetingUrl: 'https://meet.google.com/abc-defg-hij' }), env, null,
     );
     expect(res?.status).toBe(401);
   });
@@ -116,22 +127,24 @@ describe('POST /api/notetaker/meetings', () => {
 
 describe('GET /api/notetaker/meetings/:id', () => {
   it('proxies the recorder status', async () => {
-    const { env } = fakeEnv();
-    const fetchImpl = (async (url: string) => {
-      expect(url).toBe('https://recorder.example/recordings/sess-1');
-      return new Response(JSON.stringify({ id: 'sess-1', status: 'recording' }), { status: 200 });
-    }) as unknown as typeof fetch;
+    const { env } = fakeEnv({
+      RECORDER: fakeRecorder((req) => {
+        expect(new URL(req.url).pathname).toBe('/recordings/sess-1');
+        return new Response(JSON.stringify({ id: 'sess-1', status: 'recording' }), { status: 200 });
+      }),
+    });
     const req = new Request('https://x/api/notetaker/meetings/sess-1');
-    const res = await handleMeetingDispatchApi(req, env, AUTH, fetchImpl);
+    const res = await handleMeetingDispatchApi(req, env, AUTH);
     expect(res?.status).toBe(200);
     expect((await res!.json()) as object).toEqual({ meeting: { id: 'sess-1', status: 'recording' } });
   });
 
   it('404s when the recorder does not know the session', async () => {
-    const { env } = fakeEnv();
-    const fetchImpl = (async () => new Response('{"error":"not found"}', { status: 404 })) as unknown as typeof fetch;
+    const { env } = fakeEnv({
+      RECORDER: fakeRecorder(() => new Response('{"error":"not found"}', { status: 404 })),
+    });
     const req = new Request('https://x/api/notetaker/meetings/nope');
-    const res = await handleMeetingDispatchApi(req, env, AUTH, fetchImpl);
+    const res = await handleMeetingDispatchApi(req, env, AUTH);
     expect(res?.status).toBe(404);
   });
 });
@@ -140,6 +153,6 @@ describe('routing', () => {
   it('ignores non-meeting paths', async () => {
     const { env } = fakeEnv();
     const req = new Request('https://x/api/notetaker/abc123');
-    expect(await handleMeetingDispatchApi(req, env, AUTH, recorderOk({}))).toBeNull();
+    expect(await handleMeetingDispatchApi(req, env, AUTH)).toBeNull();
   });
 });

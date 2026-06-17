@@ -50,6 +50,32 @@ describe('SessionManager', () => {
   });
 });
 
+describe('graceful shutdown (SIGTERM drain)', () => {
+  it('requestStopAll flags every active session and drain resolves once they finish', async () => {
+    const m = makeManager(2, async (_s: unknown, ctx: { isStopRequested: () => boolean }) => {
+      while (!ctx.isStopRequested()) await new Promise((r) => setTimeout(r, 10));
+    });
+    m.start('https://meet.example/a', null);
+    m.start('https://meet.example/b', null);
+    expect(m.activeCount()).toBe(2);
+    m.requestStopAll();
+    expect(await m.drain(2000)).toBe(true);
+    expect(m.activeCount()).toBe(0);
+  });
+
+  it('drain gives up after the timeout when a session never ends', async () => {
+    const m = makeManager(1, () => new Promise<void>(() => {}));
+    m.start('https://meet.example/a', null);
+    expect(await m.drain(150)).toBe(false);
+    expect(m.activeCount()).toBe(1);
+  });
+
+  it('drain resolves immediately when nothing is active', async () => {
+    const m = makeManager(1, async () => {});
+    expect(await m.drain(1000)).toBe(true);
+  });
+});
+
 describe('per-session api keys (multi-tenant)', () => {
   it('stores the tenant api key on the session', () => {
     const m = makeManager(2, async () => {});
