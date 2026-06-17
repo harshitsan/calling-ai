@@ -122,6 +122,25 @@ export function VoiceIntegrations() {
         </Button>
       </Card>
 
+      <Card className="p-4 mb-6 flex items-center justify-between gap-4 bg-aurora-1/[0.04] border-aurora-1/15">
+        <div className="flex items-center gap-3">
+          <div className="h-10 w-10 rounded-xl bg-aurora-1/15 border border-aurora-1/20 flex items-center justify-center text-aurora-1">
+            <BookOpen className="h-5 w-5" />
+          </div>
+          <div>
+            <div className="text-[13px] font-display tracking-tight text-foreground/95">
+              Using Twilio? Read the Twilio setup guide.
+            </div>
+            <p className="text-[11px] text-muted-foreground/75 mt-0.5 leading-relaxed">
+              Inbound webhook, outbound REST, and SIP — bring your own Twilio account.
+            </p>
+          </div>
+        </div>
+        <Button asChild variant="outline">
+          <Link to="/integrations/twilio">Open guide →</Link>
+        </Button>
+      </Card>
+
       <div className="grid gap-5 md:grid-cols-3 mb-6">
         <ModalityCard
           k="pstn"
@@ -683,6 +702,16 @@ function SipEditor({ data, reload }: { data: SipCfg; reload: () => Promise<Integ
 
   return (
     <Card className="p-6 mt-2">
+      <div className="rounded-lg bg-aurora-1/[0.05] border border-aurora-1/15 p-3 mb-5 flex items-center justify-between gap-3">
+        <p className="text-[12px] text-foreground/85 leading-relaxed">
+          <strong>SIP works today via Twilio.</strong> Point a Twilio Programmable Voice SIP Domain at
+          calling-ai — no gateway to run. The native fields below (direct SBC → our SIP URI) are
+          deployment-pending.
+        </p>
+        <Button asChild variant="outline" size="sm" className="shrink-0">
+          <Link to="/integrations/twilio">Twilio SIP guide →</Link>
+        </Button>
+      </div>
       <div className="flex items-start justify-between mb-5">
         <div>
           <h3 className="font-display text-2xl tracking-tight">SIP Trunking</h3>

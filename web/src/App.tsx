@@ -18,6 +18,7 @@ const Voiceovers = lazy(() => import('./pages/Voiceovers').then((m) => ({ defaul
 const VoiceoverNew = lazy(() => import('./pages/VoiceoverNew').then((m) => ({ default: m.VoiceoverNew })));
 const VoiceIntegrations = lazy(() => import('./pages/VoiceIntegrations').then((m) => ({ default: m.VoiceIntegrations })));
 const TataSetup = lazy(() => import('./pages/TataSetup').then((m) => ({ default: m.TataSetup })));
+const TwilioSetup = lazy(() => import('./pages/TwilioSetup').then((m) => ({ default: m.TwilioSetup })));
 const Notetaker = lazy(() => import('./pages/Notetaker').then((m) => ({ default: m.Notetaker })));
 const NotetakerNew = lazy(() => import('./pages/NotetakerNew').then((m) => ({ default: m.NotetakerNew })));
 const NotetakerDetail = lazy(() => import('./pages/NotetakerDetail').then((m) => ({ default: m.NotetakerDetail })));
@@ -67,6 +68,7 @@ export function App() {
               <>
                 <Route path="/integrations" element={<VoiceIntegrations />} />
                 <Route path="/integrations/tata" element={<TataSetup />} />
+                <Route path="/integrations/twilio" element={<TwilioSetup />} />
               </>
             )}
             {NOTETAKER_ENABLED && (
