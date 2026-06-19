@@ -12,6 +12,13 @@ export interface Config {
   recordingsDir: string;
   audioSink: string;
   botDisplayName: string;
+  // Vision liveness check: when set, the runner confirms "everyone left" by
+  // screenshotting the meeting and asking an OpenAI vision model how many OTHER
+  // participants are visible. Reuses the project's existing OPENAI_API_KEY.
+  // Absent → the runner falls back to a name-independent DOM tile count.
+  openaiApiKey?: string;
+  visionModel: string;
+  openaiBaseUrl: string;
 }
 
 function req(env: Record<string, string | undefined>, key: string): string {
@@ -43,5 +50,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     recordingsDir: env.RECORDINGS_DIR ?? './data/recordings',
     audioSink: env.AUDIO_SINK ?? 'meet_sink',
     botDisplayName: env.BOT_DISPLAY_NAME ?? 'Notetaker Bot',
+    openaiApiKey: env.OPENAI_API_KEY,
+    visionModel: env.VISION_MODEL ?? 'gpt-4o-mini',
+    openaiBaseUrl: env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1',
   };
 }

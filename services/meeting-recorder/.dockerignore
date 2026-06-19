@@ -3,3 +3,5 @@ dist
 data
 secrets
 *.log
+.env
+.env.*

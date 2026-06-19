@@ -18,6 +18,15 @@ describe('loadConfig', () => {
     expect(c.lobbyTimeoutMs).toBe(5 * 60_000);
     expect(c.aloneGraceMs).toBe(2 * 60_000);
     expect(c.maxDurationMs).toBe(2 * 60 * 60_000);
+    expect(c.openaiApiKey).toBeUndefined();
+    expect(c.visionModel).toBe('gpt-4o-mini');
+    expect(c.openaiBaseUrl).toBe('https://api.openai.com/v1');
+  });
+
+  it('picks up the OpenAI vision settings from env', () => {
+    const c = loadConfig({ ...base, OPENAI_API_KEY: 'sk-x', VISION_MODEL: 'gpt-4o' });
+    expect(c.openaiApiKey).toBe('sk-x');
+    expect(c.visionModel).toBe('gpt-4o');
   });
 
   it('overrides defaults from env', () => {

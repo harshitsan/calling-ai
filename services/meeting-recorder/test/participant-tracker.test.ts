@@ -65,6 +65,34 @@ describe('ParticipantTracker (fixture)', () => {
     expect(await tracker.poll()).toBe(0); // bot alone, but a CONFIDENT reading
     await page.close();
   });
+
+  it('exposes the raw visible tile count (incl. bot) for the vision pre-filter', async () => {
+    const page = await browser.newPage();
+    await page.goto(fixtureUrl);
+    await joinMeeting(page, FIXTURE_SELECTORS, 'Notetaker Bot', 5000);
+    const tracker = new ParticipantTracker(page, FIXTURE_PLATFORM, 'Notetaker Bot', 0);
+    await tracker.openPanel();
+
+    await page.evaluate(() => (window as any).__setRoster(['Notetaker Bot', 'Alex']));
+    await tracker.poll();
+    expect(tracker.visibleCount()).toBe(2); // bot + Alex, NOT filtered
+
+    await page.evaluate(() => (window as any).__setRoster(['Notetaker Bot']));
+    await tracker.poll();
+    expect(tracker.visibleCount()).toBe(1); // just the bot's own tile
+
+    await page.close();
+  });
+
+  it('reports an unreadable roster as null visible count', async () => {
+    const page = await browser.newPage();
+    await page.goto(fixtureUrl);
+    await joinMeeting(page, FIXTURE_SELECTORS, 'Notetaker Bot', 5000);
+    const tracker = new ParticipantTracker(page, FIXTURE_PLATFORM, 'Notetaker Bot', 0);
+    await tracker.poll(); // roster never set → unreadable
+    expect(tracker.visibleCount()).toBeNull();
+    await page.close();
+  });
 });
 
 describe('coalesceTimeline', () => {

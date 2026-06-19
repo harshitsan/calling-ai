@@ -12,6 +12,8 @@ import { Recorder } from './recorder';
 import { createSessionSink, removeSessionSink, type ExecFn } from './audio-sink';
 import { decideEnd } from './end-detector';
 import { uploadRecording } from './uploader';
+import { countOthersInScreenshot, type VisionConfig } from './liveness-vision';
+import { shouldRunVision, resolveLeaveOthers } from './alone-signal';
 
 const execFileAsync = promisify(execFile);
 const defaultExec: ExecFn = async (cmd, args) => {
@@ -57,35 +59,69 @@ export function makeRunner(
       // with the transcriber's audio timestamps for diarization-by-name.
       const tracker = new ParticipantTracker(page, platform, config.botDisplayName, startedAtMs, now);
       await tracker.openPanel();
+      // The bot joins via its Google session, so its Meet name is the account
+      // name, not BOT_DISPLAY_NAME — name-based self-exclusion can't be trusted.
+      // When an OpenAI key is configured, confirm "everyone left" with a vision
+      // check; the DOM tile count is just the cheap pre-filter / fallback.
+      const visionCfg: VisionConfig | null = config.openaiApiKey
+        ? { apiKey: config.openaiApiKey, model: config.visionModel, baseUrl: config.openaiBaseUrl, botDisplayName: config.botDisplayName }
+        : null;
       let aloneSinceMs: number | null = null;
+      let lastVisionAtMs = 0;
+      let unreadStreak = 0;
 
       for (;;) {
         await page.waitForTimeout(5000);
-        const others = await tracker.poll();
-        // Fail-safe: only run the alone timer on a CONFIDENT empty-room reading.
-        // others===null means the roster couldn't be read (selector drift) — we
-        // leave aloneSinceMs untouched and never start the countdown, so a
-        // broken selector can no longer cause a silent early leave.
-        if (others !== null) {
-          if (others <= 0) aloneSinceMs ??= now();
+        const others = await tracker.poll(); // roster/timeline (diarization)
+        const domTotal = tracker.visibleCount(); // tiles incl. bot, null if unreadable
+        unreadStreak = domTotal === null ? unreadStreak + 1 : 0;
+
+        // Gate the vision call on the cheap DOM signal so populated meetings
+        // cost nothing — only confirm when the DOM suggests we might be alone.
+        const runVision = shouldRunVision({
+          visionConfigured: visionCfg !== null,
+          domTotal,
+          unreadStreak,
+          msSinceLastVision: now() - lastVisionAtMs,
+        });
+        let visionOthers: number | null = null;
+        if (runVision && visionCfg) {
+          lastVisionAtMs = now();
+          const png = await page.screenshot().catch(() => null);
+          visionOthers = png ? await countOthersInScreenshot(png, visionCfg) : null;
+        }
+
+        // Authoritative "others" for the leave decision (null = unknown).
+        const leaveOthers = resolveLeaveOthers({
+          visionConfigured: visionCfg !== null,
+          ranVision: runVision,
+          visionOthers,
+          domTotal,
+        });
+        // Fail-safe: only move the alone timer on a CONFIDENT reading. unknown
+        // (null) leaves it untouched, so neither selector drift nor a flaky
+        // vision call can cause a premature leave.
+        if (leaveOthers !== null) {
+          if (leaveOthers <= 0) aloneSinceMs ??= now();
           else aloneSinceMs = null;
         }
-        // DIAGNOSTIC: trace the alone-timer state each poll so an early leave is
-        // explainable from the logs alone.
+        // DIAGNOSTIC: trace the alone-timer state each poll so a leave (or a
+        // failure to leave) is explainable from the logs alone.
         console.log(
-          `[recorder ${session.id}] poll others=${others} aloneSinceMs=${aloneSinceMs} ` +
-          `elapsedMs=${now() - startedAtMs} aloneGraceMs=${config.aloneGraceMs}`,
+          `[recorder ${session.id}] poll domTotal=${domTotal} rosterOthers=${others} ` +
+          `ranVision=${runVision} visionOthers=${visionOthers} leaveOthers=${leaveOthers} ` +
+          `aloneSinceMs=${aloneSinceMs} elapsedMs=${now() - startedAtMs} aloneGraceMs=${config.aloneGraceMs}`,
         );
         const decision = decideEnd({
           removed: await isRemoved(page, sel),
           stopRequested: ctx.isStopRequested(),
-          otherParticipants: others ?? 1, // unknown reads as "not alone"
+          otherParticipants: leaveOthers ?? 1, // unknown reads as "not alone"
           aloneSinceMs, startedAtMs, nowMs: now(),
           aloneGraceMs: config.aloneGraceMs, maxDurationMs: config.maxDurationMs,
         });
         if (decision.end) {
           session.reason = decision.reason;
-          console.log(`[recorder ${session.id}] leaving: reason=${decision.reason} others=${others}`);
+          console.log(`[recorder ${session.id}] leaving: reason=${decision.reason} leaveOthers=${leaveOthers}`);
           break;
         }
       }

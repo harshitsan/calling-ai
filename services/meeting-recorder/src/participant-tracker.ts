@@ -25,6 +25,10 @@ export interface SpeakerSegment {
 export class ParticipantTracker {
   private roster = new Set<string>();
   private samples: TimelineSample[] = [];
+  // Total tiles seen on the most recent poll, INCLUDING the bot's own (null when
+  // the roster was unreadable). Used by the runner as the cheap pre-filter for
+  // the vision liveness check — `total - 1` is a name-independent "others" count.
+  private lastVisible: number | null = null;
 
   constructor(
     private readonly page: Page,
@@ -71,10 +75,12 @@ export class ParticipantTracker {
       .catch(() => null) as ProbeSample | null;
     if (!s || !s.ok || s.participants.length === 0) {
       // DIAGNOSTIC: an unreadable panel reads as "unknown" (never "alone").
+      this.lastVisible = null;
       console.log(`[tracker ${this.platform.id}] poll unreadable: ok=${s?.ok ?? 'null'} strategy=${s?.strategy ?? 'n/a'} participants=${s?.participants.length ?? 'n/a'} → others=null`);
       return null;
     }
 
+    this.lastVisible = s.participants.length;
     const others = s.participants.filter((n) => !this.isBot(n));
     for (const n of others) this.roster.add(n);
     const speaking = s.speaking.filter((n) => !this.isBot(n));
@@ -96,6 +102,15 @@ export class ParticipantTracker {
   /** Distinct participant names seen across the session (bot excluded). */
   participants(): string[] {
     return [...this.roster];
+  }
+
+  /**
+   * Total tiles seen on the most recent poll, INCLUDING the bot's own tile, or
+   * `null` if the roster was unreadable. The runner uses this as the cheap
+   * pre-filter for the vision liveness check.
+   */
+  visibleCount(): number | null {
+    return this.lastVisible;
   }
 
   /** Coalesced who-spoke-when segments for the whole session. */
