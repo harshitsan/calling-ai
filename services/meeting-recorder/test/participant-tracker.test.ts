@@ -84,6 +84,19 @@ describe('ParticipantTracker (fixture)', () => {
     await page.close();
   });
 
+  it('extracts the clean display name from a noisy Meet tile (not the UI blob)', async () => {
+    const page = await browser.newPage();
+    await page.goto(fixtureUrl);
+    await joinMeeting(page, FIXTURE_SELECTORS, 'Notetaker Bot', 5000);
+    const tracker = new ParticipantTracker(page, FIXTURE_PLATFORM, 'Notetaker Bot', 0);
+    await tracker.openPanel();
+    // A real tile full of icon ligatures + action-button labels, no clean panel row.
+    await page.evaluate(() => (window as any).__setNoisyTile('p_harshit', 'Harshit Bhalla'));
+    await tracker.poll();
+    expect(tracker.participants()).toEqual(['Harshit Bhalla']);
+    await page.close();
+  });
+
   it('reports an unreadable roster as null visible count', async () => {
     const page = await browser.newPage();
     await page.goto(fixtureUrl);

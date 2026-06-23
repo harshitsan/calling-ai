@@ -35,13 +35,75 @@ export const PROBE_SOURCE = String.raw`
       .trim();
   }
 
-  function nameOf(el) {
-    var aria = el.getAttribute('aria-label');
-    if (!aria) {
-      var sub = el.querySelector('[data-self-name],[data-participant-name]');
-      if (sub) aria = sub.textContent;
+  // Per-participant control buttons embed the clean display name in their
+  // aria-label. This is FAR more reliable than the tile's textContent, which
+  // concatenates Material-icon ligatures (keep_outline, mic_none, more_vert,
+  // devices) and action phrases into a blob.
+  var NAME_FROM_CONTROL = [
+    /^More options for (.+)$/i,
+    /^Pin (.+?) to your main screen$/i,
+    /^Unpin (.+?) from your main screen$/i,
+    /^Mute (.+)$/i,
+    /^Unmute (.+)$/i,
+    /^Remove (.+?) from the (?:call|meeting)$/i,
+  ];
+
+  // Material Symbols render their icon name as text: one lowercase token, no
+  // spaces (e.g. "keep_outline", "mic_none", "more_vert", "devices").
+  function isIconLigature(s) {
+    return /^[a-z][a-z0-9_]*$/.test(s);
+  }
+
+  function nameFromControls(el) {
+    var labelled = el.querySelectorAll('[aria-label]');
+    for (var i = 0; i < labelled.length; i++) {
+      var lab = (labelled[i].getAttribute('aria-label') || '').trim();
+      for (var p = 0; p < NAME_FROM_CONTROL.length; p++) {
+        var m = lab.match(NAME_FROM_CONTROL[p]);
+        if (m && m[1]) return stripStatus(m[1]);
+      }
     }
-    return stripStatus(aria || el.textContent);
+    return '';
+  }
+
+  // Last resort: pick the most frequent text node that isn't inside a button and
+  // isn't an icon ligature. The name is rendered repeatedly; controls are not.
+  // Locale-independent (no action-phrase matching). Ties break toward the
+  // shorter string (the bare name beats an embedded phrase).
+  function nameFromText(el) {
+    var counts = {};
+    var order = [];
+    var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+    var node;
+    while ((node = walker.nextNode())) {
+      var p = node.parentElement;
+      if (p && p.closest && p.closest('button,[role="button"]')) continue;
+      var t = (node.nodeValue || '').replace(/\s+/g, ' ').trim();
+      if (!t || isIconLigature(t)) continue;
+      if (!(t in counts)) { counts[t] = 0; order.push(t); }
+      counts[t]++;
+    }
+    var best = '', bestC = 0;
+    for (var i = 0; i < order.length; i++) {
+      var t2 = order[i];
+      if (counts[t2] > bestC || (counts[t2] === bestC && best && t2.length < best.length)) {
+        best = t2; bestC = counts[t2];
+      }
+    }
+    return stripStatus(best);
+  }
+
+  function nameOf(el) {
+    // 1) The element's own aria-label, when it's a clean name (People-panel rows
+    //    expose the bare name this way). Reject noisy blobs (icon ligatures leave
+    //    an underscore behind).
+    var aria = (el.getAttribute('aria-label') || '').trim();
+    if (aria && aria.indexOf('_') === -1 && aria.length <= 80) return stripStatus(aria);
+    // 2) Pull the name out of a per-participant control button's aria-label.
+    var fromCtrl = nameFromControls(el);
+    if (fromCtrl) return fromCtrl;
+    // 3) Structural text fallback.
+    return nameFromText(el);
   }
 
   function findRows() {

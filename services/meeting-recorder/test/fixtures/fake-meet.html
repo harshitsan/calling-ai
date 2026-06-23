@@ -55,6 +55,28 @@
       }
     };
     window.__remove = () => { document.getElementById('removed').style.display = 'block'; };
+    // Render a realistic NOISY Meet video tile: the data-participant-id
+    // container holds Material-icon ligatures (keep_outline, mic_none,
+    // more_vert, devices) and per-participant action buttons whose aria-label
+    // embeds the name, plus the bare name shown twice — exactly the soup that
+    // made nameOf return a blob. Used to verify clean name extraction.
+    window.__setNoisyTile = (id, name) => {
+      const tiles = document.getElementById('tiles');
+      const tile = document.createElement('div');
+      tile.setAttribute('data-participant-id', id);
+      const icon = (lig) => { const s = document.createElement('span'); s.className = 'google-symbols'; s.textContent = lig; return s; };
+      const ctrl = (label) => { const b = document.createElement('button'); b.setAttribute('aria-label', label); b.appendChild(icon('placeholder')); return b; };
+      tile.appendChild(icon('keep_outline'));
+      tile.appendChild(ctrl('Pin ' + name + ' to your main screen'));
+      tile.appendChild(icon('mic_none'));
+      tile.appendChild(ctrl('Mute ' + name));
+      tile.appendChild(icon('more_vert'));
+      tile.appendChild(ctrl('More options for ' + name));
+      const n1 = document.createElement('span'); n1.textContent = name; tile.appendChild(n1);
+      const n2 = document.createElement('span'); n2.textContent = name; tile.appendChild(n2);
+      tile.appendChild(icon('devices'));
+      tiles.appendChild(tile);
+    };
     // Render the People panel like Meet: one row per participant, each
     // carrying a data-participant-id + aria-label name (what the in-page probe
     // auto-discovers). The bot's own row uses id "self".
